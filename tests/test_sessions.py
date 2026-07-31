@@ -105,11 +105,15 @@ class SessionStoreTests(unittest.TestCase):
     def test_load_memory_rejects_corrupted_file_list_json(self) -> None:
         """防止损坏的持久化数据被静默覆盖为默认记忆。"""
         created = self.store.create("broken", self.workspace, "deepseek", "model-a")
-        with sqlite3.connect(self.db_path) as connection:
+        connection = sqlite3.connect(self.db_path)
+        try:
             connection.execute(
                 "UPDATE session_memory SET modified_files_json = ? WHERE session_id = ?",
                 ("{not-json", created.id),
             )
+            connection.commit()
+        finally:
+            connection.close()
 
         with self.assertRaises(SessionError):
             self.store.load_memory(created.id)

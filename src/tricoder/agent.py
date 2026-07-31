@@ -45,6 +45,7 @@ AUDIT_FAILURE_MESSAGE = "无法写入审计日志，运行已安全停止"
 NATIVE_TEXT_FEEDBACK = "本轮没有工具调用。请下一轮只选择一个可用工具调用。"
 NATIVE_MULTIPLE_CALLS_FEEDBACK = "本轮包含多个工具调用，未执行任何一个。请下一轮只选择一个。"
 PROTOCOL_FEEDBACK = "模型响应未满足当前协议。请下一轮按系统规则重新提交一个动作。"
+PROVIDER_FAILURE_MESSAGE = "模型请求失败，运行已安全停止"
 
 
 def _message_chars(message: Message) -> int:
@@ -409,7 +410,7 @@ class CodingAgent:
                 )
                 continue
             except ProviderError as exc:
-                self.observer.on_error(f"模型请求失败：{exc}")
+                self.observer.on_error(PROVIDER_FAILURE_MESSAGE)
                 if not self._log(
                     {
                         "round": round_number,
@@ -430,7 +431,7 @@ class CodingAgent:
                 return turn_result(
                     RunResult(
                         False,
-                        f"模型请求失败：{exc}",
+                        PROVIDER_FAILURE_MESSAGE,
                         round_number,
                         tool_calls,
                         tuple(modified_files),

@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tricoder.models import (
@@ -8,6 +10,7 @@ from tricoder.models import (
     ToolCall,
     ToolDefinition,
 )
+from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import (
     OpenAICompatibleProvider,
     ProviderError,
@@ -15,6 +18,7 @@ from tricoder.providers import (
     UrllibTransport,
     create_provider,
 )
+from tricoder.tools import ToolContext, ToolRegistry
 
 
 class FakeHttpResponse:
@@ -31,6 +35,22 @@ class FakeHttpResponse:
 
     def read(self) -> bytes:
         return self._body
+
+
+class ReadFailingHttpResponse:
+    """在真实 response.read 边界模拟连接中断。"""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __enter__(self) -> "ReadFailingHttpResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        raise ConnectionResetError(self._message)
 
 
 class RecordingTransport:
@@ -95,7 +115,7 @@ class ProviderTests(unittest.TestCase):
     def test_factory_selects_each_registered_provider_profile(self) -> None:
         """防止共享 Factory 忽略厂商名称并退回无能力的通用档案。"""
         expected_capabilities = {
-            "openai": (True, True, True, True, True),
+            "openai": (True, False, True, True, True),
             "deepseek": (True, False, False, True, True),
             "glm": (True, False, False, False, True),
         }
@@ -186,6 +206,73 @@ class ProviderTests(unittest.TestCase):
 
         self.assertIsInstance(caught.exception, ProviderProtocolError)
         self.assertFalse(caught.exception.retryable)
+
+    def test_urllib_transport_normalizes_invalid_utf8_without_response_text(
+        self,
+    ) -> None:
+        """防止非法响应字节以 UnicodeDecodeError 或自由文本逃出 Provider 边界。"""
+        transport = UrllibTransport()
+        url_sentinel = "URL-QUERY-PRIVATE"
+        auth_sentinel = "AUTHORIZATION-PRIVATE"
+        body_sentinel = "BODY-BYTES-PRIVATE"
+
+        with patch(
+            "tricoder.providers.urllib.request.urlopen",
+            return_value=FakeHttpResponse(
+                body_sentinel.encode("ascii") + b"\xff",
+            ),
+        ):
+            try:
+                transport.post_json(
+                    f"https://example.test/chat/completions?trace={url_sentinel}",
+                    {"Authorization": f"Bearer {auth_sentinel}"},
+                    {"model": "test-model", "messages": []},
+                    3,
+                )
+            except Exception as exc:
+                caught = exc
+            else:
+                self.fail("非法 UTF-8 响应必须失败")
+
+        self.assertIsInstance(caught, ProviderProtocolError)
+        self.assertFalse(caught.retryable)  # type: ignore[attr-defined]
+        self.assertEqual("模型服务响应编码无效", str(caught))
+        for sentinel in (url_sentinel, auth_sentinel, body_sentinel):
+            self.assertNotIn(sentinel, str(caught))
+
+    def test_urllib_transport_normalizes_body_read_failure_without_private_text(
+        self,
+    ) -> None:
+        """防止响应读取异常原文、URL 或鉴权信息逃出 Provider 边界。"""
+        transport = UrllibTransport()
+        url_sentinel = "URL-QUERY-PRIVATE"
+        auth_sentinel = "AUTHORIZATION-PRIVATE"
+        failure_sentinel = "READ-FAILURE-PRIVATE"
+
+        with patch(
+            "tricoder.providers.urllib.request.urlopen",
+            return_value=ReadFailingHttpResponse(
+                f"{failure_sentinel} {url_sentinel} {auth_sentinel}",
+            ),
+        ):
+            try:
+                transport.post_json(
+                    f"https://example.test/chat/completions?trace={url_sentinel}",
+                    {"Authorization": f"Bearer {auth_sentinel}"},
+                    {"model": "test-model", "messages": []},
+                    3,
+                )
+            except Exception as exc:
+                caught = exc
+            else:
+                self.fail("响应读取失败必须归一化")
+
+        self.assertIsInstance(caught, ProviderError)
+        self.assertNotIsInstance(caught, ProviderProtocolError)
+        self.assertTrue(caught.retryable)  # type: ignore[attr-defined]
+        self.assertEqual("模型服务连接或响应读取失败", str(caught))
+        for sentinel in (url_sentinel, auth_sentinel, failure_sentinel):
+            self.assertNotIn(sentinel, str(caught))
 
     def test_returns_unified_text_response_and_preserves_finish_reason(self) -> None:
         """防止普通文本响应绕过统一响应契约。"""
@@ -376,7 +463,10 @@ class ProviderTests(unittest.TestCase):
                 "tool_choice": "auto",
                 "parallel_tool_calls": False,
             },
-            "deepseek": {"tool_choice": "auto"},
+            "deepseek": {
+                "thinking": {"type": "disabled"},
+                "tool_choice": "auto",
+            },
             "glm": {"tool_choice": "auto"},
         }
         for provider_name, extras in expected_extras.items():
@@ -400,19 +490,117 @@ class ProviderTests(unittest.TestCase):
                     "description": "查询天气",
                     "parameters": WEATHER_TOOL.parameters,
                 }
-                if provider_name == "openai":
-                    expected_function["strict"] = True
                 payload = transport.calls[0]["payload"]
                 self.assertEqual(
                     [{"type": "function", "function": expected_function}],
                     payload["tools"],  # type: ignore[index]
                 )
                 for field, value in extras.items():
-                    self.assertEqual(value, payload[field])  # type: ignore[index]
+                    self.assertEqual(value, payload.get(field))  # type: ignore[union-attr]
                 self.assertEqual(
                     provider_name == "openai",
                     "parallel_tool_calls" in payload,
                 )
+
+    def test_openai_omits_strict_for_real_registry_optional_schemas(self) -> None:
+        """防止真实可选参数 Schema 被错误声明为 OpenAI strict 工具。"""
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry(
+                ToolContext(
+                    WorkspacePolicy(Path(directory)),
+                    CommandPolicy(),
+                    approver=lambda _action, _detail: False,
+                )
+            )
+            definitions = registry.definitions
+            optional_fields = {
+                f"{definition.name}.{name}"
+                for definition in definitions
+                for name in definition.parameters["properties"]
+                if name not in definition.parameters["required"]
+            }
+            provider, transport = make_provider(
+                "openai",
+                {
+                    "choices": [
+                        {"message": {"content": "ok"}, "finish_reason": "stop"}
+                    ]
+                },
+            )
+
+            provider.complete([Message("user", "检查工作区")], definitions)
+
+        self.assertEqual(
+            {"list_files.path", "search_text.path", "run_command.cwd"},
+            optional_fields,
+        )
+        payload = transport.calls[0]["payload"]
+        serialized_tools = payload["tools"]  # type: ignore[index]
+        self.assertEqual(
+            [definition.name for definition in definitions],
+            [
+                tool["function"]["name"]  # type: ignore[index]
+                for tool in serialized_tools  # type: ignore[union-attr]
+            ],
+        )
+        for tool in serialized_tools:  # type: ignore[union-attr]
+            self.assertNotIn("strict", tool["function"])  # type: ignore[index]
+
+    def test_deepseek_disables_thinking_for_provider_neutral_tool_rounds(self) -> None:
+        """防止 DeepSeek thinking 要求泄漏进共享消息模型或破坏自动工具选择。"""
+        provider, transport = make_provider(
+            "deepseek",
+            {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ]
+            },
+        )
+        messages = [
+            Message("user", "读取天气"),
+            Message(
+                "assistant",
+                None,
+                tool_calls=(
+                    ToolCall("call-weather", "weather", {"city": "深圳"}),
+                ),
+            ),
+            Message("tool", "晴", tool_call_id="call-weather"),
+        ]
+
+        provider.complete(messages, [WEATHER_TOOL])
+
+        payload = transport.calls[0]["payload"]
+        self.assertEqual(
+            {"type": "disabled"},
+            payload.get("thinking"),  # type: ignore[union-attr]
+        )
+        self.assertEqual("auto", payload["tool_choice"])  # type: ignore[index]
+        self.assertEqual(
+            [
+                {"role": "user", "content": "读取天气"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-weather",
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "arguments": '{"city": "深圳"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "晴",
+                    "tool_call_id": "call-weather",
+                },
+            ],
+            payload["messages"],  # type: ignore[index]
+        )
 
     def test_omits_all_tool_fields_when_no_tools_are_available(self) -> None:
         """防止旧版纯文本协议收到不兼容的空工具控制字段。"""
@@ -460,6 +648,7 @@ class ProviderTests(unittest.TestCase):
             {
                 "model": "deepseek-model",
                 "messages": [{"role": "user", "content": "修复测试"}],
+                "thinking": {"type": "disabled"},
             },
             transport.calls[0]["payload"],
         )

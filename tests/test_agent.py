@@ -337,6 +337,42 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertEqual(1, len(failing.histories))
         self.assertEqual((), failed.context.messages)
 
+    def test_provider_error_private_text_stays_out_of_public_agent_outputs(
+        self,
+    ) -> None:
+        """防止普通 Provider 异常原文进入 observer 或运行摘要。"""
+        sentinel = "PROVIDER-ERROR-PRIVATE-SENTINEL"
+        observer = RecordingObserver()
+        audit_path = self.workspace / "runtime" / "provider-public-boundary.jsonl"
+        agent = CodingAgent(
+            StructuredScriptedProvider([ProviderError(sentinel)]),
+            self.tools,
+            max_rounds=1,
+            observer=observer,
+            audit=AuditLogger(audit_path),
+        )
+
+        result = agent.run("触发普通 Provider 错误")
+        trail = audit_path.read_text(encoding="utf-8")
+        event = json.loads(trail)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("模型请求失败，运行已安全停止", result.summary)
+        self.assertEqual(
+            [
+                "round:1/1",
+                "error:模型请求失败，运行已安全停止",
+            ],
+            observer.events,
+        )
+        self.assertNotIn(sentinel, result.summary)
+        self.assertNotIn(sentinel, "\n".join(observer.events))
+        self.assertNotIn(sentinel, trail)
+        self.assertEqual("provider_error", event["status"])
+        self.assertEqual("ProviderError", event["error_type"])
+        self.assertEqual(len(sentinel), event["error_chars"])
+        self.assertNotIn("error", event)
+
     def test_native_correction_audit_failure_does_not_commit_orphan_feedback(
         self,
     ) -> None:

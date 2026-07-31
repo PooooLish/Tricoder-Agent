@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -47,13 +48,13 @@ class _ProviderProfile:
 
     capabilities: ProviderCapabilities
     automatic_tool_choice: bool = False
+    disable_thinking: bool = False
 
 
 _PROVIDER_PROFILES = {
     "openai": _ProviderProfile(
         ProviderCapabilities(
             native_tool_calling=True,
-            strict_tool_schema=True,
             parallel_tool_calls=True,
             forced_tool_choice=True,
             streaming=True,
@@ -67,6 +68,7 @@ _PROVIDER_PROFILES = {
             streaming=True,
         ),
         automatic_tool_choice=True,
+        disable_thinking=True,
     ),
     "glm": _ProviderProfile(
         ProviderCapabilities(
@@ -105,12 +107,22 @@ class UrllibTransport:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
+                response_body = response.read()
         except urllib.error.HTTPError as exc:
             retryable = exc.code == 429 or 500 <= exc.code < 600
             raise ProviderError(f"模型服务返回 HTTP {exc.code}", retryable=retryable) from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise ProviderError(f"模型服务连接失败：{exc}", retryable=True) from exc
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ) as exc:
+            raise ProviderError("模型服务连接或响应读取失败", retryable=True) from exc
+
+        try:
+            raw = response_body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProviderProtocolError("模型服务响应编码无效") from exc
 
         try:
             decoded = json.loads(raw)
@@ -170,6 +182,8 @@ class OpenAICompatibleProvider:
             "model": self._config.model,
             "messages": [self._serialize_message(message) for message in messages],
         }
+        if self._profile.disable_thinking:
+            payload["thinking"] = {"type": "disabled"}
         if tools and self.capabilities.native_tool_calling:
             payload["tools"] = [self._serialize_tool(tool) for tool in tools]
             if self._profile.automatic_tool_choice:

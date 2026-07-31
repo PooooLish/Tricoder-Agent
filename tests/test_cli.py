@@ -15,7 +15,7 @@ from tricoder.models import (
     ToolCall,
     ToolDefinition,
 )
-from tricoder.providers import ProviderProtocolError, create_provider
+from tricoder.providers import ProviderError, ProviderProtocolError, create_provider
 from tricoder.sessions import SessionError, SessionStore
 
 
@@ -101,6 +101,17 @@ class ProtocolFailingProvider:
         _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
         raise ProviderProtocolError("PROVIDER-PROTOCOL-SECRET-SENTINEL")
+
+
+class ProviderFailingProvider:
+    """返回普通 Provider 错误，验证 CLI 不复制异常自由文本。"""
+
+    def complete(
+        self,
+        _messages: list[Message],
+        _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        raise ProviderError("PROVIDER-ERROR-SECRET-SENTINEL")
 
 
 class CliTests(unittest.TestCase):
@@ -441,6 +452,33 @@ class CliTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn("模型响应未满足当前协议", text)
             self.assertNotIn("PROVIDER-PROTOCOL-SECRET-SENTINEL", text)
+
+    def test_run_redacts_ordinary_provider_error_details(self) -> None:
+        """防止普通 Provider 异常原文经 observer 或摘要重复进入 CLI。"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            exit_code = main(
+                [
+                    "run",
+                    "验证普通错误脱敏",
+                    "--provider",
+                    "openai",
+                    "--workspace",
+                    directory,
+                    "--audit-dir",
+                    str(Path(directory) / "audit-output"),
+                    "--max-rounds",
+                    "1",
+                ],
+                environ={"OPENAI_API_KEY": "test-key"},
+                provider_factory=lambda _config, _timeout: ProviderFailingProvider(),
+                output=output,
+            )
+
+            text = output.getvalue()
+            self.assertEqual(1, exit_code)
+            self.assertIn("模型请求失败，运行已安全停止", text)
+            self.assertNotIn("PROVIDER-ERROR-SECRET-SENTINEL", text)
 
     def test_run_writes_audit_log_only_to_explicit_audit_dir(self) -> None:
         """显式审计目录应承接运行日志，目标工作区不应生成 runtime。"""
