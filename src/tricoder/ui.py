@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from rich import box
 from rich.console import Console
@@ -20,6 +21,22 @@ _PROVIDER_LABELS = {
     "deepseek": "DeepSeek",
     "glm": "GLM",
 }
+
+
+def _safe_base_url(value: str) -> str:
+    """仅保留诊断所需的协议、主机、端口和路径。"""
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        if not hostname:
+            return "不可安全显示"
+        display_host = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            display_host = f"{display_host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, display_host, parsed.path, "", ""))
+    except ValueError:
+        return "不可安全显示"
 
 
 class TerminalUI:
@@ -71,7 +88,11 @@ class TerminalUI:
         table.add_column("状态", justify="right")
         table.add_row("Provider", Text(config.provider.name), "[green]可用[/green]")
         table.add_row("Model", Text(config.provider.model), "[green]已配置[/green]")
-        table.add_row("Base URL", Text(config.provider.base_url), "[green]HTTPS[/green]")
+        table.add_row(
+            "Base URL",
+            Text(_safe_base_url(config.provider.base_url)),
+            "[green]HTTPS[/green]",
+        )
         table.add_row(Text(key_name), "••••••••", "[green]已设置[/green]")
         table.add_row("密钥来源", Text(config.key_source), "[green]已确认[/green]")
         table.add_row("网络请求", "doctor 不访问网络", "[dim]未发送[/dim]")

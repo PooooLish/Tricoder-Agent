@@ -15,7 +15,7 @@ from tricoder.models import (
     ToolCall,
     ToolDefinition,
 )
-from tricoder.providers import create_provider
+from tricoder.providers import ProviderProtocolError, create_provider
 from tricoder.sessions import SessionError, SessionStore
 
 
@@ -90,6 +90,17 @@ class LegacyFinishingProvider:
             ),
             finish_reason="stop",
         )
+
+
+class ProtocolFailingProvider:
+    """返回厂商协议错误，验证 CLI 只显示稳定脱敏反馈。"""
+
+    def complete(
+        self,
+        _messages: list[Message],
+        _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        raise ProviderProtocolError("PROVIDER-PROTOCOL-SECRET-SENTINEL")
 
 
 class CliTests(unittest.TestCase):
@@ -403,6 +414,33 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code)
             self.assertEqual([()], provider.tool_batches)
+
+    def test_run_redacts_provider_protocol_error_details(self) -> None:
+        """防止 Provider 协议异常原文中的响应片段或凭据进入 CLI 输出。"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            exit_code = main(
+                [
+                    "run",
+                    "验证协议错误脱敏",
+                    "--provider",
+                    "openai",
+                    "--workspace",
+                    directory,
+                    "--audit-dir",
+                    str(Path(directory) / "audit-output"),
+                    "--max-rounds",
+                    "1",
+                ],
+                environ={"OPENAI_API_KEY": "test-key"},
+                provider_factory=lambda _config, _timeout: ProtocolFailingProvider(),
+                output=output,
+            )
+
+            text = output.getvalue()
+            self.assertEqual(1, exit_code)
+            self.assertIn("模型响应未满足当前协议", text)
+            self.assertNotIn("PROVIDER-PROTOCOL-SECRET-SENTINEL", text)
 
     def test_run_writes_audit_log_only_to_explicit_audit_dir(self) -> None:
         """显式审计目录应承接运行日志，目标工作区不应生成 runtime。"""

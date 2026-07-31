@@ -209,6 +209,35 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("example.jsonl", text)
         self.assertNotIn("secret", text)
 
+    def test_doctor_redacts_base_url_credentials_query_and_fragment(self) -> None:
+        """防止自定义 Base URL 把 userinfo、查询凭据或片段写入诊断输出。"""
+        ui, console = recording_ui()
+        config = AppConfig(
+            Path("D:/demo"),
+            ProviderConfig(
+                "openai",
+                "api-key-sentinel",
+                (
+                    "https://URL-USER:URL-PASSWORD@example.test:8443/v1/chat"
+                    "?token=QUERY-SENTINEL#FRAGMENT-SENTINEL"
+                ),
+                "model-test",
+            ),
+        )
+
+        ui.show_doctor(config, "OPENAI_API_KEY")
+
+        text = console.export_text()
+        self.assertIn("https://example.test:8443/v1/chat", text)
+        for sentinel in (
+            "URL-USER",
+            "URL-PASSWORD",
+            "QUERY-SENTINEL",
+            "FRAGMENT-SENTINEL",
+            "api-key-sentinel",
+        ):
+            self.assertNotIn(sentinel, text)
+
     def test_agent_events_render_round_action_and_result(self) -> None:
         """防止运行期间只显示空白等待，用户无法判断 Agent 在做什么。"""
         ui, console = recording_ui()

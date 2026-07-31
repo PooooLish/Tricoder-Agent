@@ -54,7 +54,9 @@ Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响�
 | GLM | 支持 | 发送工具定义和自动工具选择 |
 
 `TRICODER_TOOL_PROTOCOL` 只接受 `native` 或 `legacy_json`，默认是 `native`。
-进程环境变量优先于项目 `.tricoder.toml`。可以先用临时环境变量显式回滚：
+进程环境变量和 `.env.local` 都优先于项目 `.tricoder.toml`，其中进程环境变量
+优先级最高。`.env.example` 中的协议行默认已注释，因此复制模板后，下面的
+TOML 回滚可以直接生效。也可以先用临时进程环境变量显式回滚：
 
 ```powershell
 $env:TRICODER_TOOL_PROTOCOL = "legacy_json"
@@ -70,8 +72,10 @@ tool_protocol = "legacy_json"
 
 `doctor` 会显示当前工具协议，但只显示 Key 的变量名和掩码，不显示 Key
 内容。排查问题时不要把 Key 粘贴到命令参数、日志、Issue 或聊天记录中。
-确认 Provider 的原生协议兼容后，把配置改回 `native`；删除进程覆盖可运行
-`Remove-Item Env:TRICODER_TOOL_PROTOCOL`。
+确认 Provider 的原生协议兼容后，把配置改回 `native`。如果曾主动设置进程
+覆盖，可运行 `Remove-Item Env:TRICODER_TOOL_PROTOCOL`；如果在 `.env.local`
+取消注释并设置了该变量，则还必须删除该行、重新注释或改值，否则它仍会覆盖
+项目 TOML。
 
 可选的项目配置示例：
 
@@ -179,13 +183,16 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 新增 Provider 时保持边界最小：
 
-1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL 和模型。
+1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL、模型和
+   允许的官方 Base URL。
 2. 在 `src/tricoder/providers.py` 声明 `ProviderCapabilities` 并注册工厂。若不是
    OpenAI-compatible 协议，实现 `ModelProvider.complete(messages, tools)`。
-3. 适配器只返回归一化的 `ProviderResponse`、`ToolCall` 和
-   `ProviderProtocolError`，不要把厂商原始响应或认证头传给 Agent、日志或终端。
-4. 在 `src/tricoder/cli.py` 的 `--provider` 选项加入公开名称，并为配置、请求
-   序列化、响应解析、协议错误和 CLI 脱敏输出补测试。
+3. `complete()` 返回归一化的 `ProviderResponse`（其中包含 `ToolCall`）；厂商
+   响应无法解析或不满足协议时抛出 `ProviderProtocolError`。不要把厂商原始
+   响应或认证头传给 Agent、日志或终端。
+4. 在 `src/tricoder/cli.py` 的 `--provider` choices，以及
+   `src/tricoder/ui.py` 的 Provider label、帮助和选择列表等公开注册点加入名称。
+5. 为配置、请求序列化、响应解析、协议错误、UI/CLI 脱敏输出与交互选择补测试。
 
 只有在适配器确实验证了原生工具调用时才声明
 `native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新
