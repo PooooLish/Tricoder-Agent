@@ -76,9 +76,6 @@ _PROVIDER_PROFILES = {
         automatic_tool_choice=True,
     ),
 }
-_DEFAULT_PROFILE = _ProviderProfile(ProviderCapabilities(native_tool_calling=False))
-
-
 class JsonTransport(Protocol):
     def post_json(
         self,
@@ -151,9 +148,12 @@ class OpenAICompatibleProvider:
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._sleeper = sleeper
-        self._profile = _profile or _PROVIDER_PROFILES.get(
-            config.name.casefold(), _DEFAULT_PROFILE
-        )
+        if _profile is None:
+            try:
+                _profile = _PROVIDER_PROFILES[config.name.casefold()]
+            except KeyError as exc:
+                raise ProviderError(f"未注册的模型服务：{config.name}") from exc
+        self._profile = _profile
 
     @property
     def capabilities(self) -> ProviderCapabilities:

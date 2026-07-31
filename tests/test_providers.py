@@ -137,6 +137,18 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderError, "未注册.*unknown"):
             create_provider(config, 3)
 
+    def test_direct_provider_construction_rejects_unregistered_provider(self) -> None:
+        """防止调用方绕过 Factory 后静默获得无能力的默认档案。"""
+        config = ProviderConfig(
+            "unknown",
+            "test-key",
+            "https://example.test/v1",
+            "test-model",
+        )
+
+        with self.assertRaisesRegex(ProviderError, "未注册.*unknown"):
+            OpenAICompatibleProvider(config)
+
     def test_urllib_transport_rejects_invalid_json_as_protocol_error(self) -> None:
         """防止已收到的无效 JSON 被误分类为普通 Provider 故障。"""
         transport = UrllibTransport()
