@@ -75,26 +75,35 @@ class RecordingAgent:
 class ScriptedProvider:
     """为真实 CodingAgent 提供本地固定动作序列。"""
 
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        call_id_prefix: str = "integration-call",
+    ) -> None:
         self.responses = list(responses)
+        self.call_id_prefix = call_id_prefix
         self.call_number = 0
+        self.histories: list[list[Message]] = []
+        self.tool_batches: list[tuple[ToolDefinition, ...]] = []
+        self.calls: list[ToolCall] = []
 
     def complete(
         self,
-        _messages: list[Message],
-        _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        self.histories.append(list(messages))
+        self.tool_batches.append(tuple(tools))
         decoded = json.loads(self.responses.pop(0))
         self.call_number += 1
-        return ProviderResponse(
-            tool_calls=(
-                ToolCall(
-                    f"integration-call-{self.call_number}",
-                    decoded["tool"],
-                    decoded["arguments"],
-                ),
-            )
+        call = ToolCall(
+            f"{self.call_id_prefix}-{self.call_number}",
+            decoded["tool"],
+            decoded["arguments"],
         )
+        self.calls.append(call)
+        return ProviderResponse(tool_calls=(call,))
 
 
 def action(tool: str, arguments: dict[str, object]) -> str:
@@ -205,6 +214,9 @@ class SessionIntegrationTests(unittest.TestCase):
             (workspace / "sample.py").write_text("value = 1\n", encoding="utf-8")
             (workspace / "other.py").write_text("value = 1\n", encoding="utf-8")
             database = (root / "system-state" / "TriCoder" / "sessions.db").resolve()
+            task_marker = "TASK-CONTEXT-MARKER-7A19"
+            argument_marker = "ARGUMENT-CONTEXT-MARKER-7B20"
+            call_id_marker = "CALL-ID-CONTEXT-MARKER-7C21"
             provider = ScriptedProvider(
                 [
                     action(
@@ -224,8 +236,9 @@ class SessionIntegrationTests(unittest.TestCase):
                         },
                     ),
                     action("run_command", {"command": "python -m compileall -q sample.py other.py"}),
-                    action("finish", {"summary": "completed"}),
-                ]
+                    action("finish", {"summary": argument_marker}),
+                ],
+                call_id_prefix=call_id_marker,
             )
 
             def active_factory(record, memory, _options):  # type: ignore[no-untyped-def]
@@ -256,12 +269,59 @@ class SessionIntegrationTests(unittest.TestCase):
                 active_session_factory=active_factory,
             )
 
-            result = runtime.run_task("canonicalize write metadata")
+            result = runtime.run_task(task_marker)
 
             self.assertTrue(result.ok)
             self.assertEqual(("sample.py", "other.py"), result.modified_files)
+            histories = getattr(provider, "histories", [])
+            tool_batches = getattr(provider, "tool_batches", [])
+            calls = getattr(provider, "calls", [])
+            self.assertEqual(4, len(histories))
+            self.assertEqual(4, len(tool_batches))
+            self.assertEqual(4, len(calls))
+            self.assertTrue(all(tool_batches))
+            registered_names = [
+                {definition.name for definition in definitions}
+                for definitions in tool_batches
+            ]
+            self.assertEqual(
+                ["edit_file", "edit_file", "run_command", "finish"],
+                [call.name for call in calls],
+            )
+            self.assertTrue(
+                all(
+                    expected in names
+                    for expected, names in zip(
+                        ("edit_file", "edit_file", "run_command", "finish"),
+                        registered_names,
+                    )
+                )
+            )
+            self.assertEqual("system", histories[0][0].role)
+            self.assertEqual("task", histories[0][-1].kind)
+            for history in histories[1:]:
+                with self.subTest(request_length=len(history)):
+                    assistant, tool_result = history[-2:]
+                    self.assertEqual("assistant", assistant.role)
+                    self.assertEqual("tool", tool_result.role)
+                    self.assertEqual(
+                        assistant.tool_calls[0].id,
+                        tool_result.tool_call_id,
+                    )
             persisted = store.load_memory(runtime.current.record.id)
             self.assertEqual(("sample.py", "other.py"), persisted.modified_files)
+            forbidden_markers = (task_marker, argument_marker, call_id_marker)
+            persisted_text_fields = (
+                persisted.summary,
+                persisted.requirements_summary,
+                persisted.last_task_summary,
+                persisted.verification,
+            )
+            for marker in forbidden_markers:
+                with self.subTest(marker=marker):
+                    self.assertTrue(
+                        all(marker not in value for value in persisted_text_fields)
+                    )
             connection = sqlite3.connect(database)
             try:
                 stored_paths = connection.execute(
@@ -272,6 +332,10 @@ class SessionIntegrationTests(unittest.TestCase):
                 connection.close()
             self.assertNotIn(str(workspace), stored_paths)
             self.assertNotIn("..", stored_paths)
+            database_text = database.read_bytes().decode("utf-8", errors="ignore")
+            for marker in forbidden_markers:
+                with self.subTest(database_marker=marker):
+                    self.assertNotIn(marker, database_text)
 
     def test_sessions_are_isolated_restart_restores_safe_summary_and_workspace_stays_clean(self) -> None:
         """跨工作区切换不串状态，重启仅恢复安全摘要，SQLite 不写入工作区或原文。"""
