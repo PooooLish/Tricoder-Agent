@@ -6,6 +6,7 @@ __pycache__/
 !.env.example
 runtime/
 .superpowers/
+.worktrees/
 build/
 dist/
 *.egg-info/
