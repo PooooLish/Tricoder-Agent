@@ -53,12 +53,30 @@ def _message_chars(message: Message) -> int:
     return message.character_budget()
 
 
-def _is_tool_result_message(message: Message) -> bool:
-    """同时识别原生 tool 消息和旧版 user 工具结果。"""
+def _is_complete_tool_round(
+    assistant: Message,
+    tool_result: Message,
+    tool_protocol: str | None = None,
+) -> bool:
+    """按协议校验一组 assistant 动作和关联工具结果。"""
 
-    return message.role == "tool" or (
-        message.role == "user" and message.kind == "tool_result"
-    )
+    if assistant.role != "assistant":
+        return False
+    if tool_protocol in {None, "native"} and tool_result.role == "tool":
+        return (
+            tool_result.kind == "tool_result"
+            and len(assistant.tool_calls) == 1
+            and assistant.tool_calls[0].id == tool_result.tool_call_id
+        )
+    if tool_protocol in {None, "legacy_json"} and tool_result.role == "user":
+        return (
+            not assistant.tool_calls
+            and (
+                tool_protocol is None
+                or tool_result.kind == "tool_result"
+            )
+        )
+    return False
 
 
 def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
@@ -76,7 +94,7 @@ def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
     while index + 1 < len(later_messages):
         assistant = later_messages[index]
         tool_result = later_messages[index + 1]
-        if assistant.role == "assistant" and tool_result.role in {"user", "tool"}:
+        if _is_complete_tool_round(assistant, tool_result):
             rounds.append((assistant, tool_result))
             index += 2
         else:
@@ -113,19 +131,33 @@ def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
     return [*fixed_messages, notice, *retained]
 
 
-def _is_complete_history_task_block(block: list[Message]) -> bool:
-    """历史任务必须由 task 和至少一组完整动作/结果组成。"""
+def _normalize_history_task_block(
+    block: list[Message],
+    tool_protocol: str,
+) -> list[Message]:
+    """剔除旧任务纠错噪音，只返回任务和其中完整的动作/结果回合。"""
 
-    if len(block) < 3 or (len(block) - 1) % 2 != 0:
-        return False
-    return all(
-        block[index].role == "assistant"
-        and _is_tool_result_message(block[index + 1])
-        for index in range(1, len(block), 2)
-    )
+    if not block or block[0].kind != "task":
+        return []
+
+    retained: list[Message] = []
+    index = 1
+    while index + 1 < len(block):
+        assistant = block[index]
+        tool_result = block[index + 1]
+        if _is_complete_tool_round(assistant, tool_result, tool_protocol):
+            retained.extend((assistant, tool_result))
+            index += 2
+        else:
+            index += 1
+    return [block[0], *retained] if retained else []
 
 
-def compact_session_messages(messages: list[Message], max_chars: int) -> list[Message]:
+def compact_session_messages(
+    messages: list[Message],
+    max_chars: int,
+    tool_protocol: str,
+) -> list[Message]:
     """先丢弃残缺旧任务，再按完整用户任务块压缩历史。"""
 
     copied_messages = list(messages)
@@ -142,7 +174,9 @@ def compact_session_messages(messages: list[Message], max_chars: int) -> list[Me
     ]
     latest_block = task_blocks[-1]
     complete_history_blocks = [
-        block for block in task_blocks[:-1] if _is_complete_history_task_block(block)
+        normalized
+        for block in task_blocks[:-1]
+        if (normalized := _normalize_history_task_block(block, tool_protocol))
     ]
     normalized_messages = [
         *fixed_messages,
@@ -301,8 +335,11 @@ class CodingAgent:
                 if message.kind == "task"
             )
             return any(
-                messages[index].role == "assistant"
-                and messages[index + 1].kind == "tool_result"
+                _is_complete_tool_round(
+                    messages[index],
+                    messages[index + 1],
+                    self.tool_protocol,
+                )
                 for index in range(current_task_index, len(messages) - 1)
             )
 
@@ -337,7 +374,11 @@ class CodingAgent:
         for round_number in range(1, self.max_rounds + 1):
             self.observer.on_round_start(round_number, self.max_rounds)
             started = time.perf_counter()
-            request_messages = compact_session_messages(messages, self.max_context_chars)
+            request_messages = compact_session_messages(
+                messages,
+                self.max_context_chars,
+                self.tool_protocol,
+            )
             provider_tools = (
                 self.tools.definitions if self.tool_protocol == "native" else ()
             )
@@ -345,9 +386,6 @@ class CodingAgent:
                 response = self.provider.complete(request_messages, provider_tools)
             except ProviderProtocolError as exc:
                 self.observer.on_error(PROTOCOL_FEEDBACK)
-                messages.append(
-                    Message("user", PROTOCOL_FEEDBACK, kind="protocol_feedback")
-                )
                 if not self._log(
                     {
                         "round": round_number,
@@ -363,8 +401,12 @@ class CodingAgent:
                             tool_calls,
                             modified_files,
                             verification,
-                        )
+                        ),
+                        rollback_task=True,
                     )
+                messages.append(
+                    Message("user", PROTOCOL_FEEDBACK, kind="protocol_feedback")
+                )
                 continue
             except ProviderError as exc:
                 self.observer.on_error(f"模型请求失败：{exc}")
@@ -400,15 +442,18 @@ class CodingAgent:
             tool_call_id: str | None = None
             if self.tool_protocol == "native":
                 if len(response.tool_calls) != 1:
+                    pending_feedback: list[Message] = []
                     if not response.tool_calls and response.content:
-                        messages.append(Message("assistant", response.content))
+                        pending_feedback.append(
+                            Message("assistant", response.content)
+                        )
                         feedback = NATIVE_TEXT_FEEDBACK
                     elif response.tool_calls:
                         feedback = NATIVE_MULTIPLE_CALLS_FEEDBACK
                     else:
                         feedback = NATIVE_TEXT_FEEDBACK
                     self.observer.on_error(feedback)
-                    messages.append(
+                    pending_feedback.append(
                         Message("user", feedback, kind="protocol_feedback")
                     )
                     if not self._log(
@@ -426,8 +471,10 @@ class CodingAgent:
                                 tool_calls,
                                 modified_files,
                                 verification,
-                            )
+                            ),
+                            rollback_task=True,
                         )
+                    messages.extend(pending_feedback)
                     continue
 
                 call = response.tool_calls[0]

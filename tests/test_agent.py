@@ -337,6 +337,34 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertEqual(1, len(failing.histories))
         self.assertEqual((), failed.context.messages)
 
+    def test_native_correction_audit_failure_does_not_commit_orphan_feedback(
+        self,
+    ) -> None:
+        """纠错审计失败必须回滚尚未形成完整工具回合的当前任务。"""
+        cases = {
+            "plain_text": ProviderResponse(content="普通文本"),
+            "multiple_calls": ProviderResponse(
+                tool_calls=(
+                    ToolCall("call-one", "read_file", {"path": "sample.py"}),
+                    ToolCall("call-two", "finish", {"summary": "完成"}),
+                )
+            ),
+            "protocol_error": ProviderProtocolError("协议哨兵"),
+        }
+
+        for name, response in cases.items():
+            with self.subTest(name=name):
+                provider = StructuredScriptedProvider([response])
+                failed = CodingAgent(
+                    provider,
+                    self.tools,
+                    max_rounds=1,
+                    audit=FailingAudit(),
+                ).run_with_context("触发纠错审计失败", SessionContext())
+
+                self.assertFalse(failed.result.ok)
+                self.assertEqual((), failed.context.messages)
+
     def test_unknown_tool_returns_complete_assistant_tool_pair(self) -> None:
         """未知名称也必须用相同调用 ID 返回工具错误，不能破坏消息协议。"""
         provider = StructuredScriptedProvider(
@@ -391,6 +419,156 @@ class NativeToolCallingTests(unittest.TestCase):
             any(
                 message.role == "tool" and message.tool_call_id == "call-read"
                 for message in reused
+            )
+        )
+
+    def test_native_history_drops_correction_noise_but_reuses_later_tool_rounds(
+        self,
+    ) -> None:
+        """旧任务归一化只淘汰纠错消息，不得连带丢失之后的成功回合。"""
+        corrections = {
+            "plain_text": ProviderResponse(content="普通文本"),
+            "multiple_calls": ProviderResponse(
+                tool_calls=(
+                    ToolCall("call-one", "read_file", {"path": "sample.py"}),
+                    ToolCall("call-two", "finish", {"summary": "错误并行"}),
+                )
+            ),
+            "protocol_error": ProviderProtocolError("协议哨兵"),
+        }
+
+        for name, correction in corrections.items():
+            with self.subTest(name=name):
+                first_provider = StructuredScriptedProvider(
+                    [
+                        correction,
+                        self.response(
+                            f"call-read-{name}",
+                            "read_file",
+                            {"path": "sample.py"},
+                        ),
+                        self.response(
+                            f"call-finish-{name}",
+                            "finish",
+                            {"summary": "已修正"},
+                        ),
+                    ]
+                )
+                first = CodingAgent(
+                    first_provider,
+                    self.tools,
+                    max_rounds=3,
+                ).run_with_context("先纠错再完成", SessionContext())
+                second_provider = StructuredScriptedProvider(
+                    [
+                        self.response(
+                            f"call-next-{name}",
+                            "finish",
+                            {"summary": "下一任务完成"},
+                        )
+                    ]
+                )
+
+                CodingAgent(
+                    second_provider,
+                    self.tools,
+                    max_rounds=1,
+                ).run_with_context("继续任务", first.context)
+
+                reused = second_provider.histories[0]
+                self.assertTrue(
+                    any(
+                        message.role == "tool"
+                        and message.tool_call_id == f"call-read-{name}"
+                        for message in reused
+                    )
+                )
+                self.assertFalse(
+                    any(message.kind == "protocol_feedback" for message in reused)
+                )
+                self.assertFalse(
+                    any(message.content == "普通文本" for message in reused)
+                )
+
+    def test_compaction_drops_native_round_with_mismatched_call_id(self) -> None:
+        """assistant 与 tool 的调用 ID 不一致时不得作为完整回合保留。"""
+        fixed = [Message("system", "规则"), Message("user", "任务")]
+        invalid = [
+            Message(
+                "assistant",
+                None,
+                tool_calls=(ToolCall("call-a", "read_file", {"path": "sample.py"}),),
+            ),
+            Message(
+                "tool",
+                '{"ok": false}',
+                kind="tool_result",
+                tool_call_id="call-b",
+            ),
+        ]
+
+        compacted = compact_messages([*fixed, *invalid], 10_000)
+
+        self.assertEqual(
+            [*fixed, Message("system", CONTEXT_COMPACTION_NOTICE)],
+            compacted,
+        )
+
+    def test_compaction_drops_native_round_with_multiple_assistant_calls(self) -> None:
+        """assistant 携带多个调用时不能用其中一个 tool 结果伪装完整回合。"""
+        fixed = [Message("system", "规则"), Message("user", "任务")]
+        invalid = [
+            Message(
+                "assistant",
+                None,
+                tool_calls=(
+                    ToolCall("call-a", "read_file", {"path": "sample.py"}),
+                    ToolCall("call-b", "finish", {"summary": "完成"}),
+                ),
+            ),
+            Message(
+                "tool",
+                '{"ok": true}',
+                kind="tool_result",
+                tool_call_id="call-a",
+            ),
+        ]
+
+        compacted = compact_messages([*fixed, *invalid], 10_000)
+
+        self.assertEqual(
+            [*fixed, Message("system", CONTEXT_COMPACTION_NOTICE)],
+            compacted,
+        )
+
+    def test_native_mode_drops_legacy_history_rounds(self) -> None:
+        """原生请求不得混入旧版 assistant/user 工具回合。"""
+        context = SessionContext(
+            messages=(
+                Message("user", "旧版任务", kind="task"),
+                Message("assistant", action("read_file", {"path": "sample.py"})),
+                Message(
+                    "user",
+                    '{"tool_result":{"ok":true}}',
+                    kind="tool_result",
+                ),
+            )
+        )
+        provider = StructuredScriptedProvider(
+            [self.response("call-finish", "finish", {"summary": "完成"})]
+        )
+
+        CodingAgent(provider, self.tools, max_rounds=1).run_with_context(
+            "原生任务",
+            context,
+        )
+
+        request = provider.histories[0]
+        self.assertFalse(any(message.content == "旧版任务" for message in request))
+        self.assertFalse(
+            any(
+                message.content == action("read_file", {"path": "sample.py"})
+                for message in request
             )
         )
 
@@ -525,6 +703,43 @@ class LegacyJsonModeTests(unittest.TestCase):
                 message.kind == "tool_result" and "动作格式错误" in (message.content or "")
                 for message in provider.histories[1]
             )
+        )
+
+    def test_legacy_mode_drops_native_history_rounds(self) -> None:
+        """旧版请求不得混入原生 assistant/tool 工具回合。"""
+        context = SessionContext(
+            messages=(
+                Message("user", "原生任务", kind="task"),
+                Message(
+                    "assistant",
+                    None,
+                    tool_calls=(
+                        ToolCall("call-native", "read_file", {"path": "sample.py"}),
+                    ),
+                ),
+                Message(
+                    "tool",
+                    '{"tool_result":{"ok":true}}',
+                    kind="tool_result",
+                    tool_call_id="call-native",
+                ),
+            )
+        )
+        provider = StructuredScriptedProvider(
+            [ProviderResponse(content=action("finish", {"summary": "完成"}))]
+        )
+
+        CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=1,
+            tool_protocol="legacy_json",
+        ).run_with_context("旧版任务", context)
+
+        request = provider.histories[0]
+        self.assertFalse(any(message.content == "原生任务" for message in request))
+        self.assertFalse(
+            any(message.tool_call_id == "call-native" for message in request)
         )
 
 
