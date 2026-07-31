@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tricoder import tools as tools_module
+from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
 
@@ -67,6 +68,92 @@ class ToolTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_definitions_are_stable_read_only_and_match_handler_names(self) -> None:
+        """防止公开工具契约与实际可调用工具分叉或被调用方改写。"""
+        definitions = self.registry.definitions
+
+        self.assertIsInstance(definitions, tuple)
+        self.assertEqual(
+            (
+                "list_files",
+                "read_file",
+                "search_text",
+                "edit_file",
+                "create_file",
+                "run_command",
+                "finish",
+            ),
+            tuple(definition.name for definition in definitions),
+        )
+        self.assertTrue(all(isinstance(item, ToolDefinition) for item in definitions))
+        self.assertIs(definitions, self.registry.definitions)
+        self.assertEqual(definitions, self.registry.definitions)
+        self.assertTrue(all(self.registry.contains(item.name) for item in definitions))
+        self.assertFalse(self.registry.contains("unknown_tool"))
+
+    def test_definitions_publish_complete_schemas(self) -> None:
+        """防止模型收到的参数契约缺少类型、必填或额外参数限制。"""
+        expected = {
+            "list_files": ({"path": {"type": "string"}}, []),
+            "read_file": ({"path": {"type": "string"}}, ["path"]),
+            "search_text": (
+                {"path": {"type": "string"}, "query": {"type": "string"}},
+                ["query"],
+            ),
+            "edit_file": (
+                {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                ["path", "old_text", "new_text"],
+            ),
+            "create_file": (
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                ["path", "content"],
+            ),
+            "run_command": (
+                {"command": {"type": "string"}, "cwd": {"type": "string"}},
+                ["command"],
+            ),
+            "finish": ({"summary": {"type": "string"}}, ["summary"]),
+        }
+
+        for definition in self.registry.definitions:
+            with self.subTest(tool=definition.name):
+                self.assertEqual("object", definition.parameters["type"])
+                self.assertEqual(expected[definition.name][0], definition.parameters["properties"])
+                self.assertEqual(expected[definition.name][1], definition.parameters["required"])
+                self.assertFalse(definition.parameters["additionalProperties"])
+
+    def test_describe_returns_only_registered_static_definition(self) -> None:
+        """防止 describe 暴露处理器或根据运行时输入生成不稳定说明。"""
+        definition = self.registry.definitions[0]
+
+        self.assertIs(definition, self.registry.describe(definition.name))
+        self.assertIsNone(self.registry.describe("unknown_tool"))
+
+    def test_execute_rejects_invalid_arguments_before_handler_side_effects(self) -> None:
+        """防止缺参、类型错误或额外参数在处理器和审批前继续执行。"""
+        invalid_calls = (
+            ("read_file", {}),
+            ("read_file", {"path": 1}),
+            ("run_command", {"command": "python -m unittest", "extra": True}),
+        )
+
+        for name, arguments in invalid_calls:
+            with self.subTest(name=name, arguments=arguments):
+                result = self.registry.execute(name, arguments)
+                self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+
+    def test_unknown_tool_returns_safe_result(self) -> None:
+        """防止未知工具在动态分发阶段抛出异常。"""
+        result = self.registry.execute("unknown_tool", {})
+
+        self.assertFalse(result.ok)
+        self.assertIn("unknown_tool", result.output)
 
     def test_read_and_search_return_bounded_workspace_content(self) -> None:
         """防止读取与搜索工具遗漏目标内容或擅自请求审批。"""

@@ -11,11 +11,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from tricoder.models import ToolResult
+from tricoder.models import ToolDefinition, ToolResult
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 
 
 Approver = Callable[[str, str], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolRegistration:
+    """将公开工具定义与唯一对应的本地处理器绑定。"""
+
+    definition: ToolDefinition
+    handler: Callable[[dict[str, Any]], ToolResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,26 +385,162 @@ class ToolRegistry:
 
     def __init__(self, context: ToolContext) -> None:
         self.context = context
-        self._handlers = {
-            "list_files": self._list_files,
-            "read_file": self._read_file,
-            "search_text": self._search_text,
-            "edit_file": self._edit_file,
-            "create_file": self._create_file,
-            "run_command": self._run_command,
-            "finish": self._finish,
-        }
+        self._registrations = (
+            _ToolRegistration(
+                ToolDefinition(
+                    "list_files",
+                    "列出工作区内指定目录的条目。",
+                    self._schema({"path": {"type": "string"}}),
+                ),
+                self._list_files,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "read_file",
+                    "读取工作区内 UTF-8 文本文件。",
+                    self._schema({"path": {"type": "string"}}, ["path"]),
+                ),
+                self._read_file,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "search_text",
+                    "在工作区目录内搜索文本。",
+                    self._schema(
+                        {
+                            "path": {"type": "string"},
+                            "query": {"type": "string"},
+                        },
+                        ["query"],
+                    ),
+                ),
+                self._search_text,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "edit_file",
+                    "经审批后精确替换工作区内文件的一段文本。",
+                    self._schema(
+                        {
+                            "path": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                        },
+                        ["path", "old_text", "new_text"],
+                    ),
+                ),
+                self._edit_file,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "create_file",
+                    "经审批后在工作区内创建新的 UTF-8 文件。",
+                    self._schema(
+                        {"path": {"type": "string"}, "content": {"type": "string"}},
+                        ["path", "content"],
+                    ),
+                ),
+                self._create_file,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "run_command",
+                    "经审批后在工作区内运行受策略允许的命令。",
+                    self._schema(
+                        {"command": {"type": "string"}, "cwd": {"type": "string"}},
+                        ["command"],
+                    ),
+                ),
+                self._run_command,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
+                    "finish",
+                    "提交本轮任务的文字总结。",
+                    self._schema({"summary": {"type": "string"}}, ["summary"]),
+                ),
+                self._finish,
+            ),
+        )
+        self._definitions = tuple(
+            registration.definition for registration in self._registrations
+        )
+
+    @property
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        """返回顺序固定、仅供读取的公开工具定义。"""
+        return self._definitions
+
+    def contains(self, name: str) -> bool:
+        """判断名称是否在公开注册表中。"""
+        return self.describe(name) is not None
+
+    def describe(self, name: str) -> ToolDefinition | None:
+        """只返回注册表中静态声明的公开定义。"""
+        for registration in self._registrations:
+            if registration.definition.name == name:
+                return registration.definition
+        return None
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        handler = self._handlers.get(name)
-        if handler is None:
+        registration = next(
+            (
+                item
+                for item in self._registrations
+                if item.definition.name == name
+            ),
+            None,
+        )
+        if registration is None:
             return ToolResult(False, f"未知工具：{name}")
-        if not isinstance(arguments, dict):
-            return ToolResult(False, "工具参数必须是对象")
         try:
-            return handler(arguments)
+            self._validate_arguments(registration.definition.parameters, arguments)
+            return registration.handler(arguments)
         except (PolicyError, OSError, UnicodeError, ValueError, TypeError) as exc:
             return ToolResult(False, str(exc))
+
+    @staticmethod
+    def _schema(
+        properties: dict[str, dict[str, str]],
+        required: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """构建当前简单工具所需的统一对象 Schema。"""
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _validate_arguments(schema: dict[str, Any], arguments: object) -> None:
+        """在进入处理器前校验当前工具 Schema 支持的基础类型。"""
+        if schema.get("type") != "object" or not isinstance(arguments, dict):
+            raise ValueError("工具参数必须是对象")
+
+        properties = schema["properties"]
+        for name in schema["required"]:
+            if name not in arguments:
+                raise ValueError(f"缺少必填参数：{name}")
+        if not schema["additionalProperties"]:
+            extras = set(arguments) - set(properties)
+            if extras:
+                raise ValueError(f"不支持额外参数：{sorted(extras)[0]}")
+
+        validators: dict[str, type[object]] = {
+            "string": str,
+            "integer": int,
+            "boolean": bool,
+        }
+        for name, value in arguments.items():
+            expected = properties[name]["type"]
+            expected_type = validators.get(expected)
+            if expected_type is None:
+                raise ValueError(f"不支持的参数类型：{expected}")
+            if not isinstance(value, expected_type) or (
+                expected == "integer" and isinstance(value, bool)
+            ):
+                raise ValueError(f"参数 {name} 必须是 {expected}")
 
     def _list_files(self, arguments: dict[str, Any]) -> ToolResult:
         directory = self.context.workspace_policy.resolve_path(
