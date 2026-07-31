@@ -1,4 +1,5 @@
 import io
+import inspect
 import json
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from tricoder.audit import AuditLogger
 from tricoder.cli import ConsoleApprover, build_parser, main
 from tricoder.models import Message, ProviderConfig
+from tricoder.providers import create_provider
 from tricoder.sessions import SessionError, SessionStore
 
 
@@ -40,6 +42,12 @@ class ScriptedProvider:
 
 
 class CliTests(unittest.TestCase):
+    def test_one_shot_run_uses_shared_provider_factory_by_default(self) -> None:
+        """防止 CLI 一次性运行保留独立工厂并绕过 Provider 注册表。"""
+        default_factory = inspect.signature(main).parameters["provider_factory"].default
+
+        self.assertIs(create_provider, default_factory)
+
     def test_bare_and_chat_enter_same_injected_shell(self) -> None:
         """防止裸入口和 chat 走到不同的交互装配路径或创建真实 Provider。"""
         with tempfile.TemporaryDirectory() as directory:

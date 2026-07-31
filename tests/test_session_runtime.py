@@ -1,3 +1,4 @@
+import inspect
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -5,6 +6,7 @@ from pathlib import Path
 
 from tricoder.config import ConfigError
 from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionTurnResult
+from tricoder.providers import create_provider
 from tricoder.session_runtime import (
     ActiveSession,
     RuntimeOptions,
@@ -100,6 +102,14 @@ class SessionRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_runtime_uses_shared_provider_factory_by_default(self) -> None:
+        """防止交互会话与 CLI 使用不同的厂商注册表。"""
+        default_factory = inspect.signature(SessionRuntime).parameters[
+            "provider_factory"
+        ].default
+
+        self.assertIs(create_provider, default_factory)
 
     def test_startup_restores_only_latest_session_for_current_workspace(self) -> None:
         """防止启动时错误跳转到另一个工作区的最新会话。"""

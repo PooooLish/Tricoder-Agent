@@ -13,6 +13,7 @@ from tricoder.providers import (
     ProviderError,
     ProviderProtocolError,
     UrllibTransport,
+    create_provider,
 )
 
 
@@ -91,6 +92,51 @@ WEATHER_TOOL = ToolDefinition(
 
 
 class ProviderTests(unittest.TestCase):
+    def test_factory_selects_each_registered_provider_profile(self) -> None:
+        """防止共享 Factory 忽略厂商名称并退回无能力的通用档案。"""
+        expected_capabilities = {
+            "openai": (True, True, True, True, True),
+            "deepseek": (True, False, False, True, True),
+            "glm": (True, False, False, False, True),
+        }
+
+        for provider_name, expected in expected_capabilities.items():
+            with self.subTest(provider=provider_name):
+                provider = create_provider(
+                    ProviderConfig(
+                        provider_name,
+                        "test-key",
+                        "https://example.test/v1",
+                        "test-model",
+                    ),
+                    7.5,
+                )
+
+                self.assertIsInstance(provider, OpenAICompatibleProvider)
+                capabilities = provider.capabilities
+                self.assertEqual(
+                    expected,
+                    (
+                        capabilities.native_tool_calling,
+                        capabilities.strict_tool_schema,
+                        capabilities.parallel_tool_calls,
+                        capabilities.forced_tool_choice,
+                        capabilities.streaming,
+                    ),
+                )
+
+    def test_factory_rejects_unregistered_provider(self) -> None:
+        """防止拼写错误的厂商静默退回不支持工具调用的默认档案。"""
+        config = ProviderConfig(
+            "unknown",
+            "test-key",
+            "https://example.test/v1",
+            "test-model",
+        )
+
+        with self.assertRaisesRegex(ProviderError, "未注册.*unknown"):
+            create_provider(config, 3)
+
     def test_urllib_transport_rejects_invalid_json_as_protocol_error(self) -> None:
         """防止已收到的无效 JSON 被误分类为普通 Provider 故障。"""
         transport = UrllibTransport()

@@ -16,7 +16,7 @@ from tricoder.audit import AuditLogger
 from tricoder.config import ConfigError, load_config, provider_key_env
 from tricoder.models import ProviderConfig
 from tricoder.policy import CommandPolicy, WorkspacePolicy
-from tricoder.providers import ModelProvider, OpenAICompatibleProvider
+from tricoder.providers import ModelProvider, create_provider
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime, SessionRuntimeError
 from tricoder.sessions import SessionError, SessionStore, default_sessions_db
 from tricoder.shell import InteractiveShell
@@ -46,10 +46,6 @@ class ConsoleApprover:
         self.output.flush()
         answer = self.input_fn("允许执行？[y/N] ").strip().lower()
         return answer in {"y", "yes"}
-
-
-def _default_provider_factory(config: ProviderConfig, timeout: float) -> ModelProvider:
-    return OpenAICompatibleProvider(config, timeout=timeout)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,7 +133,7 @@ def main(
     argv: list[str] | None = None,
     *,
     environ: Mapping[str, str] | None = None,
-    provider_factory: ProviderFactory = _default_provider_factory,
+    provider_factory: ProviderFactory = create_provider,
     input_fn: Callable[[str], str] = input,
     output: TextIO = sys.stdout,
     session_store_factory: SessionStoreFactory = SessionStore,

@@ -144,15 +144,15 @@ class OpenAICompatibleProvider:
         timeout: float = 30,
         max_attempts: int = 3,
         sleeper: Callable[[float], None] = time.sleep,
+        _profile: _ProviderProfile | None = None,
     ) -> None:
         self._config = config
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._sleeper = sleeper
-        self._profile = _PROVIDER_PROFILES.get(
-            config.name.casefold(),
-            _DEFAULT_PROFILE,
+        self._profile = _profile or _PROVIDER_PROFILES.get(
+            config.name.casefold(), _DEFAULT_PROFILE
         )
 
     @property
@@ -293,3 +293,32 @@ class OpenAICompatibleProvider:
             return ToolCall(id=call_id, name=name, arguments=arguments)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderProtocolError("模型服务工具调用格式不正确") from exc
+
+
+def _openai_compatible_factory(
+    profile: _ProviderProfile,
+) -> Callable[[ProviderConfig, float], ModelProvider]:
+    """为注册表绑定厂商档案，避免协议选择泄漏到调用层。"""
+
+    def build(config: ProviderConfig, timeout: float) -> ModelProvider:
+        return OpenAICompatibleProvider(config, timeout=timeout, _profile=profile)
+
+    return build
+
+
+# 注册表值是统一接口工厂，未来可替换为完全不同的 Provider 实现。
+_PROVIDER_FACTORIES = {
+    name: _openai_compatible_factory(profile)
+    for name, profile in _PROVIDER_PROFILES.items()
+}
+
+
+def create_provider(config: ProviderConfig, timeout: float) -> ModelProvider:
+    """根据配置选择已注册的 Provider 实现。"""
+
+    provider_name = config.name.casefold()
+    try:
+        factory = _PROVIDER_FACTORIES[provider_name]
+    except KeyError as exc:
+        raise ProviderError(f"未注册的模型服务：{config.name}") from exc
+    return factory(config, timeout)

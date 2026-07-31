@@ -9,9 +9,15 @@ from typing import Callable, Mapping, Protocol
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
-from tricoder.models import RunResult, SessionContext, SessionMemory, SessionRecord
+from tricoder.models import (
+    ProviderConfig,
+    RunResult,
+    SessionContext,
+    SessionMemory,
+    SessionRecord,
+)
 from tricoder.policy import CommandPolicy, WorkspacePolicy
-from tricoder.providers import ModelProvider, OpenAICompatibleProvider
+from tricoder.providers import ModelProvider, create_provider
 from tricoder.sessions import (
     SessionError,
     SessionStore,
@@ -69,7 +75,7 @@ class ContextAgent(Protocol):
 
 
 ActiveSessionFactory = Callable[[SessionRecord, SessionMemory, RuntimeOptions], ActiveSession]
-ProviderFactory = Callable[[object, float], ModelProvider]
+ProviderFactory = Callable[[ProviderConfig, float], ModelProvider]
 ModelPreviewResolver = Callable[..., Mapping[str, str]]
 
 
@@ -105,7 +111,7 @@ class SessionRuntime:
         active_session_factory: ActiveSessionFactory | None = None,
         config_loader: Callable[..., AppConfig] = load_config,
         model_preview_resolver: ModelPreviewResolver = preview_provider_models,
-        provider_factory: ProviderFactory = OpenAICompatibleProvider,
+        provider_factory: ProviderFactory = create_provider,
         workspace_policy_factory: Callable[[Path], WorkspacePolicy] = WorkspacePolicy,
         command_policy_factory: Callable[[], CommandPolicy] = CommandPolicy,
         tool_registry_factory: Callable[[ToolContext], ToolRegistry] = ToolRegistry,
