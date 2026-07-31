@@ -42,6 +42,37 @@ python -B -m tricoder doctor --provider deepseek --workspace .
 | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
 | GLM | `ZAI_API_KEY` | `glm-5.2` |
 
+三家 Provider 都支持原生 structured tool calling。TriCoder 默认使用 `native`：向
+Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响应归一化为
+`ProviderResponse`，Agent 每轮只接受一个结构化工具调用，并用对应的
+`tool_call_id` 回填工具结果。
+
+| Provider | 原生工具调用 | 当前适配说明 |
+| --- | --- | --- |
+| OpenAI | 支持 | 发送工具定义和自动工具选择；客户端关闭并行调用 |
+| DeepSeek | 支持 | 发送工具定义和自动工具选择 |
+| GLM | 支持 | 发送工具定义和自动工具选择 |
+
+`TRICODER_TOOL_PROTOCOL` 只接受 `native` 或 `legacy_json`，默认是 `native`。
+进程环境变量优先于项目 `.tricoder.toml`。可以先用临时环境变量显式回滚：
+
+```powershell
+$env:TRICODER_TOOL_PROTOCOL = "legacy_json"
+python -B -m tricoder doctor --provider openai --workspace . --no-color
+```
+
+也可以在项目配置中持久回滚：
+
+```toml
+[agent]
+tool_protocol = "legacy_json"
+```
+
+`doctor` 会显示当前工具协议，但只显示 Key 的变量名和掩码，不显示 Key
+内容。排查问题时不要把 Key 粘贴到命令参数、日志、Issue 或聊天记录中。
+确认 Provider 的原生协议兼容后，把配置改回 `native`；删除进程覆盖可运行
+`Remove-Item Env:TRICODER_TOOL_PROTOCOL`。
+
 可选的项目配置示例：
 
 ```toml
@@ -50,6 +81,7 @@ model = "glm-5.2"
 max_rounds = 10
 max_context_chars = 80000
 timeout = 30
+tool_protocol = "native"
 
 [providers.glm]
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
@@ -142,6 +174,22 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 `--max-context-chars` 限制每次发送给模型的上下文大小。固定 system/user 消息会保留，历史按完整交互轮次截断，避免保留半个工具回合。
 
 `run` 的退出码：`0` 表示任务满足完成条件，`1` 表示任务未完成或最后验证失败，`2` 表示配置或运行前审计准备失败。
+
+## 新增 Provider 适配器
+
+新增 Provider 时保持边界最小：
+
+1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL 和模型。
+2. 在 `src/tricoder/providers.py` 声明 `ProviderCapabilities` 并注册工厂。若不是
+   OpenAI-compatible 协议，实现 `ModelProvider.complete(messages, tools)`。
+3. 适配器只返回归一化的 `ProviderResponse`、`ToolCall` 和
+   `ProviderProtocolError`，不要把厂商原始响应或认证头传给 Agent、日志或终端。
+4. 在 `src/tricoder/cli.py` 的 `--provider` 选项加入公开名称，并为配置、请求
+   序列化、响应解析、协议错误和 CLI 脱敏输出补测试。
+
+只有在适配器确实验证了原生工具调用时才声明
+`native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新
+Provider 绕过结构化响应适配的默认实现。
 
 ## 测试
 

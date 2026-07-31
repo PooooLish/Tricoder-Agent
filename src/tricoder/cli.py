@@ -174,12 +174,13 @@ def main(
             read_only=getattr(args, "read_only", False),
         )
     except ConfigError as exc:
-        ui.show_error("配置错误", str(exc))
+        ui.show_error("配置错误", str(exc).replace("tool_protocol", "工具协议"))
         return 2
 
     if args.command == "doctor":
         key_name = provider_key_env(args.provider)
         ui.show_doctor(config, key_name)
+        console.print(f"工具协议：{config.tool_protocol}")
         return 0
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -211,6 +212,7 @@ def main(
         max_context_chars=config.max_context_chars,
         audit=audit,
         observer=ui,
+        tool_protocol=config.tool_protocol,
     )
     result = agent.run(args.task)
     ui.show_complete(result, audit_path)

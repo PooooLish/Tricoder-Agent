@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 from tricoder.audit import AuditLogger
 from tricoder.cli import ConsoleApprover, build_parser, main
-from tricoder.models import Message, ProviderConfig
+from tricoder.models import (
+    Message,
+    ProviderConfig,
+    ProviderResponse,
+    ToolCall,
+    ToolDefinition,
+)
 from tricoder.providers import create_provider
 from tricoder.sessions import SessionError, SessionStore
 
@@ -17,15 +23,21 @@ class FinishingProvider:
     def __init__(self) -> None:
         self.messages: list[Message] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         self.messages = list(messages)
-        return json.dumps(
-            {
-                "tool": "finish",
-                "arguments": {"summary": "演示任务完成"},
-                "reason": "返回结果",
-            },
-            ensure_ascii=False,
+        return ProviderResponse(
+            tool_calls=(
+                ToolCall(
+                    "call-finish",
+                    "finish",
+                    {"summary": "演示任务完成"},
+                ),
+            ),
+            finish_reason="tool_calls",
         )
 
 
@@ -36,9 +48,48 @@ class ScriptedProvider:
         self.responses = list(responses)
         self.histories: list[list[Message]] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         self.histories.append(list(messages))
-        return json.dumps(self.responses.pop(0), ensure_ascii=False)
+        response = self.responses.pop(0)
+        return ProviderResponse(
+            tool_calls=(
+                ToolCall(
+                    f"call-{len(self.histories)}",
+                    str(response["tool"]),
+                    dict(response["arguments"]),  # type: ignore[arg-type]
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+
+
+class LegacyFinishingProvider:
+    """记录旧协议请求，确保 CLI 不会把显式回滚覆盖为 native。"""
+
+    def __init__(self) -> None:
+        self.tool_batches: list[tuple[ToolDefinition, ...]] = []
+
+    def complete(
+        self,
+        _messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        self.tool_batches.append(tuple(tools))
+        return ProviderResponse(
+            content=json.dumps(
+                {
+                    "tool": "finish",
+                    "arguments": {"summary": "旧协议任务完成"},
+                    "reason": "返回结果",
+                },
+                ensure_ascii=False,
+            ),
+            finish_reason="stop",
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -184,7 +235,46 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertIn("DEEPSEEK_API_KEY", text)
             self.assertIn("已设置", text)
+            self.assertIn("native", text)
             self.assertNotIn("super-secret-value", text)
+
+    def test_doctor_reports_explicit_legacy_protocol_without_exposing_key(self) -> None:
+        """防止 doctor 隐藏显式回滚状态，或在诊断输出中泄露凭据。"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            exit_code = main(
+                ["doctor", "--provider", "openai", "--workspace", directory],
+                environ={
+                    "OPENAI_API_KEY": "legacy-secret-value",
+                    "TRICODER_TOOL_PROTOCOL": "legacy_json",
+                },
+                output=output,
+            )
+
+            text = output.getvalue()
+            self.assertEqual(0, exit_code)
+            self.assertIn("legacy_json", text)
+            self.assertNotIn("legacy-secret-value", text)
+
+    def test_doctor_explains_invalid_tool_protocol_in_chinese(self) -> None:
+        """防止协议配置错误退化为堆栈、英文内部错误或含糊提示。"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            exit_code = main(
+                ["doctor", "--provider", "openai", "--workspace", directory],
+                environ={
+                    "OPENAI_API_KEY": "invalid-protocol-secret",
+                    "TRICODER_TOOL_PROTOCOL": "automatic",
+                },
+                output=output,
+            )
+
+            text = output.getvalue()
+            self.assertEqual(2, exit_code)
+            self.assertIn("工具协议", text)
+            self.assertIn("native", text)
+            self.assertIn("legacy_json", text)
+            self.assertNotIn("invalid-protocol-secret", text)
 
     def test_doctor_returns_configuration_error_when_key_is_missing(self) -> None:
         """防止缺少凭据时仍报告环境健康。"""
@@ -283,6 +373,36 @@ class CliTests(unittest.TestCase):
             logs = list(audit_dir.glob("*.jsonl"))
             self.assertEqual(1, len(logs))
             self.assertFalse((Path(directory) / "runtime").exists())
+
+    def test_run_preserves_explicit_legacy_tool_protocol(self) -> None:
+        """防止 one-shot 装配遗漏配置，并被 CodingAgent 的 native 默认值覆盖。"""
+        with tempfile.TemporaryDirectory() as directory:
+            provider = LegacyFinishingProvider()
+            audit_dir = Path(directory) / "audit-output"
+
+            exit_code = main(
+                [
+                    "run",
+                    "验证旧协议回滚",
+                    "--provider",
+                    "openai",
+                    "--workspace",
+                    directory,
+                    "--audit-dir",
+                    str(audit_dir),
+                    "--max-rounds",
+                    "1",
+                ],
+                environ={
+                    "OPENAI_API_KEY": "test-key",
+                    "TRICODER_TOOL_PROTOCOL": "legacy_json",
+                },
+                provider_factory=lambda _config, _timeout: provider,
+                output=io.StringIO(),
+            )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual([()], provider.tool_batches)
 
     def test_run_writes_audit_log_only_to_explicit_audit_dir(self) -> None:
         """显式审计目录应承接运行日志，目标工作区不应生成 runtime。"""
