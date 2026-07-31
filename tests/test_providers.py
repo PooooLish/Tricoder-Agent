@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from tricoder.models import (
     Message,
@@ -11,7 +12,24 @@ from tricoder.providers import (
     OpenAICompatibleProvider,
     ProviderError,
     ProviderProtocolError,
+    UrllibTransport,
 )
+
+
+class FakeHttpResponse:
+    """仅替代真实网络响应流，保留 Transport 的完整解码路径。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "FakeHttpResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
 
 
 class RecordingTransport:
@@ -73,6 +91,44 @@ WEATHER_TOOL = ToolDefinition(
 
 
 class ProviderTests(unittest.TestCase):
+    def test_urllib_transport_rejects_invalid_json_as_protocol_error(self) -> None:
+        """防止已收到的无效 JSON 被误分类为普通 Provider 故障。"""
+        transport = UrllibTransport()
+
+        with patch(
+            "tricoder.providers.urllib.request.urlopen",
+            return_value=FakeHttpResponse(b"not-json"),
+        ):
+            with self.assertRaises(ProviderError) as caught:
+                transport.post_json(
+                    "https://example.test/chat/completions",
+                    {"Authorization": "Bearer test-key"},
+                    {"model": "test-model", "messages": []},
+                    3,
+                )
+
+        self.assertIsInstance(caught.exception, ProviderProtocolError)
+        self.assertFalse(caught.exception.retryable)
+
+    def test_urllib_transport_rejects_non_object_json_as_protocol_error(self) -> None:
+        """防止顶层数组绕过统一厂商响应对象契约。"""
+        transport = UrllibTransport()
+
+        with patch(
+            "tricoder.providers.urllib.request.urlopen",
+            return_value=FakeHttpResponse(b"[]"),
+        ):
+            with self.assertRaises(ProviderError) as caught:
+                transport.post_json(
+                    "https://example.test/chat/completions",
+                    {"Authorization": "Bearer test-key"},
+                    {"model": "test-model", "messages": []},
+                    3,
+                )
+
+        self.assertIsInstance(caught.exception, ProviderProtocolError)
+        self.assertFalse(caught.exception.retryable)
+
     def test_returns_unified_text_response_and_preserves_finish_reason(self) -> None:
         """防止普通文本响应绕过统一响应契约。"""
         provider, _ = make_provider(

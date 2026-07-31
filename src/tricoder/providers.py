@@ -118,9 +118,9 @@ class UrllibTransport:
         try:
             decoded = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ProviderError("模型服务返回了无效 JSON") from exc
+            raise ProviderProtocolError("模型服务返回了无效 JSON") from exc
         if not isinstance(decoded, dict):
-            raise ProviderError("模型服务响应格式不正确")
+            raise ProviderProtocolError("模型服务响应格式不正确")
         return decoded
 
 
