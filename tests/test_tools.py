@@ -87,7 +87,6 @@ class ToolTests(unittest.TestCase):
             tuple(definition.name for definition in definitions),
         )
         self.assertTrue(all(isinstance(item, ToolDefinition) for item in definitions))
-        self.assertIs(definitions, self.registry.definitions)
         self.assertEqual(definitions, self.registry.definitions)
         self.assertTrue(all(self.registry.contains(item.name) for item in definitions))
         self.assertFalse(self.registry.contains("unknown_tool"))
@@ -131,8 +130,23 @@ class ToolTests(unittest.TestCase):
         """防止 describe 暴露处理器或根据运行时输入生成不稳定说明。"""
         definition = self.registry.definitions[0]
 
-        self.assertIs(definition, self.registry.describe(definition.name))
+        self.assertEqual(definition, self.registry.describe(definition.name))
         self.assertIsNone(self.registry.describe("unknown_tool"))
+
+    def test_public_definition_schema_mutation_cannot_change_registry_validation(self) -> None:
+        """防止调用方篡改嵌套 Schema 后放宽或改写内部参数校验。"""
+        public_definition = self.registry.definitions[1]
+        public_definition.parameters["required"].clear()
+        public_definition.parameters["properties"]["path"]["type"] = "integer"
+
+        original_definition = self.registry.definitions[1]
+        self.assertEqual(["path"], original_definition.parameters["required"])
+        self.assertEqual(
+            "string",
+            original_definition.parameters["properties"]["path"]["type"],
+        )
+        self.assertFalse(self.registry.execute("read_file", {}).ok)
+        self.assertFalse(self.registry.execute("read_file", {"path": 1}).ok)
 
     def test_execute_rejects_invalid_arguments_before_handler_side_effects(self) -> None:
         """防止缺参、类型错误或额外参数在处理器和审批前继续执行。"""

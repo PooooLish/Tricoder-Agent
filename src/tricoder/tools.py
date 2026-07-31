@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import os
 import secrets
@@ -462,25 +463,36 @@ class ToolRegistry:
                 self._finish,
             ),
         )
-        self._definitions = tuple(
-            registration.definition for registration in self._registrations
-        )
-
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        """返回顺序固定、仅供读取的公开工具定义。"""
-        return self._definitions
+        """返回顺序固定且与内部注册表隔离的公开工具定义。"""
+        return tuple(
+            self._public_definition(registration.definition)
+            for registration in self._registrations
+        )
 
     def contains(self, name: str) -> bool:
         """判断名称是否在公开注册表中。"""
-        return self.describe(name) is not None
+        return any(
+            registration.definition.name == name
+            for registration in self._registrations
+        )
 
     def describe(self, name: str) -> ToolDefinition | None:
         """只返回注册表中静态声明的公开定义。"""
         for registration in self._registrations:
             if registration.definition.name == name:
-                return registration.definition
+                return self._public_definition(registration.definition)
         return None
+
+    @staticmethod
+    def _public_definition(definition: ToolDefinition) -> ToolDefinition:
+        """复制嵌套 Schema，避免公开调用方修改注册表的校验依据。"""
+        return ToolDefinition(
+            definition.name,
+            definition.description,
+            copy.deepcopy(definition.parameters),
+        )
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         registration = next(
