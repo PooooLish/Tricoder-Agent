@@ -9,12 +9,21 @@ from typing import Any, Protocol
 from tricoder.audit import AuditLogger
 from tricoder.models import Message, RunResult, SessionContext, SessionTurnResult, ToolAction
 from tricoder.policy import PolicyError
-from tricoder.providers import ModelProvider, ProviderError
+from tricoder.providers import ModelProvider, ProviderError, ProviderProtocolError
 from tricoder.tools import ToolRegistry
 
 
-SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Coding Agent。
-每轮只能返回一个 JSON 对象，不能使用 Markdown 代码块，也不能添加对象之外的文字：
+COMMON_SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Coding Agent。
+不要输出隐藏思维过程。只说明当前动作的直接目的。
+编辑前必须先读取目标文件；遇到工具错误时根据错误信息调整下一步。
+"""
+
+NATIVE_TOOL_PROMPT = """使用 Provider 提供的原生工具调用完成任务。
+每轮必须且只能选择一个工具；不要用普通文本或并行工具调用代替。
+工具参数只包含当前工具定义允许的字段。
+"""
+
+LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Markdown 代码块，也不能添加对象之外的文字：
 {"tool":"工具名","arguments":{},"reason":"简短、可公开审计的操作理由"}
 
 可用工具：
@@ -25,20 +34,31 @@ SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Coding Agent
 - create_file: {"path":"相对文件","content":"新文件完整内容"}
 - run_command: {"command":"测试或静态检查命令","cwd":"可选相对目录"}
 - finish: {"summary":"完成情况、验证结果和剩余风险"}
-
-不要输出隐藏思维过程。reason 只说明当前动作的直接目的。
-编辑前必须先读取目标文件；遇到工具错误时根据错误信息调整下一步。
 """
+
+SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + NATIVE_TOOL_PROMPT
+LEGACY_SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + LEGACY_JSON_PROMPT
 
 
 CONTEXT_COMPACTION_NOTICE = "较早的消息已被压缩，以保留最新上下文。"
 AUDIT_FAILURE_MESSAGE = "无法写入审计日志，运行已安全停止"
+NATIVE_TEXT_FEEDBACK = "本轮没有工具调用。请下一轮只选择一个可用工具调用。"
+NATIVE_MULTIPLE_CALLS_FEEDBACK = "本轮包含多个工具调用，未执行任何一个。请下一轮只选择一个。"
+PROTOCOL_FEEDBACK = "模型响应未满足当前协议。请下一轮按系统规则重新提交一个动作。"
 
 
 def _message_chars(message: Message) -> int:
     """按上下文预算规则计算单条消息的字符数。"""
 
-    return len(message.role) + len(message.content)
+    return message.character_budget()
+
+
+def _is_tool_result_message(message: Message) -> bool:
+    """同时识别原生 tool 消息和旧版 user 工具结果。"""
+
+    return message.role == "tool" or (
+        message.role == "user" and message.kind == "tool_result"
+    )
 
 
 def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
@@ -56,7 +76,7 @@ def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
     while index + 1 < len(later_messages):
         assistant = later_messages[index]
         tool_result = later_messages[index + 1]
-        if assistant.role == "assistant" and tool_result.role == "user":
+        if assistant.role == "assistant" and tool_result.role in {"user", "tool"}:
             rounds.append((assistant, tool_result))
             index += 2
         else:
@@ -100,8 +120,7 @@ def _is_complete_history_task_block(block: list[Message]) -> bool:
         return False
     return all(
         block[index].role == "assistant"
-        and block[index + 1].role == "user"
-        and block[index + 1].kind == "tool_result"
+        and _is_tool_result_message(block[index + 1])
         for index in range(1, len(block), 2)
     )
 
@@ -218,6 +237,7 @@ class CodingAgent:
         max_context_chars: int = 80_000,
         audit: AuditLogger | None = None,
         observer: AgentObserver | None = None,
+        tool_protocol: str = "native",
     ) -> None:
         if max_rounds <= 0:
             raise ValueError("max_rounds 必须大于 0")
@@ -227,12 +247,15 @@ class CodingAgent:
             or max_context_chars <= 0
         ):
             raise ValueError("max_context_chars 必须大于 0")
+        if tool_protocol not in {"native", "legacy_json"}:
+            raise ValueError("tool_protocol 必须是 native 或 legacy_json")
         self.provider = provider
         self.tools = tools
         self.max_rounds = max_rounds
         self.max_context_chars = max_context_chars
         self.audit = audit
         self.observer = observer or NullObserver()
+        self.tool_protocol = tool_protocol
 
     def run(self, task: str) -> RunResult:
         """保持一次性运行接口的返回类型不变。"""
@@ -248,7 +271,12 @@ class CodingAgent:
 
         if not task.strip():
             return SessionTurnResult(RunResult(False, "任务描述不能为空", 0), context)
-        messages = [Message("system", SYSTEM_PROMPT)]
+        system_prompt = (
+            SYSTEM_PROMPT
+            if self.tool_protocol == "native"
+            else LEGACY_SYSTEM_PROMPT
+        )
+        messages = [Message("system", system_prompt)]
         if context.persisted_summary:
             messages.append(
                 Message(
@@ -310,8 +338,34 @@ class CodingAgent:
             self.observer.on_round_start(round_number, self.max_rounds)
             started = time.perf_counter()
             request_messages = compact_session_messages(messages, self.max_context_chars)
+            provider_tools = (
+                self.tools.definitions if self.tool_protocol == "native" else ()
+            )
             try:
-                raw_action = self.provider.complete(request_messages)
+                response = self.provider.complete(request_messages, provider_tools)
+            except ProviderProtocolError as exc:
+                self.observer.on_error(PROTOCOL_FEEDBACK)
+                messages.append(
+                    Message("user", PROTOCOL_FEEDBACK, kind="protocol_feedback")
+                )
+                if not self._log(
+                    {
+                        "round": round_number,
+                        "status": "provider_protocol_error",
+                        "error_type": type(exc).__name__,
+                        "error_chars": len(str(exc)),
+                        "duration_ms": self._elapsed_ms(started),
+                    }
+                ):
+                    return turn_result(
+                        self._audit_failure_result(
+                            round_number,
+                            tool_calls,
+                            modified_files,
+                            verification,
+                        )
+                    )
+                continue
             except ProviderError as exc:
                 self.observer.on_error(f"模型请求失败：{exc}")
                 if not self._log(
@@ -343,40 +397,95 @@ class CodingAgent:
                     rollback_task=True,
                 )
 
-            messages.append(Message("assistant", raw_action))
-            try:
-                action = parse_action(raw_action)
-            except ValueError as exc:
-                error = str(exc)
-                self.observer.on_error(error)
+            tool_call_id: str | None = None
+            if self.tool_protocol == "native":
+                if len(response.tool_calls) != 1:
+                    if not response.tool_calls and response.content:
+                        messages.append(Message("assistant", response.content))
+                        feedback = NATIVE_TEXT_FEEDBACK
+                    elif response.tool_calls:
+                        feedback = NATIVE_MULTIPLE_CALLS_FEEDBACK
+                    else:
+                        feedback = NATIVE_TEXT_FEEDBACK
+                    self.observer.on_error(feedback)
+                    messages.append(
+                        Message("user", feedback, kind="protocol_feedback")
+                    )
+                    if not self._log(
+                        {
+                            "round": round_number,
+                            "status": "invalid_action",
+                            "error_type": "ToolCallCountError",
+                            "error_chars": len(feedback),
+                            "duration_ms": self._elapsed_ms(started),
+                        }
+                    ):
+                        return turn_result(
+                            self._audit_failure_result(
+                                round_number,
+                                tool_calls,
+                                modified_files,
+                                verification,
+                            )
+                        )
+                    continue
+
+                call = response.tool_calls[0]
                 messages.append(
                     Message(
-                        "user",
-                        json.dumps(
-                            {"tool_result": {"ok": False, "output": error}},
-                            ensure_ascii=False,
-                        ),
-                        kind="tool_result",
+                        "assistant",
+                        response.content,
+                        tool_calls=(call,),
                     )
                 )
-                if not self._log(
-                    {
-                        "round": round_number,
-                        "status": "invalid_action",
-                        "error_type": type(exc).__name__,
-                        "error_chars": len(error),
-                        "duration_ms": self._elapsed_ms(started),
-                    }
-                ):
-                    return turn_result(
-                        self._audit_failure_result(
-                            round_number,
-                            tool_calls,
-                            modified_files,
-                            verification,
+                definition = self.tools.describe(call.name)
+                reason = (
+                    definition.description
+                    if definition is not None
+                    else "请求执行未注册的工具。"
+                )
+                action = ToolAction(
+                    tool=call.name,
+                    arguments=call.arguments,
+                    reason=reason,
+                )
+                tool_call_id = call.id
+            else:
+                raw_action = response.content or ""
+                messages.append(Message("assistant", raw_action))
+                try:
+                    action = parse_action(raw_action)
+                except ValueError as exc:
+                    error = str(exc)
+                    self.observer.on_error(error)
+                    messages.append(
+                        Message(
+                            "user",
+                            json.dumps(
+                                {"tool_result": {"ok": False, "output": error}},
+                                ensure_ascii=False,
+                            ),
+                            kind="tool_result",
                         )
                     )
-                continue
+                    if not self._log(
+                        {
+                            "round": round_number,
+                            "status": "invalid_action",
+                            "error_type": type(exc).__name__,
+                            "error_chars": len(error),
+                            "duration_ms": self._elapsed_ms(started),
+                        }
+                    ):
+                        return turn_result(
+                            self._audit_failure_result(
+                                round_number,
+                                tool_calls,
+                                modified_files,
+                                verification,
+                            )
+                        )
+                    continue
 
             self.observer.on_action(action)
             tool_calls += 1
@@ -392,29 +501,40 @@ class CodingAgent:
                 verification = "通过" if result.ok else "失败"
             duration_ms = self._elapsed_ms(started)
             self.observer.on_tool_result(action, result, duration_ms)
-            messages.append(
-                Message(
-                    "user",
-                    json.dumps(
-                        {
-                            "tool_result": {
-                                "tool": action.tool,
-                                "ok": result.ok,
-                                "output": result.output,
-                            }
-                        },
-                        ensure_ascii=False,
-                    ),
-                    kind="tool_result",
-                )
+            tool_result_content = json.dumps(
+                {
+                    "tool_result": {
+                        "tool": action.tool,
+                        "ok": result.ok,
+                        "output": result.output,
+                    }
+                },
+                ensure_ascii=False,
             )
+            if tool_call_id is not None:
+                messages.append(
+                    Message(
+                        "tool",
+                        tool_result_content,
+                        kind="tool_result",
+                        tool_call_id=tool_call_id,
+                    )
+                )
+            else:
+                messages.append(
+                    Message(
+                        "user",
+                        tool_result_content,
+                        kind="tool_result",
+                    )
+                )
             if not self._log(
                 {
                     "round": round_number,
                     "status": "ok" if result.ok else "tool_error",
                     "tool": (
                         action.tool
-                        if action.tool in self.tools._handlers
+                        if self.tools.contains(action.tool)
                         else "unknown"
                     ),
                     "reason_chars": len(action.reason),

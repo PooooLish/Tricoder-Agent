@@ -8,15 +8,22 @@ from unittest.mock import patch
 from tricoder import tools as tools_module
 from tricoder.agent import (
     CONTEXT_COMPACTION_NOTICE,
-    SYSTEM_PROMPT,
+    LEGACY_SYSTEM_PROMPT,
     CodingAgent,
     compact_messages,
     parse_action,
 )
 from tricoder.audit import AuditLogger
-from tricoder.models import Message, RunResult, SessionContext
+from tricoder.models import (
+    Message,
+    ProviderResponse,
+    RunResult,
+    SessionContext,
+    ToolCall,
+    ToolDefinition,
+)
 from tricoder.policy import CommandPolicy, WorkspacePolicy
-from tricoder.providers import ProviderError
+from tricoder.providers import ProviderError, ProviderProtocolError
 from tricoder.tools import ToolContext, ToolRegistry
 
 
@@ -51,10 +58,64 @@ class ScriptedProvider:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
         self.histories: list[list[Message]] = []
+        self.tool_batches: list[tuple[ToolDefinition, ...]] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         self.histories.append(list(messages))
-        return self.responses.pop(0)
+        self.tool_batches.append(tuple(tools))
+        return ProviderResponse(content=self.responses.pop(0))
+
+
+class StructuredScriptedProvider:
+    """记录原生工具定义和结构化消息历史的确定性 Provider。"""
+
+    def __init__(
+        self,
+        responses: list[ProviderResponse | ProviderError],
+    ) -> None:
+        self.responses = list(responses)
+        self.histories: list[list[Message]] = []
+        self.tool_batches: list[tuple[ToolDefinition, ...]] = []
+
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        self.histories.append(list(messages))
+        self.tool_batches.append(tuple(tools))
+        response = self.responses.pop(0)
+        if isinstance(response, ProviderError):
+            raise response
+        return response
+
+
+class PublicToolRegistry:
+    """只暴露 Agent 所需公开接口，防止测试放任私有注册表耦合。"""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self._registry = registry
+
+    @property
+    def context(self) -> ToolContext:
+        return self._registry.context
+
+    @property
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        return self._registry.definitions
+
+    def contains(self, name: str) -> bool:
+        return self._registry.contains(name)
+
+    def describe(self, name: str) -> ToolDefinition | None:
+        return self._registry.describe(name)
+
+    def execute(self, name: str, arguments: dict[str, object]) -> object:
+        return self._registry.execute(name, arguments)
 
 
 class FailingProvider:
@@ -63,7 +124,11 @@ class FailingProvider:
     def __init__(self) -> None:
         self.histories: list[list[Message]] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         self.histories.append(list(messages))
         raise ProviderError("模拟 Provider 故障")
 
@@ -75,11 +140,15 @@ class FailingOnSecondRequestProvider:
         self.first_response = first_response
         self.histories: list[list[Message]] = []
 
-    def complete(self, messages: list[Message]) -> str:
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         self.histories.append(list(messages))
         if len(self.histories) == 2:
             raise ProviderError("模拟第二次请求故障")
-        return self.first_response
+        return ProviderResponse(content=self.first_response)
 
 
 class FailingAudit:
@@ -116,11 +185,359 @@ class RecordingObserver:
         self.events.append(f"error:{message}")
 
 
+class CapturingObserver(RecordingObserver):
+    """保留公开动作，便于断言 reason 不来自模型自由文本。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.actions: list[object] = []
+
+    def on_action(self, current_action: object) -> None:
+        self.actions.append(current_action)
+        super().on_action(current_action)
+
+
 def action(tool: str, arguments: dict[str, object], reason: str = "测试") -> str:
     return json.dumps(
         {"tool": tool, "arguments": arguments, "reason": reason},
         ensure_ascii=False,
     )
+
+
+class NativeToolCallingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name)
+        (self.workspace / "sample.py").write_text("value = 1\n", encoding="utf-8")
+        self.tools = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(),
+                approver=lambda _action, _detail: True,
+                timeout=5,
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    @staticmethod
+    def response(call_id: str, name: str, arguments: dict[str, object]) -> ProviderResponse:
+        return ProviderResponse(
+            tool_calls=(ToolCall(call_id, name, arguments),),
+            finish_reason="tool_calls",
+        )
+
+    def test_default_native_mode_passes_definitions_and_preserves_tool_pair(self) -> None:
+        """工具定义、调用 ID 或结构化历史任一丢失时都应失败。"""
+        provider = StructuredScriptedProvider(
+            [
+                self.response("call-read", "read_file", {"path": "sample.py"}),
+                self.response("call-finish", "finish", {"summary": "读取完成"}),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("读取示例")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(self.tools.definitions, provider.tool_batches[0])
+        self.assertEqual(self.tools.definitions, provider.tool_batches[1])
+        assistant, tool = provider.histories[1][-2:]
+        self.assertEqual("assistant", assistant.role)
+        self.assertEqual(("call-read",), tuple(call.id for call in assistant.tool_calls))
+        self.assertEqual("tool", tool.role)
+        self.assertEqual("call-read", tool.tool_call_id)
+        self.assertIn('"tool": "read_file"', tool.content or "")
+
+    def test_plain_text_gets_controlled_feedback_without_parsing_content_json(self) -> None:
+        """原生模式不得把普通文本中的 JSON 当作工具调用执行。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    content=action("create_file", {"path": "leak.py", "content": "bad"})
+                ),
+                self.response("call-finish", "finish", {"summary": "已改用工具调用"}),
+            ]
+        )
+
+        with patch("tricoder.agent.parse_action", side_effect=AssertionError("不应解析")):
+            result = CodingAgent(provider, self.tools, max_rounds=2).run("检查协议")
+
+        self.assertTrue(result.ok)
+        self.assertFalse((self.workspace / "leak.py").exists())
+        feedback = provider.histories[1][-1]
+        self.assertEqual("user", feedback.role)
+        self.assertIn("工具调用", feedback.content or "")
+        self.assertNotIn("leak.py", feedback.content or "")
+
+    def test_multiple_tool_calls_execute_none_and_request_one_call(self) -> None:
+        """并行调用不得产生部分执行或文件副作用。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "call-create",
+                            "create_file",
+                            {"path": "created.py", "content": "created = True\n"},
+                        ),
+                        ToolCall(
+                            "call-edit",
+                            "edit_file",
+                            {
+                                "path": "sample.py",
+                                "old_text": "value = 1",
+                                "new_text": "value = 2",
+                            },
+                        ),
+                    )
+                ),
+                self.response("call-finish", "finish", {"summary": "已选择单个调用"}),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("拒绝并行调用")
+
+        self.assertTrue(result.ok)
+        self.assertFalse((self.workspace / "created.py").exists())
+        self.assertEqual(
+            "value = 1\n",
+            (self.workspace / "sample.py").read_text(encoding="utf-8"),
+        )
+        feedback = provider.histories[1][-1]
+        self.assertEqual("user", feedback.role)
+        self.assertIn("一个", feedback.content or "")
+
+    def test_protocol_error_can_recover_but_provider_error_stops_and_rolls_back(
+        self,
+    ) -> None:
+        """只有协议转换错误可进入受控纠错，传输类错误仍立即停止。"""
+        protocol_sentinel = "PROTOCOL-SENTINEL-PRIVATE"
+        recovering = StructuredScriptedProvider(
+            [
+                ProviderProtocolError(protocol_sentinel),
+                self.response("call-finish", "finish", {"summary": "协议已修正"}),
+            ]
+        )
+
+        recovered = CodingAgent(recovering, self.tools, max_rounds=2).run("修正协议")
+
+        self.assertTrue(recovered.ok)
+        feedback = recovering.histories[1][-1]
+        self.assertIn("协议", feedback.content or "")
+        self.assertNotIn(protocol_sentinel, feedback.content or "")
+
+        failing = StructuredScriptedProvider([ProviderError("HTTP 401")])
+        failed = CodingAgent(failing, self.tools, max_rounds=2).run_with_context(
+            "不可恢复",
+            SessionContext(),
+        )
+
+        self.assertFalse(failed.result.ok)
+        self.assertEqual(1, len(failing.histories))
+        self.assertEqual((), failed.context.messages)
+
+    def test_unknown_tool_returns_complete_assistant_tool_pair(self) -> None:
+        """未知名称也必须用相同调用 ID 返回工具错误，不能破坏消息协议。"""
+        provider = StructuredScriptedProvider(
+            [
+                self.response("call-unknown", "delete_everything", {"secret": "value"}),
+                self.response("call-finish", "finish", {"summary": "已改用安全工具"}),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("处理未知工具")
+
+        self.assertTrue(result.ok)
+        assistant, tool = provider.histories[1][-2:]
+        self.assertEqual("call-unknown", assistant.tool_calls[0].id)
+        self.assertEqual("tool", tool.role)
+        self.assertEqual("call-unknown", tool.tool_call_id)
+        self.assertIn("未知工具", tool.content or "")
+
+    def test_native_session_reuses_complete_assistant_tool_history(self) -> None:
+        """跨任务压缩不得丢弃原生 assistant/tool 完整回合。"""
+        first_provider = StructuredScriptedProvider(
+            [
+                self.response("call-read", "read_file", {"path": "sample.py"}),
+                self.response("call-finish", "finish", {"summary": "首轮完成"}),
+            ]
+        )
+        first = CodingAgent(first_provider, self.tools, max_rounds=2).run_with_context(
+            "读取示例",
+            SessionContext(),
+        )
+        second_provider = StructuredScriptedProvider(
+            [self.response("call-finish-2", "finish", {"summary": "继续完成"})]
+        )
+
+        second = CodingAgent(
+            second_provider,
+            self.tools,
+            max_rounds=1,
+        ).run_with_context("继续检查", first.context)
+
+        self.assertTrue(second.result.ok)
+        reused = second_provider.histories[0]
+        self.assertTrue(
+            any(
+                message.role == "assistant"
+                and message.tool_calls
+                and message.tool_calls[0].id == "call-read"
+                for message in reused
+            )
+        )
+        self.assertTrue(
+            any(
+                message.role == "tool" and message.tool_call_id == "call-read"
+                for message in reused
+            )
+        )
+
+    def test_finish_keeps_write_verification_requirement(self) -> None:
+        """原生 finish 不得绕过现有的写后验证判定。"""
+        provider = StructuredScriptedProvider(
+            [
+                self.response(
+                    "call-edit",
+                    "edit_file",
+                    {
+                        "path": "sample.py",
+                        "old_text": "value = 1",
+                        "new_text": "value = 2",
+                    },
+                ),
+                self.response("call-finish", "finish", {"summary": "修改完成"}),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("修改后结束")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("待验证", result.verification)
+        self.assertIn("尚未运行验证命令", result.summary)
+
+    def test_observer_reason_and_audit_use_only_public_static_metadata(self) -> None:
+        """Agent 不得读取私有注册表，也不得审计模型传入的完整参数。"""
+        content_sentinel = "ARGUMENT-CONTENT-SENTINEL-PRIVATE"
+        provider = StructuredScriptedProvider(
+            [
+                self.response(
+                    "call-create",
+                    "create_file",
+                    {"path": "created.py", "content": content_sentinel},
+                ),
+                self.response(
+                    "call-verify",
+                    "run_command",
+                    {"command": "python -m compileall -q created.py"},
+                ),
+                self.response("call-finish", "finish", {"summary": "完成"}),
+            ]
+        )
+        observer = CapturingObserver()
+        audit_path = self.workspace / "runtime" / "native.jsonl"
+        public_tools = PublicToolRegistry(self.tools)
+        agent = CodingAgent(
+            provider,
+            public_tools,  # type: ignore[arg-type]
+            max_rounds=3,
+            audit=AuditLogger(audit_path),
+            observer=observer,
+        )
+
+        result = agent.run("创建并验证文件")
+        trail = audit_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.ok)
+        definition = self.tools.describe("create_file")
+        self.assertIsNotNone(definition)
+        self.assertEqual(
+            definition.description,  # type: ignore[union-attr]
+            observer.actions[0].reason,  # type: ignore[attr-defined]
+        )
+        self.assertNotIn(content_sentinel, trail)
+
+
+class LegacyJsonModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name)
+        self.tools = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(),
+                approver=lambda _action, _detail: True,
+                timeout=5,
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_explicit_legacy_mode_passes_no_tools_and_parses_only_content(self) -> None:
+        """旧版只能消费 content，不能执行响应中附带的原生 ToolCall。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    content=action("finish", {"summary": "旧版完成"}),
+                    tool_calls=(
+                        ToolCall(
+                            "call-create",
+                            "create_file",
+                            {"path": "unexpected.py", "content": "bad = True\n"},
+                        ),
+                    ),
+                )
+            ]
+        )
+
+        result = CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=1,
+            tool_protocol="legacy_json",
+        ).run("兼容旧版")
+
+        self.assertTrue(result.ok)
+        self.assertEqual([()], provider.tool_batches)
+        self.assertFalse((self.workspace / "unexpected.py").exists())
+
+    def test_legacy_invalid_json_is_returned_for_self_correction(self) -> None:
+        """显式旧版路径必须保留非法 JSON 的可恢复反馈。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(content="这不是 JSON"),
+                ProviderResponse(content=action("finish", {"summary": "格式已修正"})),
+            ]
+        )
+
+        result = CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=2,
+            tool_protocol="legacy_json",
+        ).run("修正旧版格式")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(
+            any(
+                message.kind == "tool_result" and "动作格式错误" in (message.content or "")
+                for message in provider.histories[1]
+            )
+        )
+
+
+class LegacyCodingAgent(CodingAgent):
+    """让既有测试显式锁定旧版 JSON 协议。"""
+
+    def __init__(self, provider: object, tools: ToolRegistry, **kwargs: object) -> None:
+        super().__init__(
+            provider,  # type: ignore[arg-type]
+            tools,
+            tool_protocol="legacy_json",
+            **kwargs,
+        )
 
 
 class AgentTests(unittest.TestCase):
@@ -143,7 +560,7 @@ class AgentTests(unittest.TestCase):
     def test_audit_failure_after_tool_keeps_reusable_complete_turn(self) -> None:
         """防止审计失败让已执行工具只留下孤立 assistant 动作。"""
         provider = ScriptedProvider([action("read_file", {"path": "sample.py"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
 
         failed = agent.run_with_context("读取模块", SessionContext())
 
@@ -153,7 +570,7 @@ class AgentTests(unittest.TestCase):
             [message.kind for message in failed.context.messages],
         )
         resumed_provider = ScriptedProvider([action("finish", {"summary": "继续完成"})])
-        resumed = CodingAgent(resumed_provider, self.tools, max_rounds=2).run_with_context(
+        resumed = LegacyCodingAgent(resumed_provider, self.tools, max_rounds=2).run_with_context(
             "继续任务", failed.context
         )
         self.assertTrue(resumed.result.ok)
@@ -164,7 +581,7 @@ class AgentTests(unittest.TestCase):
     def test_audit_failure_after_finish_keeps_complete_turn(self) -> None:
         """防止 finish 的审计失败遗漏其对应 tool-result。"""
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
 
         failed = agent.run_with_context("结束任务", SessionContext())
 
@@ -185,7 +602,7 @@ class AgentTests(unittest.TestCase):
             ),
             persisted_summary="恢复摘要",
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=2, max_context_chars=1)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=1)
 
         completed = agent.run_with_context("当前任务", context)
 
@@ -205,7 +622,7 @@ class AgentTests(unittest.TestCase):
         """防止首次 Provider 失败把未完成的当前任务写入下轮历史。"""
         provider = FailingProvider()
         context = SessionContext(messages=(Message("user", "旧任务", kind="task"),))
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         failed = agent.run_with_context("当前任务", context)
 
@@ -221,7 +638,7 @@ class AgentTests(unittest.TestCase):
                 {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
             )
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         failed = agent.run_with_context("修改模块", SessionContext())
 
@@ -260,7 +677,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "completed"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=5)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5)
 
         result = agent.run("canonicalize modified files")
 
@@ -284,7 +701,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3, max_context_chars=2_000)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, max_context_chars=2_000)
 
         failed = agent.run_with_context("修改模块", SessionContext())
 
@@ -312,7 +729,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "继续完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         first = agent.run_with_context("检查模块", SessionContext())
         second = agent.run_with_context("继续补测试", first.context)
@@ -330,7 +747,7 @@ class AgentTests(unittest.TestCase):
     def test_persisted_summary_is_sent_without_raw_tool_history(self) -> None:
         """防止恢复会话时把未持久化的工具历史伪造进摘要。"""
         provider = ScriptedProvider([action("finish", {"summary": "继续检查"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
         context = SessionContext(persisted_summary="此前修改 src/app.py，验证通过")
 
         agent.run_with_context("继续检查", context)
@@ -353,7 +770,7 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2, max_context_chars=3_000)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=3_000)
 
         agent.run_with_context("当前任务", context)
 
@@ -379,12 +796,12 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         agent.run_with_context("当前任务", context)
 
         contents = [message.content for message in provider.histories[0]]
-        self.assertEqual([SYSTEM_PROMPT, "用户任务：当前任务"], contents)
+        self.assertEqual([LEGACY_SYSTEM_PROMPT, "用户任务：当前任务"], contents)
 
     def test_complete_external_history_is_kept_when_budget_fits(self) -> None:
         """防止历史规范化误删合法的完整工具回合。"""
@@ -396,14 +813,14 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         agent.run_with_context("当前任务", context)
 
         contents = [message.content for message in provider.histories[0]]
         self.assertEqual(
             [
-                SYSTEM_PROMPT,
+                LEGACY_SYSTEM_PROMPT,
                 "旧任务",
                 "旧动作",
                 "旧工具结果",
@@ -425,7 +842,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已验证"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         first = agent.run_with_context("修改模块", SessionContext())
         second = agent.run_with_context("验证修改", first.context)
@@ -446,7 +863,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "兼容完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         previous = agent.run_with_context(
             "旧会话", SessionContext(modified_files=("sample.py",), verification="待验证")
@@ -474,7 +891,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "run.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=6,
@@ -512,7 +929,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "private-safe.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=4,
@@ -543,7 +960,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "structured-command.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=2,
@@ -569,11 +986,15 @@ class AgentTests(unittest.TestCase):
         sentinel = "PROVIDER-ERROR-SENTINEL-PRIVATE"
 
         class FailingProvider:
-            def complete(self, _messages: list[Message]) -> str:
+            def complete(
+                self,
+                _messages: list[Message],
+                _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+            ) -> ProviderResponse:
                 raise ProviderError(sentinel)
 
         audit_path = self.workspace / "runtime" / "provider-error.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             FailingProvider(),
             self.tools,
             max_rounds=1,
@@ -599,7 +1020,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "unknown-argument.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=2,
@@ -632,7 +1053,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "invalid-cwd.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=2,
@@ -660,7 +1081,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         audit_path = self.workspace / "runtime" / "create-file.jsonl"
-        agent = CodingAgent(
+        agent = LegacyCodingAgent(
             provider,
             self.tools,
             max_rounds=3,
@@ -683,7 +1104,7 @@ class AgentTests(unittest.TestCase):
     def test_finish_without_file_modification_succeeds(self) -> None:
         """防止无文件修改的只读任务被错误地要求运行验证命令。"""
         provider = ScriptedProvider([action("finish", {"summary": "已完成检查"})])
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         result = agent.run("检查工作区")
 
@@ -701,7 +1122,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         result = agent.run("修改示例")
 
@@ -721,7 +1142,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
 
         result = agent.run("修改示例")
 
@@ -741,7 +1162,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改并验证"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
 
         result = agent.run("修改示例")
 
@@ -764,7 +1185,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "再次修改"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=5)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5)
 
         result = agent.run("连续修改示例")
 
@@ -784,7 +1205,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "创建完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
         target = self.workspace / "committed.py"
         real_unlink = os.unlink
 
@@ -820,7 +1241,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "编辑完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
 
         with patch_binding_close_failure():
             result = agent.run("先验证再编辑文件")
@@ -848,7 +1269,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "创建完成"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
         target = self.workspace / "close-warning.py"
 
         with patch_binding_close_failure():
@@ -876,7 +1297,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "保留已验证修改"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
 
         result = agent.run("验证后尝试失败编辑")
 
@@ -901,7 +1322,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "保留已验证修改"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
 
         result = agent.run("验证后尝试失败创建")
 
@@ -918,7 +1339,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修正格式"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         result = agent.run("检查格式")
 
@@ -935,7 +1356,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "改用安全方案"}),
             ]
         )
-        agent = CodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
 
         result = agent.run("安全完成")
 
@@ -945,7 +1366,7 @@ class AgentTests(unittest.TestCase):
     def test_stops_after_max_rounds(self) -> None:
         """防止异常模型造成无限调用和失控费用。"""
         provider = ScriptedProvider(["bad", "bad", "bad"])
-        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
 
         result = agent.run("不会结束的任务")
 
@@ -970,7 +1391,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         observer = RecordingObserver()
-        agent = CodingAgent(provider, self.tools, max_rounds=3, observer=observer)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, observer=observer)
 
         result = agent.run("读取后结束")
 
@@ -1214,7 +1635,7 @@ class AgentTests(unittest.TestCase):
         for value in (0, -1):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "max_context_chars"):
-                    CodingAgent(provider, self.tools, max_context_chars=value)
+                    LegacyCodingAgent(provider, self.tools, max_context_chars=value)
 
 
 if __name__ == "__main__":
