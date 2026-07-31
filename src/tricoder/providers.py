@@ -6,9 +6,16 @@ import json
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from tricoder.models import Message, ProviderConfig
+from tricoder.models import (
+    Message,
+    ProviderConfig,
+    ProviderResponse,
+    ToolCall,
+    ToolDefinition,
+)
 
 
 class ProviderError(RuntimeError):
@@ -17,6 +24,59 @@ class ProviderError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class ProviderProtocolError(ProviderError):
+    """厂商响应能收到，但无法转换成统一协议。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """单个厂商已声明支持的原生模型能力。"""
+
+    native_tool_calling: bool
+    strict_tool_schema: bool = False
+    parallel_tool_calls: bool = False
+    forced_tool_choice: bool = False
+    streaming: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderProfile:
+    """将厂商请求差异封装在 Provider 层内。"""
+
+    capabilities: ProviderCapabilities
+    automatic_tool_choice: bool = False
+
+
+_PROVIDER_PROFILES = {
+    "openai": _ProviderProfile(
+        ProviderCapabilities(
+            native_tool_calling=True,
+            strict_tool_schema=True,
+            parallel_tool_calls=True,
+            forced_tool_choice=True,
+            streaming=True,
+        ),
+        automatic_tool_choice=True,
+    ),
+    "deepseek": _ProviderProfile(
+        ProviderCapabilities(
+            native_tool_calling=True,
+            forced_tool_choice=True,
+            streaming=True,
+        ),
+        automatic_tool_choice=True,
+    ),
+    "glm": _ProviderProfile(
+        ProviderCapabilities(
+            native_tool_calling=True,
+            streaming=True,
+        ),
+        automatic_tool_choice=True,
+    ),
+}
+_DEFAULT_PROFILE = _ProviderProfile(ProviderCapabilities(native_tool_calling=False))
 
 
 class JsonTransport(Protocol):
@@ -65,8 +125,12 @@ class UrllibTransport:
 
 
 class ModelProvider(Protocol):
-    def complete(self, messages: list[Message]) -> str:
-        """根据完整消息历史生成下一步文本。"""
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        """根据完整消息历史和工具定义生成统一响应。"""
 
 
 class OpenAICompatibleProvider:
@@ -86,12 +150,32 @@ class OpenAICompatibleProvider:
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._sleeper = sleeper
+        self._profile = _PROVIDER_PROFILES.get(
+            config.name.casefold(),
+            _DEFAULT_PROFILE,
+        )
 
-    def complete(self, messages: list[Message]) -> str:
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """公开不可变的厂商能力快照。"""
+
+        return self._profile.capabilities
+
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
         payload: dict[str, object] = {
             "model": self._config.model,
-            "messages": [message.as_dict() for message in messages],
+            "messages": [self._serialize_message(message) for message in messages],
         }
+        if tools and self.capabilities.native_tool_calling:
+            payload["tools"] = [self._serialize_tool(tool) for tool in tools]
+            if self._profile.automatic_tool_choice:
+                payload["tool_choice"] = "auto"
+            if self.capabilities.parallel_tool_calls:
+                payload["parallel_tool_calls"] = False
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
@@ -106,7 +190,7 @@ class OpenAICompatibleProvider:
                     payload,
                     self._timeout,
                 )
-                return self._extract_content(response)
+                return self._extract_response(response)
             except ProviderError as exc:
                 if not exc.retryable or attempt == self._max_attempts - 1:
                     raise
@@ -114,7 +198,42 @@ class OpenAICompatibleProvider:
         raise ProviderError("模型请求重试逻辑异常")
 
     @staticmethod
-    def _extract_content(response: dict[str, object]) -> str:
+    def _serialize_message(message: Message) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_calls:
+            payload["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(
+                            call.arguments,
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+                for call in message.tool_calls
+            ]
+        if message.tool_call_id is not None:
+            payload["tool_call_id"] = message.tool_call_id
+        return payload
+
+    def _serialize_tool(self, tool: ToolDefinition) -> dict[str, object]:
+        function: dict[str, object] = {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+        if self.capabilities.strict_tool_schema:
+            function["strict"] = True
+        return {"type": "function", "function": function}
+
+    @classmethod
+    def _extract_response(cls, response: dict[str, object]) -> ProviderResponse:
         try:
             choices = response["choices"]
             if not isinstance(choices, list) or not choices:
@@ -125,9 +244,52 @@ class OpenAICompatibleProvider:
             message = first["message"]
             if not isinstance(message, dict):
                 raise TypeError
-            content = message["content"]
-            if not isinstance(content, str):
+            content = message.get("content")
+            raw_tool_calls = message.get("tool_calls", [])
+            if not isinstance(raw_tool_calls, list):
                 raise TypeError
-            return content
-        except (KeyError, TypeError, IndexError) as exc:
-            raise ProviderError("模型服务响应格式不正确") from exc
+            tool_calls = tuple(
+                cls._parse_tool_call(raw_call) for raw_call in raw_tool_calls
+            )
+            if content is not None and not isinstance(content, str):
+                raise TypeError
+            if content is None and not tool_calls:
+                raise TypeError
+            finish_reason = first.get("finish_reason")
+            if finish_reason is not None and not isinstance(finish_reason, str):
+                raise TypeError
+            return ProviderResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+            )
+        except ProviderProtocolError:
+            raise
+        except (KeyError, TypeError, IndexError, ValueError) as exc:
+            raise ProviderProtocolError("模型服务响应格式不正确") from exc
+
+    @staticmethod
+    def _parse_tool_call(raw_call: object) -> ToolCall:
+        try:
+            if not isinstance(raw_call, dict):
+                raise TypeError
+            call_id = raw_call["id"]
+            if raw_call.get("type") != "function":
+                raise TypeError
+            function = raw_call["function"]
+            if not isinstance(call_id, str) or not call_id:
+                raise TypeError
+            if not isinstance(function, dict):
+                raise TypeError
+            name = function["name"]
+            arguments_json = function["arguments"]
+            if not isinstance(name, str) or not name:
+                raise TypeError
+            if not isinstance(arguments_json, str):
+                raise TypeError
+            arguments = json.loads(arguments_json)
+            if not isinstance(arguments, dict):
+                raise TypeError
+            return ToolCall(id=call_id, name=name, arguments=arguments)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ProviderProtocolError("模型服务工具调用格式不正确") from exc
