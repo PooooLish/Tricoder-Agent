@@ -70,6 +70,11 @@ class StructuredModelTests(unittest.TestCase):
                 tool_calls=(ToolCall(id="call_1", name="read_file", arguments={}),),
             )
 
+    def test_message_rejects_unknown_role(self) -> None:
+        """防止未知角色绕过文本与工具消息的协议约束。"""
+        with self.assertRaises(ValueError):
+            Message(role="developer", content="不受支持的角色")
+
     def test_message_character_budget_includes_structured_tool_call_data(self) -> None:
         """防止上下文压缩只计算文本而遗漏工具名、调用 ID 与参数。"""
         call = ToolCall(

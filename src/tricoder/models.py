@@ -61,6 +61,8 @@ class Message:
     def __post_init__(self) -> None:
         """确保不同角色只携带其允许的结构化字段。"""
 
+        if self.role not in {"system", "user", "assistant", "tool"}:
+            raise ValueError("消息角色不受支持")
         if not isinstance(self.content, (str, type(None))):
             raise ValueError("消息内容必须是字符串或 None")
         if not isinstance(self.tool_calls, tuple) or not all(
