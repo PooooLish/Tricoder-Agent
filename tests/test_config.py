@@ -491,6 +491,24 @@ class ConfigTests(unittest.TestCase):
                             },
                         )
 
+    def test_tool_protocol_rejects_non_string_project_values(self) -> None:
+        """防止 TOML 列表或内联表绕过协议白名单并泄露 TypeError。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for parsed_value in ([], {"mode": "native"}):
+                with self.subTest(parsed_value=parsed_value):
+                    with patch.object(
+                        config_module,
+                        "_read_project_config",
+                        return_value={"agent": {"tool_protocol": parsed_value}},
+                    ):
+                        with self.assertRaisesRegex(ConfigError, "tool_protocol"):
+                            load_config(
+                                provider="openai",
+                                workspace=workspace,
+                                environ={"OPENAI_API_KEY": "test-key"},
+                            )
+
 
 if __name__ == "__main__":
     unittest.main()

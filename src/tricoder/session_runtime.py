@@ -417,7 +417,11 @@ class SessionRuntime:
             "audit": audit,
             "observer": self._observer,
         }
-        if "tool_protocol" in inspect.signature(self._agent_factory).parameters:
+        agent_parameters = inspect.signature(self._agent_factory).parameters
+        if "tool_protocol" in agent_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in agent_parameters.values()
+        ):
             agent_kwargs["tool_protocol"] = loaded.tool_protocol
         agent = self._agent_factory(provider, tools, **agent_kwargs)
         return ActiveSession(

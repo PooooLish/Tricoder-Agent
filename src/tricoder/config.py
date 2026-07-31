@@ -352,7 +352,10 @@ def load_config(
         raise ConfigError("model 不能为空")
     if not isinstance(selected_url, str) or not selected_url.startswith("https://"):
         raise ConfigError("base_url 必须是 HTTPS 地址")
-    if tool_protocol_value not in {"native", "legacy_json"}:
+    if (
+        not isinstance(tool_protocol_value, str)
+        or tool_protocol_value not in {"native", "legacy_json"}
+    ):
         raise ConfigError("tool_protocol 只能是 native 或 legacy_json")
 
     return AppConfig(

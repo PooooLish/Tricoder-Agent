@@ -362,8 +362,8 @@ class SessionRuntimeTests(unittest.TestCase):
                 tool_protocol="legacy_json",
             )
 
-        def agent_factory(*_args, tool_protocol, **_kwargs):  # type: ignore[no-untyped-def]
-            received_protocols.append(tool_protocol)
+        def agent_factory(*_args, **kwargs):  # type: ignore[no-untyped-def]
+            received_protocols.append(kwargs["tool_protocol"])
             return FakeAgent("configured")
 
         runtime = SessionRuntime(
