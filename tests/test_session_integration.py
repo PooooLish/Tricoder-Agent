@@ -9,7 +9,17 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionTurnResult
+from tricoder.models import (
+    AppConfig,
+    Message,
+    ProviderConfig,
+    ProviderResponse,
+    RunResult,
+    SessionContext,
+    SessionTurnResult,
+    ToolCall,
+    ToolDefinition,
+)
 from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime
 from tricoder.sessions import SessionStore
 from tricoder.agent import CodingAgent
@@ -27,6 +37,20 @@ class RecordingAgent:
 
     def run_with_context(self, task: str, context: SessionContext) -> SessionTurnResult:
         self.calls.append((task, context))
+        call_id = f"{self.provider}-call-{len(self.calls)}"
+        structured_round = (
+            Message(
+                "assistant",
+                None,
+                tool_calls=(ToolCall(call_id, "finish", {"summary": task}),),
+            ),
+            Message(
+                "tool",
+                '{"ok":true}',
+                kind="tool_result",
+                tool_call_id=call_id,
+            ),
+        )
         return SessionTurnResult(
             RunResult(
                 ok=True,
@@ -36,7 +60,11 @@ class RecordingAgent:
                 verification="passed",
             ),
             SessionContext(
-                messages=context.messages + (Message("user", task, kind="task"),),
+                messages=(
+                    *context.messages,
+                    Message("user", task, kind="task"),
+                    *structured_round,
+                ),
                 persisted_summary=context.persisted_summary,
                 modified_files=(f"src/{self.provider}.py",),
                 verification="passed",
@@ -48,10 +76,25 @@ class ScriptedProvider:
     """为真实 CodingAgent 提供本地固定动作序列。"""
 
     def __init__(self, responses: list[str]) -> None:
-        self.responses = responses
+        self.responses = list(responses)
+        self.call_number = 0
 
-    def complete(self, _messages) -> str:  # type: ignore[no-untyped-def]
-        return self.responses.pop(0)
+    def complete(
+        self,
+        _messages: list[Message],
+        _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        decoded = json.loads(self.responses.pop(0))
+        self.call_number += 1
+        return ProviderResponse(
+            tool_calls=(
+                ToolCall(
+                    f"integration-call-{self.call_number}",
+                    decoded["tool"],
+                    decoded["arguments"],
+                ),
+            )
+        )
 
 
 def action(tool: str, arguments: dict[str, object]) -> str:
@@ -86,6 +129,72 @@ class RecordingSessionFactory:
 
 
 class SessionIntegrationTests(unittest.TestCase):
+    def test_structured_context_survives_model_and_session_switches_until_clear(
+        self,
+    ) -> None:
+        """防止模型重建或会话切换串改结构化消息；清空只影响当前会话。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_workspace = (root / "workspace-one").resolve()
+            second_workspace = (root / "workspace-two").resolve()
+            first_workspace.mkdir()
+            second_workspace.mkdir()
+            store = SessionStore((root / "state" / "sessions.db").resolve())
+            store.initialize(first_workspace)
+            first = store.create("first", first_workspace, "openai", "model-a")
+            second = store.create("second", second_workspace, "glm", "model-b")
+            factory = RecordingSessionFactory({}, {})
+
+            def load_config(
+                *,
+                provider: str,
+                workspace: Path,
+                model: str | None = None,
+                **_options: object,
+            ) -> AppConfig:
+                return AppConfig(
+                    workspace=workspace,
+                    provider=ProviderConfig(
+                        provider,
+                        "test-key",
+                        "https://example.test",
+                        model or f"{provider}-model",
+                    ),
+                )
+
+            runtime = SessionRuntime(
+                store,
+                first_workspace,
+                options=RuntimeOptions(environ={}),
+                active_session_factory=factory,
+                config_loader=load_config,
+            )
+            runtime.run_task("first structured task")
+            first_snapshot = runtime.current.context
+
+            runtime.change_model("glm")
+
+            self.assertEqual(first_snapshot, runtime.current.context)
+            self.assertTrue(first_snapshot.messages[-2].tool_calls)
+            self.assertEqual(
+                first_snapshot.messages[-2].tool_calls[0].id,
+                first_snapshot.messages[-1].tool_call_id,
+            )
+
+            runtime.switch(second.id, confirm=lambda _workspace: True)
+            self.assertEqual((), runtime.current.context.messages)
+            runtime.run_task("second structured task")
+            second_snapshot = runtime.current.context
+            self.assertNotEqual(first_snapshot.messages, second_snapshot.messages)
+
+            runtime.switch(first.id, confirm=lambda _workspace: True)
+            self.assertEqual(first_snapshot, runtime.current.context)
+            runtime.clear_current()
+            self.assertEqual((), runtime.current.context.messages)
+
+            runtime.switch(second.id, confirm=lambda _workspace: True)
+            self.assertEqual(second_snapshot, runtime.current.context)
+
     def test_sqlite_persists_only_canonical_relative_paths_after_agent_writes(self) -> None:
         """防止 Agent 写入后将绝对路径或 dotdot 形式保存到 SQLite。"""
         with tempfile.TemporaryDirectory() as temporary:

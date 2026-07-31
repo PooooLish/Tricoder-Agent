@@ -541,6 +541,51 @@ class NativeToolCallingTests(unittest.TestCase):
             compacted,
         )
 
+    def test_compaction_budget_counts_structured_tool_arguments(self) -> None:
+        """防止只计算可见文本，让超大结构化参数绕过上下文预算。"""
+        fixed = [Message("system", "规则"), Message("user", "任务")]
+        oversized = [
+            Message(
+                "assistant",
+                None,
+                tool_calls=(
+                    ToolCall(
+                        "call-large",
+                        "read_file",
+                        {"path": "very-long/" + "nested/" * 100 + "sample.py"},
+                    ),
+                ),
+            ),
+            Message(
+                "tool",
+                '{"ok":true}',
+                kind="tool_result",
+                tool_call_id="call-large",
+            ),
+        ]
+        latest = [
+            Message(
+                "assistant",
+                None,
+                tool_calls=(ToolCall("call-latest", "finish", {"summary": "完成"}),),
+            ),
+            Message(
+                "tool",
+                '{"ok":true}',
+                kind="tool_result",
+                tool_call_id="call-latest",
+            ),
+        ]
+        expected = [
+            *fixed,
+            Message("system", CONTEXT_COMPACTION_NOTICE),
+            *latest,
+        ]
+
+        compacted = compact_messages([*fixed, *oversized, *latest], 300)
+
+        self.assertEqual(expected, compacted)
+
     def test_native_mode_drops_legacy_history_rounds(self) -> None:
         """原生请求不得混入旧版 assistant/user 工具回合。"""
         context = SessionContext(
