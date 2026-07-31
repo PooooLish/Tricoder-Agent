@@ -8,15 +8,96 @@ from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    """Provider 无关的可调用工具说明。"""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("工具名称必须是非空字符串")
+        if not isinstance(self.parameters, dict):
+            raise ValueError("工具参数 Schema 必须是对象")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """一次 Provider 已解析的工具调用。"""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("工具调用 ID 必须是非空字符串")
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("工具调用名称必须是非空字符串")
+        if not isinstance(self.arguments, dict):
+            raise ValueError("工具调用参数必须是对象")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderResponse:
+    """Provider 适配器归一化后的响应，不保留厂商原始对象。"""
+
+    content: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
+    finish_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     """发送给模型的一条消息。"""
 
     role: str
-    content: str
+    content: str | None
     kind: str = "generic"
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
 
-    def as_dict(self) -> dict[str, str]:
+    def __post_init__(self) -> None:
+        """确保不同角色只携带其允许的结构化字段。"""
+
+        if not isinstance(self.content, (str, type(None))):
+            raise ValueError("消息内容必须是字符串或 None")
+        if not isinstance(self.tool_calls, tuple) or not all(
+            isinstance(call, ToolCall) for call in self.tool_calls
+        ):
+            raise ValueError("消息工具调用必须是 ToolCall 元组")
+        if self.tool_call_id is not None and (
+            not isinstance(self.tool_call_id, str) or not self.tool_call_id
+        ):
+            raise ValueError("工具调用 ID 必须是非空字符串")
+
+        if self.role == "tool":
+            if self.content is None:
+                raise ValueError("工具结果必须包含文本内容")
+            if self.tool_calls:
+                raise ValueError("工具结果不能携带新的工具调用")
+            if self.tool_call_id is None:
+                raise ValueError("工具结果必须包含 tool_call_id")
+            return
+
+        if self.tool_call_id is not None:
+            raise ValueError("普通消息不能携带 tool_call_id")
+        if self.tool_calls and self.role != "assistant":
+            raise ValueError("只有 assistant 消息可以携带工具调用")
+        if self.content is None and not self.tool_calls:
+            raise ValueError("普通消息必须包含文本内容")
+
+    def as_dict(self) -> dict[str, str | None]:
         return {"role": self.role, "content": self.content}
+
+    def character_budget(self) -> int:
+        """返回消息在上下文预算中占用的统一字符数估算。"""
+
+        return len(self.role) + len(self.content or "") + len(self.tool_call_id or "") + sum(
+            len(call.id) + len(call.name) + len(str(call.arguments))
+            for call in self.tool_calls
+        )
 
 
 @dataclass(frozen=True, slots=True)
