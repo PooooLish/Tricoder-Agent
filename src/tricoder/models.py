@@ -125,6 +125,7 @@ class AppConfig:
     key_source: str = "进程环境变量"
     audit_dir: Path | None = None
     max_context_chars: int = 80_000
+    tool_protocol: str = "native"
 
 
 @dataclass(frozen=True, slots=True)

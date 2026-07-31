@@ -342,11 +342,18 @@ def load_config(
         if timeout is not None
         else env.get("TRICODER_TIMEOUT", agent_table.get("timeout", 30))
     )
+    tool_protocol_value = (
+        env["TRICODER_TOOL_PROTOCOL"]
+        if "TRICODER_TOOL_PROTOCOL" in env
+        else agent_table.get("tool_protocol", "native")
+    )
 
     if not isinstance(selected_model, str) or not selected_model.strip():
         raise ConfigError("model 不能为空")
     if not isinstance(selected_url, str) or not selected_url.startswith("https://"):
         raise ConfigError("base_url 必须是 HTTPS 地址")
+    if tool_protocol_value not in {"native", "legacy_json"}:
+        raise ConfigError("tool_protocol 只能是 native 或 legacy_json")
 
     return AppConfig(
         workspace=resolved_workspace,
@@ -363,4 +370,5 @@ def load_config(
         env_file=used_env_file,
         key_source=key_source,
         audit_dir=resolved_audit_dir,
+        tool_protocol=tool_protocol_value,
     )

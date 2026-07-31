@@ -344,6 +344,41 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertIsNot(original.agent, changed.agent)
         self.assertEqual("glm", changed.record.provider)
 
+    def test_rebuild_and_model_change_pass_tool_protocol_to_agent_factory(self) -> None:
+        """防止重建或 /model 切换时遗漏已加载的工具协议。"""
+        received_protocols: list[str] = []
+
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            provider = kwargs["provider"]
+            return AppConfig(
+                workspace=self.workspace,
+                provider=ProviderConfig(
+                    provider,
+                    "test-key",
+                    "https://example.test",
+                    f"{provider}-model",
+                ),
+                audit_dir=self.root / "audit",
+                tool_protocol="legacy_json",
+            )
+
+        def agent_factory(*_args, tool_protocol, **_kwargs):  # type: ignore[no-untyped-def]
+            received_protocols.append(tool_protocol)
+            return FakeAgent("configured")
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            config_loader=config_loader,
+            provider_factory=lambda _config, _timeout: object(),
+            agent_factory=agent_factory,
+        )
+
+        runtime.change_model("glm")
+
+        self.assertEqual(["legacy_json", "legacy_json"], received_protocols)
+
     def test_persist_failure_keeps_memory_and_marks_runtime_unsaved(self) -> None:
         """防止 SQLite 临时失败时丢失内存记忆或伪装为已保存。"""
         wrapped_store = FailingMemoryStore(self.store)

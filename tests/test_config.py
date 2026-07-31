@@ -444,6 +444,53 @@ class ConfigTests(unittest.TestCase):
                             max_context_chars=value,
                         )
 
+    def test_tool_protocol_defaults_to_native(self) -> None:
+        """防止未配置协议时意外回退到旧的 JSON 兼容模式。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai",
+                workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+
+        self.assertEqual("native", config.tool_protocol)
+
+    def test_tool_protocol_uses_environment_before_project_config(self) -> None:
+        """防止环境中的兼容模式开关被项目配置静默覆盖。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[agent]\ntool_protocol = "native"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={
+                    "OPENAI_API_KEY": "test-key",
+                    "TRICODER_TOOL_PROTOCOL": "legacy_json",
+                },
+            )
+
+        self.assertEqual("legacy_json", config.tool_protocol)
+
+    def test_tool_protocol_rejects_non_exact_values(self) -> None:
+        """防止大小写、空白或未知协议值被静默标准化后启用。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for value in ("NATIVE", " native", "native ", "", "unknown"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ConfigError, "tool_protocol"):
+                        load_config(
+                            provider="openai",
+                            workspace=workspace,
+                            environ={
+                                "OPENAI_API_KEY": "test-key",
+                                "TRICODER_TOOL_PROTOCOL": value,
+                            },
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

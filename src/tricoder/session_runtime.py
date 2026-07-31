@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
@@ -410,14 +411,15 @@ class SessionRuntime:
             raise SessionRuntimeError("运行配置缺少审计目录")
         audit = self._audit_factory(loaded.audit_dir / f"session-{record.id}.jsonl")
         audit.prepare()
-        agent = self._agent_factory(
-            provider,
-            tools,
-            max_rounds=loaded.max_rounds,
-            max_context_chars=loaded.max_context_chars,
-            audit=audit,
-            observer=self._observer,
-        )
+        agent_kwargs = {
+            "max_rounds": loaded.max_rounds,
+            "max_context_chars": loaded.max_context_chars,
+            "audit": audit,
+            "observer": self._observer,
+        }
+        if "tool_protocol" in inspect.signature(self._agent_factory).parameters:
+            agent_kwargs["tool_protocol"] = loaded.tool_protocol
+        agent = self._agent_factory(provider, tools, **agent_kwargs)
         return ActiveSession(
             record,
             memory,
