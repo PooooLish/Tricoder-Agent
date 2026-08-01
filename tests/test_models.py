@@ -6,10 +6,16 @@ from pathlib import Path
 # 让 ``python -m unittest`` 在未安装包的源码工作树中也能直接发现 ``src``。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tricoder.models import Message, ProviderResponse, ToolCall, ToolDefinition
+from tricoder.models import Message, ProviderResponse, ToolCall, ToolDefinition, ToolResult
 
 
 class StructuredModelTests(unittest.TestCase):
+    def test_tool_result_keeps_legacy_and_multi_file_paths(self) -> None:
+        result = ToolResult(True, "ok", "legacy.py", ("a.py", "b.py"))
+
+        self.assertEqual("legacy.py", result.relative_path)
+        self.assertEqual(("a.py", "b.py"), result.modified_paths)
+
     def test_tool_definition_rejects_blank_name_and_non_object_parameters(self) -> None:
         """防止没有可调用名称或参数对象的工具定义进入 Provider 适配层。"""
         with self.assertRaises(ValueError):

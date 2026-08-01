@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tricoder import tools as tools_module
+from tricoder.changes import ChangeJournal, FileIdentity
 from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
@@ -237,6 +238,63 @@ class ToolTests(unittest.TestCase):
         self.assertIn("+    return 42", self.approver.requests[0][1])
         self.assertEqual([], list((self.workspace / "src").glob("*.tmp")))
 
+    def test_edit_file_records_before_and_committed_after_snapshots(self) -> None:
+        """防止编辑账本遗漏原始内容，或记录尚未提交的预测后态。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        registry = ToolRegistry(
+            ToolContext(
+                workspace_policy=WorkspacePolicy(self.workspace),
+                command_policy=CommandPolicy(),
+                approver=RecordingApprover([True]),
+                change_journal=journal,
+            )
+        )
+
+        result = registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 41", "new_text": "return 42"},
+        )
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual("def answer():\n    return 41\n", change_set.changes[0].before.content)
+        self.assertEqual("def answer():\n    return 42\n", change_set.changes[0].after.content)
+        metadata = (self.workspace / "src" / "app.py").stat()
+        self.assertEqual(
+            FileIdentity(metadata.st_dev, metadata.st_ino),
+            change_set.changes[0].after.identity,
+        )
+
+    def test_edit_file_rejects_journal_over_budget_before_approval(self) -> None:
+        """防止预算不足时仍请求审批或触碰原文件。"""
+        journal = ChangeJournal(max_chars=10)
+        journal.begin_task((), "not-run")
+        approver = RecordingApprover([])
+        registry = ToolRegistry(
+            ToolContext(
+                workspace_policy=WorkspacePolicy(self.workspace),
+                command_policy=CommandPolicy(),
+                approver=approver,
+                change_journal=journal,
+            )
+        )
+        target = self.workspace / "src" / "app.py"
+        original = target.read_bytes()
+
+        result = registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 41", "new_text": "return 42"},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("变更预算不足", result.output)
+        self.assertEqual([], approver.requests)
+        self.assertEqual(original, target.read_bytes())
+        self.assertIsNone(journal.seal_task((), "not-run"))
+
     def test_successful_writes_return_policy_canonical_relative_path(self) -> None:
         """防止工具成功后仍把绝对或 dotdot 输入暴露给会话元数据。"""
         target = self.workspace / "src" / "app.py"
@@ -329,6 +387,34 @@ class ToolTests(unittest.TestCase):
         self.assertEqual("create_file", self.approver.requests[0][0])
         self.assertIn("+答案 = '安全'", self.approver.requests[0][1])
         self.assertEqual([], list((self.workspace / "src").glob("*.tmp")))
+
+    def test_create_file_records_missing_before_and_published_after_snapshot(self) -> None:
+        """防止新建账本伪造前态，或沿用临时文件而非发布目标的身份。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        registry = ToolRegistry(
+            ToolContext(
+                workspace_policy=WorkspacePolicy(self.workspace),
+                command_policy=CommandPolicy(),
+                approver=RecordingApprover([True]),
+                change_journal=journal,
+            )
+        )
+
+        result = registry.execute(
+            "create_file",
+            {"path": "src/new.py", "content": "answer = 42\n"},
+        )
+        change_set = journal.seal_task(("src/new.py",), "not-run")
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        change = change_set.changes[0]
+        self.assertIsNone(change.before)
+        self.assertEqual("answer = 42\n", change.after.content)
+        metadata = (self.workspace / "src" / "new.py").stat()
+        self.assertEqual(FileIdentity(metadata.st_dev, metadata.st_ino), change.after.identity)
 
     def test_create_approval_receives_complete_diff_beyond_output_limit(self) -> None:
         """防止超长新文件的审批详情遗漏末尾关键内容。"""
@@ -543,6 +629,9 @@ class ToolTests(unittest.TestCase):
     def test_create_file_reports_success_with_warning_after_cleanup_failure(self) -> None:
         """硬链接发布是提交点；之后清理失败不得把已创建文件伪装成失败。"""
         target = self.workspace / "src" / "committed.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
 
         with patch_binding_cleanup_failure(target):
             result = self.registry.execute(
@@ -553,10 +642,15 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("清理警告", result.output)
         self.assertEqual("committed = True\n", target.read_text(encoding="utf-8"))
+        change_set = journal.seal_task(("src/committed.py",), "not-run")
+        self.assertEqual("src/committed.py", change_set.changes[0].path)
 
     def test_edit_reports_success_with_warning_after_binding_close_failure(self) -> None:
         """原子替换成功后关闭目录绑定失败，不得把真实修改伪装成失败。"""
         target = self.workspace / "src" / "app.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
 
         with patch_binding_close_failure():
             result = self.registry.execute(
@@ -574,12 +668,17 @@ class ToolTests(unittest.TestCase):
             "def answer():\n    return 42\n",
             target.read_text(encoding="utf-8"),
         )
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+        self.assertEqual("src/app.py", change_set.changes[0].path)
 
     def test_create_reports_success_with_warning_after_binding_close_failure(
         self,
     ) -> None:
         """硬链接发布成功后关闭目录绑定失败，不得把真实创建伪装成失败。"""
         target = self.workspace / "src" / "close-warning.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
 
         with patch_binding_close_failure():
             result = self.registry.execute(
@@ -596,6 +695,8 @@ class ToolTests(unittest.TestCase):
             "committed = True\n",
             target.read_text(encoding="utf-8"),
         )
+        change_set = journal.seal_task(("src/close-warning.py",), "not-run")
+        self.assertEqual("src/close-warning.py", change_set.changes[0].path)
 
     def test_create_file_rejects_sensitive_path(self) -> None:
         """防止创建工具绕过工作区敏感路径策略。"""

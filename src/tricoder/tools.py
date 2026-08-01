@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from tricoder.changes import ChangeJournal, FileChange, FileIdentity, FileSnapshot
 from tricoder.models import ToolDefinition, ToolResult
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 
@@ -27,16 +28,8 @@ class _ToolRegistration:
     handler: Callable[[dict[str, Any]], ToolResult]
 
 
-@dataclass(frozen=True, slots=True)
-class _FileIdentity:
-    """跨平台比较文件系统对象身份所需的稳定字段。"""
-
-    device: int
-    inode: int
-
-
-def _stat_identity(metadata: os.stat_result) -> _FileIdentity:
-    return _FileIdentity(metadata.st_dev, metadata.st_ino)
+def _stat_identity(metadata: os.stat_result) -> FileIdentity:
+    return FileIdentity(metadata.st_dev, metadata.st_ino)
 
 
 def _is_windows() -> bool:
@@ -72,7 +65,7 @@ class _DirectoryBinding:
     def verify_parent(self, parent: Path) -> bool:
         raise NotImplementedError
 
-    def read_text(self, name: str) -> tuple[str, _FileIdentity, int]:
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
         raise NotImplementedError
 
     def target_exists(self, name: str) -> bool:
@@ -125,7 +118,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
         except OSError:
             return False
 
-    def read_text(self, name: str) -> tuple[str, _FileIdentity, int]:
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(name, flags, dir_fd=self._fd)
@@ -237,7 +230,7 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
         return chain
 
     @classmethod
-    def _open_handle(cls, path: Path) -> tuple[int, _FileIdentity]:
+    def _open_handle(cls, path: Path) -> tuple[int, FileIdentity]:
         import ctypes
         from ctypes import wintypes
 
@@ -290,7 +283,7 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
             error = ctypes.WinError(ctypes.get_last_error())
             kernel32.CloseHandle(handle)
             raise error
-        identity = _FileIdentity(
+        identity = FileIdentity(
             information.volume_serial_number,
             (information.file_index_high << 32) | information.file_index_low,
         )
@@ -324,7 +317,7 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
         finally:
             self._close_handle(handle)
 
-    def read_text(self, name: str) -> tuple[str, _FileIdentity, int]:
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
         with (self.parent / name).open("r", encoding="utf-8") as file:
             metadata = os.fstat(file.fileno())
             content = file.read()
@@ -379,6 +372,7 @@ class ToolContext:
     read_only: bool = False
     timeout: float = 30.0
     max_output_chars: int = 20_000
+    change_journal: ChangeJournal | None = None
 
 
 class ToolRegistry:
@@ -631,14 +625,16 @@ class ToolRegistry:
             preapproved = self.context.workspace_policy.resolve_path(raw_path)
             if preapproved != path or not binding.verify_parent(preapproved.parent):
                 return ToolResult(False, "目标父目录身份发生变化，拒绝请求审批")
-            original, original_identity, original_mode = binding.read_text(path.name)
+            relative = path.relative_to(self.context.workspace_policy.workspace)
+            relative_path = relative.as_posix()
+            before = self._snapshot(binding, path.name, relative_path)
+            original = before.content
             if original.count(old_text) != 1:
                 return ToolResult(
                     False,
                     "old_text 必须在目标文件中恰好出现一次，请重新读取文件",
                 )
             updated = original.replace(old_text, new_text, 1)
-            relative = path.relative_to(self.context.workspace_policy.workspace)
             diff = "".join(
                 difflib.unified_diff(
                     original.splitlines(keepends=True),
@@ -647,24 +643,33 @@ class ToolRegistry:
                     tofile=str(relative),
                 )
             )
+            projected_after = FileSnapshot(
+                relative_path,
+                updated,
+                before.mode,
+                before.identity,
+            )
+            self._reserve_change(FileChange(relative_path, before, projected_after))
             if not self.context.approver("edit_file", diff):
                 return ToolResult(False, "用户拒绝了文件修改")
 
             verified = self.context.workspace_policy.resolve_path(raw_path)
             if not binding.verify_parent(verified.parent) or verified != path:
                 return ToolResult(False, "审批后目标父目录身份发生变化，拒绝写入")
-            current, current_identity, _current_mode = binding.read_text(path.name)
-            if current_identity != original_identity or current != original:
+            current = self._snapshot(binding, path.name, relative_path)
+            if current.identity != before.identity or current.content != original:
                 return ToolResult(False, "审批后目标文件发生变化，请重新读取并审批")
 
             temporary_name = binding.create_temporary(
                 path.name,
                 updated,
-                original_mode,
+                before.mode,
             )
             binding.replace(temporary_name, path.name)
             committed = True
             temporary_name = None
+            after = self._snapshot(binding, path.name, relative_path)
+            self._record_committed(relative_path, before, after)
         finally:
             if temporary_name is not None:
                 try:
@@ -680,7 +685,7 @@ class ToolRegistry:
         output = f"已修改 {relative}"
         if close_warning:
             output += "；关闭警告：目录绑定未能正常关闭，文件修改已提交，请在验证时检查目录"
-        return ToolResult(True, output, relative.as_posix())
+        return ToolResult(True, output, relative_path)
 
     def _create_file(self, arguments: dict[str, Any]) -> ToolResult:
         """经审批后，以不可覆盖的原子发布方式创建 UTF-8 文件。"""
@@ -730,6 +735,14 @@ class ToolRegistry:
             )
             if preapproved != path or not binding.verify_parent(preapproved.parent):
                 return ToolResult(False, "目标父目录身份发生变化，拒绝请求审批")
+            relative_path = relative.as_posix()
+            projected_after = FileSnapshot(
+                relative_path,
+                content,
+                0o600,
+                FileIdentity(0, 0),
+            )
+            self._reserve_change(FileChange(relative_path, None, projected_after))
             if not self.context.approver("create_file", diff):
                 return ToolResult(False, "用户拒绝了创建文件")
 
@@ -748,6 +761,8 @@ class ToolRegistry:
             except OSError:
                 return ToolResult(False, "create_file 无法原子发布文件，拒绝覆盖")
             committed = True
+            after = self._snapshot(binding, path.name, relative_path)
+            self._record_committed(relative_path, None, after)
             try:
                 binding.unlink(temporary_name)
             except OSError:
@@ -770,7 +785,35 @@ class ToolRegistry:
             output += "；清理警告：临时链接未能删除，请在验证时检查目录"
         if close_warning:
             output += "；关闭警告：目录绑定未能正常关闭，文件创建已提交，请在验证时检查目录"
-        return ToolResult(True, output, relative.as_posix())
+        return ToolResult(True, output, relative_path)
+
+    @staticmethod
+    def _snapshot(
+        binding: _DirectoryBinding,
+        name: str,
+        relative: str,
+    ) -> FileSnapshot:
+        """通过已绑定目录读取 UTF-8 内容、规范权限与真实文件身份。"""
+
+        content, identity, mode = binding.read_text(name)
+        return FileSnapshot(relative, content, stat.S_IMODE(mode), identity)
+
+    def _reserve_change(self, change: FileChange) -> None:
+        """有活动账本时在审批前预留字符预算。"""
+
+        if self.context.change_journal is not None:
+            self.context.change_journal.reserve((change,))
+
+    def _record_committed(
+        self,
+        path: str,
+        before: FileSnapshot | None,
+        after: FileSnapshot | None,
+    ) -> None:
+        """仅在文件系统提交点之后记录真实快照。"""
+
+        if self.context.change_journal is not None:
+            self.context.change_journal.record_committed(path, before, after)
 
     def _run_command(self, arguments: dict[str, Any]) -> ToolResult:
         if self.context.read_only:

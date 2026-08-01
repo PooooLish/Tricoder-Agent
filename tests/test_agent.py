@@ -21,6 +21,7 @@ from tricoder.models import (
     SessionContext,
     ToolCall,
     ToolDefinition,
+    ToolResult,
 )
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ProviderError, ProviderProtocolError
@@ -148,6 +149,15 @@ class PublicToolRegistry:
 
     def execute(self, name: str, arguments: dict[str, object]) -> object:
         return self._registry.execute(name, arguments)
+
+
+class MultiPathToolRegistry(PublicToolRegistry):
+    """模拟一次成功写入多个路径的未来工具。"""
+
+    def execute(self, name: str, arguments: dict[str, object]) -> object:
+        if name == "edit_file":
+            return ToolResult(True, "ok", None, ("a.py", "b.py", "a.py"))
+        return super().execute(name, arguments)
 
 
 class FailingProvider:
@@ -1013,6 +1023,24 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(("sample.py", "other.py"), result.modified_files)
         self.assertFalse(any(path.is_absolute() for path in map(Path, result.modified_files)))
         self.assertFalse(any(".." in path for path in result.modified_files))
+
+    def test_successful_multi_path_result_records_each_path_once(self) -> None:
+        """防止多文件工具只记录首个路径或在会话状态中产生重复项。"""
+        provider = ScriptedProvider(
+            [
+                action(
+                    "edit_file",
+                    {"path": "sample.py", "old_text": "1", "new_text": "2"},
+                ),
+                action("finish", {"summary": "已完成"}),
+            ]
+        )
+        agent = LegacyCodingAgent(provider, MultiPathToolRegistry(self.tools), max_rounds=2)
+
+        result = agent.run("修改多个文件")
+
+        self.assertEqual(("a.py", "b.py"), result.modified_files)
+        self.assertEqual("待验证", result.verification)
 
     def test_tiny_budget_still_sends_latest_complete_tool_round(self) -> None:
         """当前任务的完整工具回合即使超预算也必须发送给 Provider。"""

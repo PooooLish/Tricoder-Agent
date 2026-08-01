@@ -144,6 +144,7 @@ class ToolResult:
     ok: bool
     output: str
     relative_path: str | None = None
+    modified_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

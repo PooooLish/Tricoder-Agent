@@ -538,11 +538,17 @@ class CodingAgent:
             self.observer.on_action(action)
             tool_calls += 1
             result = self.tools.execute(action.tool, action.arguments)
-            if action.tool in {"edit_file", "create_file"} and result.ok:
-                # 仅使用写工具在 WorkspacePolicy 边界内确认的规范相对路径，
-                # 不回读模型提供的原始参数，避免绝对路径或 dotdot 进入会话状态。
-                if result.relative_path is not None and result.relative_path not in modified_files:
-                    modified_files.append(result.relative_path)
+            # 只消费工具在文件安全边界内确认的规范路径，不回读模型原始参数。
+            changed_paths = tuple(
+                dict.fromkeys(
+                    ([result.relative_path] if result.relative_path is not None else [])
+                    + list(result.modified_paths)
+                )
+            )
+            for changed_path in changed_paths:
+                if changed_path not in modified_files:
+                    modified_files.append(changed_path)
+            if result.ok and changed_paths:
                 # 成功写入会使此前命令验证立即失效，必须重新验证。
                 verification = "待验证"
             if action.tool == "run_command":
