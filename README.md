@@ -9,7 +9,7 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 
 - **统一 Provider 边界**：OpenAI、DeepSeek、GLM 响应统一归一化为内部 `ProviderResponse` 与 `ToolCall`。
 - **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
-- **可控本地执行**：读取、编辑、创建文件和运行受限命令；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；写操作与命令执行需要人工审批。
+- **可控本地执行**：读取、编辑、创建文件和运行受限命令；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；`--read-only` 禁止 `edit_file`、`create_file`、`apply_patch` 等写入；写操作与命令执行需要人工审批。
 - **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态。
 - **本地斜杠命令**：`/session`、`/model`、`/status`、`/clear` 等命令不会发送给 Provider。
 - **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。
@@ -147,7 +147,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 | `/model` | 显示 OpenAI、DeepSeek、GLM 的模型并按序号切换。 |
 | `/clear` | 仅在输入 `y` 或 `yes` 后清除当前 Session 的运行时上下文和持久化摘要。 |
 | `/diff` | 本地展示当前 Session 最近一次非空任务的正向 unified diff，不发送给 Provider。 |
-| `/undo` | 先本地展示当前 Session 最近一次非空任务的完整反向 unified diff；仅在输入 `y` 或 `yes` 后尝试撤销整组变更。任何外部内容、权限模式或文件身份冲突都会拒绝全部写入。 |
+| `/undo` | 先本地展示当前 Session 最近一次非空任务的完整反向 unified diff；仅在输入 `y` 或 `yes` 后尝试撤销整组变更。任何外部内容、权限模式或文件身份冲突都会拒绝全部写入；`--read-only` 会在预览或确认前拒绝撤销。 |
 | `/session` | 列出全部 Session，并按序号选择。 |
 | `/session new <名称>` | 用当前工作区、Provider 和模型创建并切换到新 Session。 |
 | `/session current` | 显示当前 Session 的详细信息。 |
@@ -160,7 +160,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 
 ## 任务级变更预览与撤销
 
-每次非空 Agent 任务的文件净变更只保存在当前进程中对应 Session 的内存账本里。`/diff` 正向预览最近一条非空任务；`/undo` 先完整预览反向 diff，再以 `y` 或 `yes` 明确确认。撤销会重新核验每个目标的内容、权限模式与文件身份；只要发现任一外部冲突，就拒绝全部写入。经确认后，撤销也可能删除由该任务创建的文件。
+每次非空 Agent 任务的文件净变更只保存在当前进程中对应 Session 的内存账本里。`/diff` 正向预览最近一条非空任务，在 `--read-only` 下仍可使用；`/undo` 先完整预览反向 diff，再以 `y` 或 `yes` 明确确认。`--read-only` 会在预览或确认前稳定拒绝 `/undo`。撤销会重新核验每个目标的内容、权限模式与文件身份；只要发现任一外部冲突，就拒绝全部写入。经确认后，撤销也可能删除由该任务创建的文件。
 
 源码快照、正向/反向 diff 和 Provider 的补丁文本不会写入 SQLite、JSONL 审计记录或 Provider 请求。内存账本总预算为 2,000,000 个字符，进程重启后历史即消失。MVP 不提供 `/redo`、多级撤销、按历史记录选择撤销、持久化撤销历史，也不依赖 Git；`apply_patch` 同样不支持文件删除或重命名补丁。
 
