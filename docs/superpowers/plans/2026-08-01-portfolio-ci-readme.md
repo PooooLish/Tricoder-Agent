@@ -270,11 +270,28 @@ Expected: 测试与编译成功；没有未提交差异；`main` 只领先 `orig
 Run:
 
 ```powershell
-git grep -l -E "(sk-[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|(OPENAI|DEEPSEEK|ZAI)_API_KEY[[:space:]]*=[[:space:]]*[^<[:space:]])"
-git ls-files .env .env.local "*.key" "*.pem"
+$credentialScanPattern = '(sk-[A-Za-z0-9_-]{20,}|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|(OPENAI|DEEPSEEK|ZAI)_API_KEY[[:space:]]*=[[:space:]]*[^<[:space:]])'
+$allowedCredentialFixtureFiles = @(
+  '.env.example',
+  'docs/superpowers/plans/2026-07-31-interactive-slash-sessions.md',
+  'tests/test_cli.py',
+  'tests/test_config.py'
+)
+$credentialHitFiles = @(git grep -l -E $credentialScanPattern --)
+$unexpectedCredentialHitFiles = @($credentialHitFiles | Where-Object { $_ -notin $allowedCredentialFixtureFiles })
+if ($unexpectedCredentialHitFiles.Count -gt 0) {
+  $unexpectedCredentialHitFiles
+  throw 'Unexpected credential-like content found.'
+}
+
+$trackedSensitiveFiles = @(git ls-files -- .env .env.local '*.key' '*.pem')
+if ($trackedSensitiveFiles.Count -gt 0) {
+  $trackedSensitiveFiles
+  throw 'Sensitive credential file is tracked.'
+}
 ```
 
-Expected: 两条命令都没有输出。第一条只输出疑似命中的文件名，不输出匹配文本。
+Expected: `unexpectedCredentialHitFiles` 和 `trackedSensitiveFiles` 两类输出均为空。凭据内容扫描仅以文件名形式输出不在允许列表中的异常文件，绝不输出匹配文本。
 
 - [ ] **Step 3: 推送当前 `main`**
 
