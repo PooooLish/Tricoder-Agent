@@ -1,11 +1,15 @@
 import inspect
+import json
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tricoder.audit import AuditLogger
+from tricoder.changes import ChangeJournal, FileIdentity, FileSnapshot
 from tricoder.config import ConfigError
-from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionTurnResult
+from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionMemory, SessionTurnResult
+from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import create_provider
 from tricoder.session_runtime import (
     ActiveSession,
@@ -14,6 +18,7 @@ from tricoder.session_runtime import (
     SessionRuntimeError,
 )
 from tricoder.sessions import SessionStore
+from tricoder.tools import ToolContext, ToolRegistry
 
 
 class FakeAgent:
@@ -80,6 +85,129 @@ class FailingMemoryStore:
         self.store.save_memory(session_id, memory)
 
 
+class CountingJournal(ChangeJournal):
+    """记录事务边界，确保 Runtime 每次任务只开闭一次账本。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.begun = 0
+        self.sealed = 0
+
+    def begin_task(self, modified_files: tuple[str, ...], verification: str) -> None:
+        self.begun += 1
+        super().begin_task(modified_files, verification)
+
+    def seal_task(self, modified_files: tuple[str, ...], verification: str):  # type: ignore[no-untyped-def]
+        self.sealed += 1
+        return super().seal_task(modified_files, verification)
+
+
+class SealFailingJournal(CountingJournal):
+    """先真实封存，再模拟事务收尾钩子异常。"""
+
+    def seal_task(self, modified_files: tuple[str, ...], verification: str):  # type: ignore[no-untyped-def]
+        super().seal_task(modified_files, verification)
+        raise RuntimeError("SEAL-ERROR-SENTINEL")
+
+
+class JournalWritingAgent:
+    """在返回前模拟工具已提交写入；不写磁盘，只验证 Runtime 事务编排。"""
+
+    def __init__(self, journal: ChangeJournal, label: str) -> None:
+        self.journal = journal
+        self.label = label
+
+    def run_with_context(self, task: str, context: SessionContext) -> SessionTurnResult:
+        modified_files: tuple[str, ...] = ()
+        if task != "no-write":
+            path = f"src/{self.label}.py"
+            before = FileSnapshot(path, f"{self.label}-before\n", 0o644, FileIdentity(1, 1))
+            after = FileSnapshot(path, f"{self.label}-after\n", 0o644, FileIdentity(1, 2))
+            self.journal.record_committed(path, before, after)
+            modified_files = (path,)
+        result = RunResult(
+            ok=task != "failed-write",
+            summary="受控结果",
+            rounds=1,
+            modified_files=modified_files,
+            verification="failed" if task == "failed-write" else "passed",
+        )
+        return SessionTurnResult(
+            result,
+            SessionContext(
+                messages=context.messages,
+                persisted_summary=context.persisted_summary,
+                modified_files=modified_files,
+                verification=result.verification,
+            ),
+        )
+
+
+class RegistryWritingAgent:
+    """通过真实 ToolRegistry 提交一改一建，覆盖 Runtime 与工具账本的装配边界。"""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self.registry = registry
+
+    def run_with_context(self, _task: str, context: SessionContext) -> SessionTurnResult:
+        edited = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/app.py",
+                "old_text": "BEFORE_SENTINEL",
+                "new_text": "AFTER_SENTINEL",
+            },
+        )
+        created = self.registry.execute(
+            "create_file",
+            {"path": "src/created.py", "content": "CREATED_SENTINEL\n"},
+        )
+        if not edited.ok or not created.ok:
+            raise AssertionError((edited, created))
+        paths = ("src/app.py", "src/created.py")
+        return SessionTurnResult(
+            RunResult(True, "完成", 1, modified_files=paths, verification="passed"),
+            replace(context, modified_files=paths, verification="passed"),
+        )
+
+
+class ExplodingJournalAgent:
+    """在真实提交账本记录后抛出同一个异常实例。"""
+
+    def __init__(self, journal: ChangeJournal, error: Exception) -> None:
+        self.journal = journal
+        self.error = error
+
+    def run_with_context(self, _task: str, _context: SessionContext) -> SessionTurnResult:
+        before = FileSnapshot("src/error.py", "before\n", 0o644, FileIdentity(1, 1))
+        after = FileSnapshot("src/error.py", "after\n", 0o644, FileIdentity(1, 2))
+        self.journal.record_committed("src/error.py", before, after)
+        raise self.error
+@dataclass
+class JournalSessionFactory:
+    journals: dict[str, CountingJournal]
+
+    def __call__(self, record, memory, _options) -> ActiveSession:  # type: ignore[no-untyped-def]
+        journal = CountingJournal()
+        self.journals[record.id] = journal
+        config = AppConfig(
+            workspace=record.workspace,
+            provider=ProviderConfig(record.provider, "test-key", "https://example.test", record.model),
+        )
+        return ActiveSession(
+            record,
+            memory,
+            SessionContext(
+                persisted_summary=memory.summary,
+                modified_files=memory.modified_files,
+                verification=memory.verification,
+            ),
+            config,
+            JournalWritingAgent(journal, record.name),
+            journal=journal,
+        )
+
+
 class SessionRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -103,6 +231,56 @@ class SessionRuntimeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def _runtime_with_real_registry(
+        self,
+        store: SessionStore | FailingMemoryStore | None = None,
+    ) -> tuple[SessionRuntime, Path]:
+        active_store = store or self.store
+        memory = SessionMemory(
+            modified_files=("src/prior.py",),
+            verification="not-run",
+        )
+        active_store.save_memory(self.first.id, memory)
+        runtime = SessionRuntime(
+            active_store,  # type: ignore[arg-type]
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=FakeBuilder(set()),
+        )
+        source_dir = self.workspace / "src"
+        source_dir.mkdir(exist_ok=True)
+        target = source_dir / "app.py"
+        target.write_text("value = 'BEFORE_SENTINEL'\n", encoding="utf-8")
+        journal = ChangeJournal()
+        registry = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(),
+                lambda _action, _detail: True,
+                change_journal=journal,
+            )
+        )
+        audit_path = self.root / "audit" / f"session-{runtime.current.record.id}.jsonl"
+        audit = AuditLogger(audit_path)
+        audit.prepare()
+        runtime.current = ActiveSession(
+            runtime.current.record,
+            memory,
+            SessionContext(
+                modified_files=memory.modified_files,
+                verification=memory.verification,
+            ),
+            runtime.current.config,
+            RegistryWritingAgent(registry),
+            registry,
+            journal,
+            audit,
+        )
+        runtime._persisted_memory = memory
+        runtime._memory_dirty = False
+        runtime._cache_current()
+        return runtime, audit_path
+
     def test_runtime_uses_shared_provider_factory_by_default(self) -> None:
         """防止交互会话与 CLI 使用不同的厂商注册表。"""
         default_factory = inspect.signature(SessionRuntime).parameters[
@@ -110,6 +288,195 @@ class SessionRuntimeTests(unittest.TestCase):
         ].default
 
         self.assertIs(create_provider, default_factory)
+
+    def test_failed_write_is_sealed_once_and_no_write_keeps_latest_diff(self) -> None:
+        journals: dict[str, CountingJournal] = {}
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=JournalSessionFactory(journals),
+        )
+
+        result = runtime.run_task("failed-write")
+        first_diff = runtime.diff_latest()
+        runtime.run_task("no-write")
+
+        self.assertFalse(result.ok)
+        self.assertIsNotNone(first_diff)
+        self.assertIn("-first-before", first_diff or "")
+        self.assertIn("+first-after", first_diff or "")
+        self.assertEqual(runtime.diff_latest(), first_diff)
+        self.assertEqual(journals[runtime.current.record.id].begun, 2)
+        self.assertEqual(journals[runtime.current.record.id].sealed, 2)
+
+    def test_session_journals_are_isolated_and_survive_clear_model_change(self) -> None:
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            provider = kwargs["provider"]
+            return AppConfig(
+                workspace=self.workspace,
+                provider=ProviderConfig(provider, "test-key", "https://example.test", f"{provider}-model"),
+            )
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=JournalSessionFactory({}),
+            config_loader=config_loader,
+        )
+        session_a = runtime.current.record.id
+        runtime.run_task("write-a")
+        diff_a = runtime.diff_latest()
+
+        runtime.create("third")
+        session_b = runtime.current.record.id
+        runtime.run_task("write-b")
+        diff_b = runtime.diff_latest()
+        runtime.switch(session_a, confirm=lambda _workspace: True)
+
+        self.assertEqual(runtime.diff_latest(), diff_a)
+        runtime.clear_current()
+        self.assertEqual(runtime.diff_latest(), diff_a)
+        runtime.change_model("glm")
+        self.assertEqual(runtime.diff_latest(), diff_a)
+        runtime.switch(session_b, confirm=lambda _workspace: True)
+        self.assertEqual(runtime.diff_latest(), diff_b)
+
+    def test_restart_does_not_restore_source_snapshots(self) -> None:
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=JournalSessionFactory({}),
+        )
+        runtime.run_task("write")
+        self.assertIsNotNone(runtime.diff_latest())
+
+        restarted = SessionRuntime(
+            SessionStore(self.store.database_path),
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=JournalSessionFactory({}),
+        )
+
+        self.assertIsNone(restarted.diff_latest())
+
+    def test_agent_exception_after_write_is_sealed_and_reraised_unchanged(self) -> None:
+        journals: dict[str, CountingJournal] = {}
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=JournalSessionFactory(journals),
+        )
+        error = LookupError("AGENT-ERROR-SENTINEL")
+        journal = runtime.current.journal
+        runtime.current = replace(
+            runtime.current,
+            agent=ExplodingJournalAgent(journal, error),
+        )
+
+        with self.assertRaises(LookupError) as raised:
+            runtime.run_task("explode")
+
+        self.assertIs(error, raised.exception)
+        self.assertIn("-before", runtime.diff_latest() or "")
+        self.assertIn("+after", runtime.diff_latest() or "")
+        self.assertEqual(1, journals[runtime.current.record.id].begun)
+        self.assertEqual(1, journals[runtime.current.record.id].sealed)
+
+    def test_agent_exception_is_not_masked_by_secondary_seal_failure(self) -> None:
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=FakeBuilder(set()),
+        )
+        journal = SealFailingJournal()
+        error = LookupError("PRIMARY-AGENT-ERROR")
+        runtime.current = replace(
+            runtime.current,
+            journal=journal,
+            agent=ExplodingJournalAgent(journal, error),
+        )
+
+        with self.assertRaises(LookupError) as raised:
+            runtime.run_task("explode")
+
+        self.assertIs(error, raised.exception)
+        self.assertIsNotNone(journal.latest())
+
+    def test_prepare_and_undo_restore_structured_state_clear_journal_and_audit_safely(self) -> None:
+        runtime, audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+
+        preview = runtime.prepare_undo()
+        execution = runtime.undo_latest()
+
+        self.assertIn("-value = 'AFTER_SENTINEL'", preview.diff)
+        self.assertIn("+value = 'BEFORE_SENTINEL'", preview.diff)
+        self.assertTrue(execution.ok)
+        self.assertEqual("value = 'BEFORE_SENTINEL'\n", (self.workspace / "src" / "app.py").read_text(encoding="utf-8"))
+        self.assertFalse((self.workspace / "src" / "created.py").exists())
+        self.assertIsNone(runtime.diff_latest())
+        self.assertEqual(("src/prior.py",), runtime.current.context.modified_files)
+        self.assertEqual("not-run", runtime.current.context.verification)
+        self.assertEqual(("src/prior.py",), runtime.current.memory.modified_files)
+        self.assertEqual("not-run", runtime.current.memory.verification)
+        persisted = self.store.load_memory(runtime.current.record.id)
+        self.assertEqual(("src/prior.py",), persisted.modified_files)
+        audit_text = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn("BEFORE_SENTINEL", audit_text)
+        self.assertNotIn("AFTER_SENTINEL", audit_text)
+        self.assertNotIn(preview.diff, audit_text)
+        event = json.loads(audit_text.splitlines()[-1])
+        self.assertEqual("undo", event["event"])
+        self.assertEqual("succeeded", event["status"])
+        self.assertEqual(["src/app.py", "src/created.py"], event["paths"])
+        self.assertEqual(
+            {
+                "timestamp",
+                "event",
+                "status",
+                "paths",
+                "file_count",
+                "conflict_count",
+                "compensation_status",
+            },
+            set(event),
+        )
+
+    def test_successful_undo_keeps_files_restored_when_memory_persist_fails_then_retries(self) -> None:
+        wrapped = FailingMemoryStore(self.store)
+        runtime, _audit_path = self._runtime_with_real_registry(wrapped)
+        runtime.run_task("write mixed change")
+        wrapped.fail_writes = True
+
+        execution = runtime.undo_latest()
+
+        self.assertTrue(execution.ok)
+        self.assertEqual("value = 'BEFORE_SENTINEL'\n", (self.workspace / "src" / "app.py").read_text(encoding="utf-8"))
+        self.assertIsNone(runtime.diff_latest())
+        self.assertEqual("本次记忆未持久化", runtime.status().warning)
+        wrapped.fail_writes = False
+        self.assertTrue(runtime.retry_persist())
+        self.assertEqual("", runtime.status().warning)
+
+    def test_read_only_rejects_undo_before_tool_preview_but_keeps_diff_available(self) -> None:
+        runtime, _audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        runtime.current = replace(
+            runtime.current,
+            config=replace(runtime.current.config, read_only=True),
+        )
+        diff = runtime.diff_latest()
+
+        with self.assertRaises(SessionRuntimeError):
+            runtime.prepare_undo()
+
+        self.assertEqual(diff, runtime.diff_latest())
+        self.assertEqual("value = 'AFTER_SENTINEL'\n", (self.workspace / "src" / "app.py").read_text(encoding="utf-8"))
 
     def test_startup_restores_only_latest_session_for_current_workspace(self) -> None:
         """防止启动时错误跳转到另一个工作区的最新会话。"""

@@ -138,6 +138,50 @@ class RecordingSessionFactory:
 
 
 class SessionIntegrationTests(unittest.TestCase):
+    def test_default_active_session_shares_one_ephemeral_journal_with_tools(self) -> None:
+        """防止默认装配让 Runtime 与写工具记录到不同账本，或把快照写进 SQLite。"""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = SessionStore((root / "state" / "sessions.db").resolve())
+            registries: list[ToolRegistry] = []
+
+            def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+                provider = kwargs["provider"]
+                return AppConfig(
+                    workspace=workspace,
+                    provider=ProviderConfig(
+                        provider,
+                        "test-key",
+                        "https://example.test",
+                        "model-a",
+                    ),
+                    audit_dir=root / "audit",
+                )
+
+            def agent_factory(_provider, tools, **_kwargs):  # type: ignore[no-untyped-def]
+                registries.append(tools)
+                return RecordingAgent("openai", {})
+
+            runtime = SessionRuntime(
+                store,
+                workspace,
+                options=RuntimeOptions(environ={}),
+                config_loader=config_loader,
+                provider_factory=lambda _config, _timeout: object(),
+                agent_factory=agent_factory,
+            )
+
+            self.assertIs(runtime.current.tools, registries[0])
+            self.assertIs(
+                runtime.current.journal,
+                registries[0].context.change_journal,
+            )
+            self.assertIsNotNone(runtime.current.audit)
+            self.assertIsNone(runtime.diff_latest())
+
     def test_structured_context_survives_model_and_session_switches_until_clear(
         self,
     ) -> None:

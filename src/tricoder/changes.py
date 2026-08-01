@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
 
 
@@ -44,6 +45,44 @@ class TaskChangeSet:
     before_verification: str
     after_modified_files: tuple[str, ...]
     after_verification: str
+
+
+@dataclass(frozen=True, slots=True)
+class UndoPreview:
+    """撤销前展示的反向差异与规范相对路径。"""
+
+    diff: str
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UndoExecution:
+    """一次全量撤销的结构化结果，不包含任何源码快照。"""
+
+    ok: bool
+    paths: tuple[str, ...]
+    conflicts: tuple[str, ...] = ()
+    compensation_failed: tuple[str, ...] = ()
+
+
+def render_change_set_diff(change_set: TaskChangeSet, *, reverse: bool = False) -> str:
+    """按规范路径顺序渲染任务正向或反向 unified diff。"""
+
+    chunks: list[str] = []
+    for change in sorted(change_set.changes, key=lambda item: item.path):
+        source = change.after if reverse else change.before
+        target = change.before if reverse else change.after
+        chunks.append(
+            "".join(
+                difflib.unified_diff(
+                    source.content.splitlines(keepends=True) if source else [],
+                    target.content.splitlines(keepends=True) if target else [],
+                    fromfile=change.path if source else "/dev/null",
+                    tofile=change.path if target else "/dev/null",
+                )
+            )
+        )
+    return "".join(chunks)
 
 
 class ChangeBudgetError(ValueError):

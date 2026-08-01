@@ -12,7 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from tricoder.changes import ChangeJournal, FileChange, FileIdentity, FileSnapshot
+from tricoder.changes import (
+    ChangeJournal,
+    FileChange,
+    FileIdentity,
+    FileSnapshot,
+    TaskChangeSet,
+    UndoExecution,
+    UndoPreview,
+    render_change_set_diff,
+)
 from tricoder.models import ToolDefinition, ToolResult
 from tricoder.patches import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
@@ -47,6 +56,23 @@ class _CommittedFilePatch:
 
     prepared: _PreparedFilePatch
     after: FileSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedUndo:
+    """已解析并绑定到工作区边界的单个撤销目标。"""
+
+    change: FileChange
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedUndo:
+    """已恢复到 before 的目标，以及可恢复原 inode 的 after 硬链接。"""
+
+    prepared: _PreparedUndo
+    restored: FileSnapshot | None
+    backup_name: str | None
 
 
 def _stat_identity(metadata: os.stat_result) -> FileIdentity:
@@ -102,6 +128,9 @@ class _DirectoryBinding:
         raise NotImplementedError
 
     def unlink(self, temporary_name: str) -> None:
+        raise NotImplementedError
+
+    def chmod(self, name: str, mode: int) -> None:
         raise NotImplementedError
 
     @staticmethod
@@ -209,6 +238,9 @@ class _PosixDirectoryBinding(_DirectoryBinding):
 
     def unlink(self, temporary_name: str) -> None:
         os.unlink(temporary_name, dir_fd=self._fd)
+
+    def chmod(self, name: str, mode: int) -> None:
+        os.chmod(name, mode, dir_fd=self._fd, follow_symlinks=False)
 
 
 class _WindowsDirectoryBinding(_DirectoryBinding):
@@ -382,6 +414,9 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
     def unlink(self, temporary_name: str) -> None:
         os.unlink(self.parent / temporary_name)
 
+    def chmod(self, name: str, mode: int) -> None:
+        os.chmod(self.parent / name, mode)
+
 
 @dataclass(slots=True)
 class ToolContext:
@@ -533,6 +568,228 @@ class ToolRegistry:
             return registration.handler(arguments)
         except (PolicyError, OSError, UnicodeError, ValueError, TypeError) as exc:
             return ToolResult(False, str(exc))
+
+    def preview_undo(self, change_set: TaskChangeSet) -> UndoPreview:
+        """首次全量核验 after 快照，并生成不落盘的反向差异。"""
+
+        if self.context.read_only:
+            raise PolicyError("只读模式禁止撤销")
+        paths = tuple(sorted(change.path for change in change_set.changes))
+        _prepared, bindings, conflicts = self._open_undo_targets(change_set)
+        self._close_bindings(bindings)
+        if conflicts:
+            raise PolicyError(f"无法撤销，文件状态冲突：{'、'.join(conflicts)}")
+        return UndoPreview(render_change_set_diff(change_set, reverse=True), paths)
+
+    def undo_change_set(self, change_set: TaskChangeSet) -> UndoExecution:
+        """再次全量核验后恢复整组文件；中途失败则反向补偿已恢复目标。"""
+
+        paths = tuple(sorted(change.path for change in change_set.changes))
+        if self.context.read_only:
+            return UndoExecution(False, paths, conflicts=paths)
+        prepared, bindings, conflicts = self._open_undo_targets(change_set)
+        if conflicts:
+            self._close_bindings(bindings)
+            return UndoExecution(False, paths, conflicts=conflicts)
+
+        temporary_files: list[tuple[_DirectoryBinding, str]] = []
+        backup_files: list[tuple[_DirectoryBinding, str]] = []
+        committed: list[_CommittedUndo] = []
+        try:
+            for item in prepared:
+                binding = bindings[item.path.parent]
+                # 全量校验完成后仍在每次发布前拒绝竞态变化；若已有提交则走补偿。
+                if not self._undo_target_matches(item, binding):
+                    raise PolicyError("撤销写入前目标状态发生变化")
+                backup_name: str | None = None
+                if item.change.after is not None:
+                    backup_name = next(binding._temporary_names(item.path.name))
+                    binding.link(item.path.name, backup_name)
+                    backup_files.append((binding, backup_name))
+                    committed.append(
+                        _CommittedUndo(item, item.change.after, backup_name)
+                    )
+                    # Windows 不能替换或删除只读目标；硬链接备份让后续补偿仍可恢复原 identity。
+                    binding.chmod(
+                        item.path.name,
+                        item.change.after.mode | stat.S_IWUSR,
+                    )
+                    writable_after = self._snapshot(
+                        binding,
+                        item.path.name,
+                        item.change.path,
+                    )
+                    committed[-1] = _CommittedUndo(item, writable_after, backup_name)
+                restored = self._restore_before(item, binding, temporary_files)
+                if backup_name is None:
+                    committed.append(_CommittedUndo(item, restored, None))
+                else:
+                    committed[-1] = _CommittedUndo(item, restored, backup_name)
+        except Exception:
+            compensation_failed = self._compensate_undo_commits(
+                committed,
+                bindings,
+                backup_files,
+            )
+            return UndoExecution(
+                False,
+                paths,
+                compensation_failed=compensation_failed,
+            )
+        finally:
+            for binding, temporary_name in reversed(temporary_files):
+                try:
+                    binding.unlink(temporary_name)
+                except OSError:
+                    pass
+            for binding, backup_name in reversed(backup_files):
+                try:
+                    binding.unlink(backup_name)
+                except OSError:
+                    pass
+            self._close_bindings(bindings)
+
+        return UndoExecution(True, paths)
+
+    def _open_undo_targets(
+        self,
+        change_set: TaskChangeSet,
+    ) -> tuple[list[_PreparedUndo], dict[Path, _DirectoryBinding], tuple[str, ...]]:
+        """解析全部规范路径、绑定父目录，并以真实 content/mode/identity 核验 after。"""
+
+        workspace = self.context.workspace_policy.workspace
+        prepared: list[_PreparedUndo] = []
+        conflicts: list[str] = []
+        for change in sorted(change_set.changes, key=lambda item: item.path):
+            path = self.context.workspace_policy.resolve_path(change.path, must_exist=False)
+            if path.relative_to(workspace).as_posix() != change.path or not path.parent.is_dir():
+                conflicts.append(change.path)
+                continue
+            prepared.append(_PreparedUndo(change, path))
+
+        bindings: dict[Path, _DirectoryBinding] = {}
+        for parent in sorted({item.path.parent for item in prepared}, key=str):
+            bindings[parent] = _DirectoryBinding.open(workspace, parent)
+        for item in prepared:
+            binding = bindings[item.path.parent]
+            if not binding.verify_parent(item.path.parent) or not self._undo_target_matches(
+                item, binding
+            ):
+                conflicts.append(item.change.path)
+        return prepared, bindings, tuple(sorted(set(conflicts)))
+
+    def _undo_target_matches(
+        self,
+        item: _PreparedUndo,
+        binding: _DirectoryBinding,
+    ) -> bool:
+        """存在性及完整 after 快照必须同时匹配。"""
+
+        after = item.change.after
+        exists = binding.target_exists(item.path.name)
+        if after is None:
+            return not exists
+        if not exists:
+            return False
+        try:
+            return self._snapshot(binding, item.path.name, item.change.path) == after
+        except (OSError, UnicodeError):
+            return False
+
+    def _restore_before(
+        self,
+        item: _PreparedUndo,
+        binding: _DirectoryBinding,
+        temporary_files: list[tuple[_DirectoryBinding, str]],
+    ) -> FileSnapshot | None:
+        """发布 before 内容；调用方已为存在的 after 保留同 inode 备份。"""
+
+        before = item.change.before
+        if before is None:
+            binding.unlink(item.path.name)
+            if binding.target_exists(item.path.name):
+                raise OSError("撤销后任务创建文件仍存在")
+            return None
+
+        temporary_name = binding.create_temporary(
+            item.path.name,
+            before.content,
+            before.mode,
+        )
+        temporary_files.append((binding, temporary_name))
+        if item.change.after is None:
+            binding.link(temporary_name, item.path.name)
+            binding.unlink(temporary_name)
+            temporary_files.pop()
+        else:
+            binding.replace(temporary_name, item.path.name)
+            temporary_files.pop()
+        restored = self._snapshot(binding, item.path.name, item.change.path)
+        if restored.content != before.content or restored.mode != before.mode:
+            raise OSError("撤销后的内容或权限不匹配 before 快照")
+        return restored
+
+    def _compensate_undo_commits(
+        self,
+        committed: list[_CommittedUndo],
+        bindings: dict[Path, _DirectoryBinding],
+        backup_files: list[tuple[_DirectoryBinding, str]],
+    ) -> tuple[str, ...]:
+        """仅在目标仍等于刚恢复状态时，用硬链接备份精确恢复 after 身份。"""
+
+        failures: list[str] = []
+        for entry in reversed(committed):
+            item = entry.prepared
+            binding = bindings[item.path.parent]
+            try:
+                if entry.restored is None:
+                    if binding.target_exists(item.path.name):
+                        raise PolicyError("补偿前目标不再缺失")
+                else:
+                    current_state = self._snapshot(
+                        binding,
+                        item.path.name,
+                        item.change.path,
+                    )
+                    controlled_unlock = (
+                        entry.backup_name is not None
+                        and item.change.after is not None
+                        and entry.restored == item.change.after
+                        and current_state.content == item.change.after.content
+                        and current_state.identity == item.change.after.identity
+                    )
+                    if current_state != entry.restored and not controlled_unlock:
+                        raise PolicyError("补偿前目标不再等于受控恢复状态")
+
+                after = item.change.after
+                if after is None:
+                    binding.unlink(item.path.name)
+                    if binding.target_exists(item.path.name):
+                        raise OSError("补偿后目标仍存在")
+                else:
+                    if entry.backup_name is None:
+                        raise OSError("补偿缺少 after 备份")
+                    current = self._snapshot(binding, item.path.name, item.change.path)
+                    if current.identity == after.identity:
+                        if binding.target_exists(entry.backup_name):
+                            binding.unlink(entry.backup_name)
+                    else:
+                        binding.replace(entry.backup_name, item.path.name)
+                    backup_files.remove((binding, entry.backup_name))
+                    binding.chmod(item.path.name, after.mode)
+                    if self._snapshot(binding, item.path.name, item.change.path) != after:
+                        raise OSError("补偿后的目标不等于 after 快照")
+            except Exception:
+                failures.append(item.change.path)
+        return tuple(sorted(failures))
+
+    @staticmethod
+    def _close_bindings(bindings: dict[Path, _DirectoryBinding]) -> None:
+        for binding in reversed(tuple(bindings.values())):
+            try:
+                binding.close()
+            except OSError:
+                pass
 
     @staticmethod
     def _schema(

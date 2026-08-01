@@ -1,11 +1,18 @@
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from tricoder import tools as tools_module
-from tricoder.changes import ChangeJournal, FileIdentity
+from tricoder.changes import (
+    ChangeJournal,
+    FileChange,
+    FileIdentity,
+    FileSnapshot,
+    TaskChangeSet,
+)
 from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
@@ -186,6 +193,46 @@ def patch_external_replacement_before_compensation(
         tools_module._DirectoryBinding,
         "open",
         side_effect=open_with_external_replace,
+    )
+
+
+class PostChmodReadFailingBinding:
+    """允许权限变更落盘，随后仅让第一次快照读取失败。"""
+
+    def __init__(self, binding: object) -> None:
+        self.binding = binding
+        self.fail_next_read = False
+        self.has_failed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def chmod(self, name: str, mode: int) -> None:
+        self.binding.chmod(name, mode)  # type: ignore[attr-defined]
+        if not self.has_failed:
+            self.fail_next_read = True
+
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
+        if self.fail_next_read:
+            self.fail_next_read = False
+            self.has_failed = True
+            raise OSError("POST-CHMOD-READ-SENTINEL")
+        return self.binding.read_text(name)  # type: ignore[attr-defined,no-any-return]
+
+
+def patch_post_chmod_read_failure() -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_read_failure(
+        workspace: Path,
+        parent: Path,
+    ) -> PostChmodReadFailingBinding:
+        return PostChmodReadFailingBinding(real_open(workspace, parent))
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_read_failure,
     )
 
 
@@ -1355,6 +1402,206 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(create.ok)
         self.assertFalse((self.workspace / "src" / "forbidden.py").exists())
         self.assertEqual([], self.approver.requests)
+
+    @staticmethod
+    def _file_snapshot(path: Path, relative_path: str) -> FileSnapshot:
+        metadata = path.stat()
+        return FileSnapshot(
+            relative_path,
+            path.read_text(encoding="utf-8"),
+            stat.S_IMODE(metadata.st_mode),
+            FileIdentity(metadata.st_dev, metadata.st_ino),
+        )
+
+    @staticmethod
+    def _change_set(*changes: FileChange) -> TaskChangeSet:
+        return TaskChangeSet(
+            changes=tuple(changes),
+            before_modified_files=("before.py",),
+            before_verification="not-run",
+            after_modified_files=tuple(change.path for change in changes),
+            after_verification="passed",
+        )
+
+    def test_preview_and_undo_restore_modified_file_content_and_mode(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        os.chmod(target, 0o600)
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        os.chmod(target, 0o400)
+        after = self._file_snapshot(target, "src/app.py")
+        change_set = self._change_set(FileChange("src/app.py", before, after))
+
+        preview = self.registry.preview_undo(change_set)
+        execution = self.registry.undo_change_set(change_set)
+
+        self.assertEqual(("src/app.py",), preview.paths)
+        self.assertIn("-    return 42", preview.diff)
+        self.assertIn("+    return 41", preview.diff)
+        self.assertTrue(execution.ok, execution)
+        self.assertEqual(before.content, target.read_text(encoding="utf-8"))
+        self.assertEqual(before.mode, stat.S_IMODE(target.stat().st_mode))
+
+    def test_undo_mixed_update_and_creation_deletes_created_file(self) -> None:
+        updated = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(updated, "src/app.py")
+        updated.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        after = self._file_snapshot(updated, "src/app.py")
+        created = self.workspace / "src" / "created.py"
+        created.write_text("CREATED_SENTINEL = True\n", encoding="utf-8")
+        created_after = self._file_snapshot(created, "src/created.py")
+        change_set = self._change_set(
+            FileChange("src/created.py", None, created_after),
+            FileChange("src/app.py", before, after),
+        )
+
+        execution = self.registry.undo_change_set(change_set)
+
+        self.assertTrue(execution.ok)
+        self.assertEqual(("src/app.py", "src/created.py"), execution.paths)
+        self.assertEqual(before.content, updated.read_text(encoding="utf-8"))
+        self.assertFalse(created.exists())
+
+    def test_undo_content_conflict_makes_entire_change_set_zero_write(self) -> None:
+        updated = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(updated, "src/app.py")
+        updated.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        after = self._file_snapshot(updated, "src/app.py")
+        created = self.workspace / "src" / "created.py"
+        created.write_text("after\n", encoding="utf-8")
+        created_after = self._file_snapshot(created, "src/created.py")
+        change_set = self._change_set(
+            FileChange("src/app.py", before, after),
+            FileChange("src/created.py", None, created_after),
+        )
+        created.write_text("external\n", encoding="utf-8")
+
+        execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/created.py",), execution.conflicts)
+        self.assertEqual(after.content, updated.read_text(encoding="utf-8"))
+        self.assertEqual("external\n", created.read_text(encoding="utf-8"))
+
+    def test_undo_existence_conflict_makes_entire_change_set_zero_write(self) -> None:
+        updated = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(updated, "src/app.py")
+        updated.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        after = self._file_snapshot(updated, "src/app.py")
+        created = self.workspace / "src" / "created.py"
+        created.write_text("after\n", encoding="utf-8")
+        created_after = self._file_snapshot(created, "src/created.py")
+        change_set = self._change_set(
+            FileChange("src/app.py", before, after),
+            FileChange("src/created.py", None, created_after),
+        )
+        created.unlink()
+
+        execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/created.py",), execution.conflicts)
+        self.assertEqual(after.content, updated.read_text(encoding="utf-8"))
+        self.assertFalse(created.exists())
+
+    def test_undo_rejects_same_content_with_replaced_identity(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        after = self._file_snapshot(target, "src/app.py")
+        replacement = self.workspace / "src" / "replacement.py"
+        replacement.write_text(after.content, encoding="utf-8")
+        os.chmod(replacement, after.mode)
+        os.replace(replacement, target)
+
+        execution = self.registry.undo_change_set(
+            self._change_set(FileChange("src/app.py", before, after))
+        )
+
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/app.py",), execution.conflicts)
+        self.assertEqual(after.content, target.read_text(encoding="utf-8"))
+
+    def test_undo_rejects_mode_change_and_rechecks_after_preview(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        os.chmod(target, 0o600)
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("def answer():\n    return 42\n", encoding="utf-8")
+        after = self._file_snapshot(target, "src/app.py")
+        change_set = self._change_set(FileChange("src/app.py", before, after))
+        self.registry.preview_undo(change_set)
+        changed_mode = 0o400 if after.mode != 0o400 else 0o600
+        os.chmod(target, changed_mode)
+        changed_mode = stat.S_IMODE(target.stat().st_mode)
+
+        execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/app.py",), execution.conflicts)
+        self.assertEqual(after.content, target.read_text(encoding="utf-8"))
+        self.assertEqual(changed_mode, stat.S_IMODE(target.stat().st_mode))
+
+    def test_partial_undo_failure_compensates_prior_file_back_to_exact_after(self) -> None:
+        app = self.workspace / "src" / "app.py"
+        app_before = self._file_snapshot(app, "src/app.py")
+        app.write_text("app-after\n", encoding="utf-8")
+        app_after = self._file_snapshot(app, "src/app.py")
+        other = self.workspace / "src" / "other.py"
+        other.write_text("other-before\n", encoding="utf-8")
+        other_before = self._file_snapshot(other, "src/other.py")
+        other.write_text("other-after\n", encoding="utf-8")
+        other_after = self._file_snapshot(other, "src/other.py")
+        change_set = self._change_set(
+            FileChange("src/app.py", app_before, app_after),
+            FileChange("src/other.py", other_before, other_after),
+        )
+
+        with patch_binding_publish_failure():
+            execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertEqual(app_after, self._file_snapshot(app, "src/app.py"))
+        self.assertEqual(other_after, self._file_snapshot(other, "src/other.py"))
+
+    def test_partial_undo_reports_path_when_safe_compensation_cannot_publish(self) -> None:
+        app = self.workspace / "src" / "app.py"
+        app_before = self._file_snapshot(app, "src/app.py")
+        app.write_text("app-after\n", encoding="utf-8")
+        app_after = self._file_snapshot(app, "src/app.py")
+        other = self.workspace / "src" / "other.py"
+        other.write_text("other-before\n", encoding="utf-8")
+        other_before = self._file_snapshot(other, "src/other.py")
+        other.write_text("other-after\n", encoding="utf-8")
+        other_after = self._file_snapshot(other, "src/other.py")
+        change_set = self._change_set(
+            FileChange("src/app.py", app_before, app_after),
+            FileChange("src/other.py", other_before, other_after),
+        )
+
+        with patch_binding_publish_failure(rollback_fails=True):
+            execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/app.py",), execution.compensation_failed)
+        self.assertEqual(app_before.content, app.read_text(encoding="utf-8"))
+        self.assertEqual(other_after, self._file_snapshot(other, "src/other.py"))
+
+    def test_failure_after_unlocking_read_only_target_restores_exact_after_snapshot(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        os.chmod(target, 0o600)
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("after\n", encoding="utf-8")
+        os.chmod(target, 0o400)
+        after = self._file_snapshot(target, "src/app.py")
+        change_set = self._change_set(FileChange("src/app.py", before, after))
+
+        with patch_post_chmod_read_failure():
+            execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertEqual(after, self._file_snapshot(target, "src/app.py"))
 
     def test_approved_command_runs_without_shell(self) -> None:
         """防止合法检查命令在审批后仍无法执行。"""

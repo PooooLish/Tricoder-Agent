@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
+from tricoder.changes import (
+    ChangeJournal,
+    TaskChangeSet,
+    UndoExecution,
+    UndoPreview,
+    render_change_set_diff,
+)
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
 from tricoder.models import (
     ProviderConfig,
@@ -17,7 +24,7 @@ from tricoder.models import (
     SessionMemory,
     SessionRecord,
 )
-from tricoder.policy import CommandPolicy, WorkspacePolicy
+from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
 from tricoder.sessions import (
     SessionError,
@@ -57,6 +64,9 @@ class ActiveSession:
     context: SessionContext
     config: AppConfig
     agent: "ContextAgent"
+    tools: ToolRegistry | None = None
+    journal: ChangeJournal = field(default_factory=ChangeJournal)
+    audit: AuditLogger | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,11 +283,17 @@ class SessionRuntime:
                 provider=config.provider.name,
                 model=config.provider.model,
             )
-            rebuilt = self._build_active(candidate_record, original.memory, config=config)
+            rebuilt = self._build_active(
+                candidate_record,
+                original.memory,
+                config=config,
+                journal=original.journal,
+            )
             candidate = replace(
                 rebuilt,
                 memory=original.memory,
                 context=original.context,
+                journal=original.journal,
             )
             persisted = self.store.update_configuration(
                 original.record.id,
@@ -293,7 +309,26 @@ class SessionRuntime:
     def run_task(self, task: str) -> RunResult:
         """运行后仅提炼安全摘要和结构化元数据，绝不持久化原始消息。"""
         original = self.current
-        turn = original.agent.run_with_context(task, original.context)
+        original.journal.begin_task(
+            tuple(original.context.modified_files),
+            original.context.verification,
+        )
+        try:
+            turn = original.agent.run_with_context(task, original.context)
+        except Exception:
+            try:
+                original.journal.seal_task(
+                    tuple(original.context.modified_files),
+                    original.context.verification,
+                )
+            except Exception:
+                # Agent 主异常必须原样越过 Runtime；账本收尾异常不能替换根因。
+                pass
+            raise
+        original.journal.seal_task(
+            tuple(turn.context.modified_files),
+            turn.context.verification,
+        )
         result = turn.result
         verification = _normalized_verification(result.verification)
         persisted_summary = _persisted_run_summary(result, verification)
@@ -309,6 +344,71 @@ class SessionRuntime:
         self._memory_dirty = memory != self._persisted_memory
         self.persist_current()
         return result
+
+    def diff_latest(self) -> str | None:
+        """返回当前 Session 最近一次非空任务的正向差异。"""
+
+        latest = self.current.journal.latest()
+        if latest is None:
+            return None
+        return render_change_set_diff(latest)
+
+    def prepare_undo(self) -> UndoPreview:
+        """在用户确认前首次全量核验，并只返回反向差异与结构化路径。"""
+
+        change_set, tools = self._undo_inputs()
+        try:
+            return tools.preview_undo(change_set)
+        except (PolicyError, OSError, UnicodeError, ValueError) as exc:
+            raise SessionRuntimeError("无法安全预览最近任务的撤销") from exc
+
+    def undo_latest(self) -> UndoExecution:
+        """执行第二次全量核验；仅在文件全部恢复后提交会话状态。"""
+
+        change_set, tools = self._undo_inputs()
+        execution = tools.undo_change_set(change_set)
+        if not execution.ok:
+            return execution
+
+        self.current.journal.clear_latest()
+        memory = replace(
+            self.current.memory,
+            modified_files=change_set.before_modified_files,
+            verification=change_set.before_verification,
+        )
+        context = replace(
+            self.current.context,
+            modified_files=change_set.before_modified_files,
+            verification=change_set.before_verification,
+        )
+        self.current = replace(self.current, memory=memory, context=context)
+        self._cache_current()
+        self._memory_dirty = memory != self._persisted_memory
+        if self.current.audit is not None:
+            self.current.audit.log(
+                {
+                    "event": "undo",
+                    "status": "succeeded",
+                    "paths": execution.paths,
+                    "file_count": len(execution.paths),
+                    "conflict_count": len(execution.conflicts),
+                    "compensation_status": "not-required",
+                }
+            )
+        self.persist_current()
+        return execution
+
+    def _undo_inputs(self) -> tuple[TaskChangeSet, ToolRegistry]:
+        """在任何预览、审批或写入前统一拒绝不可撤销状态。"""
+
+        if self.current.config.read_only:
+            raise SessionRuntimeError("只读模式禁止撤销")
+        change_set = self.current.journal.latest()
+        if change_set is None:
+            raise SessionRuntimeError("当前 Session 没有可撤销的最近任务")
+        if self.current.tools is None:
+            raise SessionRuntimeError("当前 Session 未装配可撤销工具")
+        return change_set, self.current.tools
 
     def persist_current(self) -> bool:
         """尝试保存安全摘要；失败时保留内存状态并暴露未保存警告。"""
@@ -391,13 +491,16 @@ class SessionRuntime:
         memory: SessionMemory,
         *,
         config: AppConfig | None = None,
+        journal: ChangeJournal | None = None,
     ) -> ActiveSession:
         """构建完整候选对象，调用方在成功返回前不会修改 ``current``。"""
         if self._active_session_factory is not None:
-            return self._active_session_factory(record, memory, self.options)
+            candidate = self._active_session_factory(record, memory, self.options)
+            return replace(candidate, journal=journal) if journal is not None else candidate
         loaded = config or self._load_config(record.workspace, record.provider, record.model)
         provider = self._provider_factory(loaded.provider, loaded.timeout)
         workspace_policy = self._workspace_policy_factory(loaded.workspace)
+        active_journal = journal or ChangeJournal()
         tools = self._tool_registry_factory(
             ToolContext(
                 workspace_policy=workspace_policy,
@@ -405,6 +508,7 @@ class SessionRuntime:
                 approver=self._approver,
                 read_only=loaded.read_only,
                 timeout=loaded.timeout,
+                change_journal=active_journal,
             )
         )
         if loaded.audit_dir is None:
@@ -434,6 +538,9 @@ class SessionRuntime:
             ),
             loaded,
             agent,
+            tools,
+            active_journal,
+            audit,
         )
 
     def _load_config(self, workspace: Path, provider: str, model: str | None) -> AppConfig:
