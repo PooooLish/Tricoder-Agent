@@ -22,6 +22,8 @@ class CommandParserTests(unittest.TestCase):
             ("/STATUS", "status"),
             ("  /Model", "model"),
             ("/clear", "clear"),
+            ("/DIFF", "diff"),
+            ("/undo", "undo"),
             ("/EXIT", "exit"),
         ):
             with self.subTest(text=text):
@@ -40,7 +42,14 @@ class CommandParserTests(unittest.TestCase):
 
     def test_rejects_unknown_and_extra_arguments(self) -> None:
         """防止无效命令或多余参数进入后续 Shell 与 Provider 流程。"""
-        for text in ("/unknown", "/help extra", "/exit now", "/session bad"):
+        for text in (
+            "/unknown",
+            "/help extra",
+            "/exit now",
+            "/diff extra",
+            "/undo now",
+            "/session bad",
+        ):
             with self.subTest(text=text):
                 with self.assertRaises(CommandError):
                     parse_command(text)

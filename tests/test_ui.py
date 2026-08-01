@@ -64,11 +64,34 @@ class TerminalUITests(unittest.TestCase):
         text = console.export_text()
         self.assertIn("[first]", text)
         self.assertIn("/session new", text)
+        self.assertIn("/diff", text)
+        self.assertIn("/undo", text)
         self.assertIn("未持久化", text)
         self.assertIn("无效", text)
         self.assertIn("gpt-preview", text)
         self.assertIn("deepseek-preview", text)
         self.assertIn("glm-preview", text)
+
+    def test_show_diff_renders_dynamic_content_as_literal_text(self) -> None:
+        """反向 diff 及路径中的 Rich 标记必须按字面显示。"""
+        output = io.StringIO()
+        console = Console(
+            file=output,
+            width=100,
+            record=True,
+            markup=True,
+            force_terminal=False,
+            color_system=None,
+            no_color=True,
+        )
+        ui = TerminalUI(console=console)
+        diff = "--- [bold red]not markup[/bold red]\n+++ src/app.py\n"
+
+        ui.show_diff(diff, title="撤销预览")
+
+        text = console.export_text()
+        self.assertIn("撤销预览", text)
+        self.assertIn("[bold red]not markup[/bold red]", text)
     def test_start_panel_exposes_task_provider_workspace_and_mode(self) -> None:
         """防止启动界面缺少执行前最重要的上下文。"""
         ui, console = recording_ui()

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-_SIMPLE_COMMANDS = {"help", "status", "model", "clear", "exit"}
+_SIMPLE_COMMANDS = {"help", "status", "model", "clear", "diff", "undo", "exit"}
 _SESSION_SUBCOMMANDS = {"new", "current", "rename"}
 
 

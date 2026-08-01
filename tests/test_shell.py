@@ -8,8 +8,13 @@ from types import SimpleNamespace
 import unittest
 
 from tricoder.models import RunResult, SessionMemory, SessionRecord
+from tricoder.changes import UndoExecution, UndoPreview
 from tricoder.session_runtime import RuntimeStatus, SessionRuntimeError
 from tricoder.shell import InteractiveShell
+
+
+EXPECTED_DIFF = "--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+EXPECTED_REVERSE_DIFF = "--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-new\n+old\n"
 
 
 def make_record(
@@ -39,9 +44,18 @@ class FakeRuntime:
         self.second = make_record("second", "second", "D:/workspace/second", "glm", "glm-test")
         self.sessions = [self.first, self.second]
         self.tasks: list[str] = []
+        self.run_task_calls = 0
         self.persist_ok = True
         self.fail_model = False
         self.clear_calls = 0
+        self.diff_latest_calls = 0
+        self.prepare_undo_calls = 0
+        self.undo_latest_calls = 0
+        self.diff_result: str | None = EXPECTED_DIFF
+        self.undo_preview = UndoPreview(EXPECTED_REVERSE_DIFF, ("src/app.py",))
+        self.undo_execution = UndoExecution(True, ("src/app.py",))
+        self.prepare_undo_error: SessionRuntimeError | None = None
+        self.undo_latest_error: SessionRuntimeError | None = None
         self.run_result = RunResult(
             True,
             "任务完成",
@@ -67,8 +81,25 @@ class FakeRuntime:
         )
 
     def run_task(self, task: str) -> RunResult:
+        self.run_task_calls += 1
         self.tasks.append(task)
         return self.run_result
+
+    def diff_latest(self) -> str | None:
+        self.diff_latest_calls += 1
+        return self.diff_result
+
+    def prepare_undo(self) -> UndoPreview:
+        self.prepare_undo_calls += 1
+        if self.prepare_undo_error is not None:
+            raise self.prepare_undo_error
+        return self.undo_preview
+
+    def undo_latest(self) -> UndoExecution:
+        self.undo_latest_calls += 1
+        if self.undo_latest_error is not None:
+            raise self.undo_latest_error
+        return self.undo_execution
 
     def switch(self, session_id: str, *, confirm):  # type: ignore[no-untyped-def]
         target = next(item for item in self.sessions if item.id == session_id)
@@ -126,7 +157,9 @@ class FakeUI:
         self.session_choice: str | None = None
         self.model_choice: str | None = None
         self.answers: list[str] = []
+        self.confirm_calls = 0
         self.run_results: list[RunResult] = []
+        self.diffs: list[tuple[str, str]] = []
 
     def show_shell_start(self, _record: SessionRecord) -> None:
         self.text.append("start")
@@ -145,7 +178,11 @@ class FakeUI:
         return self.model_choice
 
     def confirm(self, _prompt: str) -> bool:
+        self.confirm_calls += 1
         return bool(self.answers) and self.answers.pop(0).strip().lower() in {"y", "yes"}
+
+    def show_diff(self, diff: str, *, title: str) -> None:
+        self.diffs.append((title, diff))
 
     def show_memory_warning(self, warning: str) -> None:
         self.text.append(warning)
@@ -200,6 +237,74 @@ class InteractiveShellTests(unittest.TestCase):
         self.shell().execute("检查失败场景")
 
         self.assertEqual([self.runtime.run_result], self.ui.run_results)
+
+    def test_diff_is_local_and_shows_latest_task_change(self) -> None:
+        """/diff 必须只查询运行时账本，不得调用 Agent 或 Provider。"""
+        self.shell().execute("/diff")
+
+        self.assertEqual(1, self.runtime.diff_latest_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual([("最近任务变更", EXPECTED_DIFF)], self.ui.diffs)
+
+    def test_diff_without_history_shows_stable_notice(self) -> None:
+        """没有已封存变更时 /diff 要留在本地并给出可读提示。"""
+        self.runtime.diff_result = None
+
+        self.shell().execute("/diff")
+
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual([], self.ui.diffs)
+        self.assertIn("当前 Session 没有最近任务变更。", self.ui.text)
+
+    def test_undo_previews_then_confirms_and_executes_locally(self) -> None:
+        """/undo 必须先完整展示反向 diff，再仅在 y/yes 时执行。"""
+        self.ui.answers = ["yes"]
+
+        self.shell().execute("/undo")
+
+        self.assertEqual(1, self.runtime.prepare_undo_calls)
+        self.assertEqual([("撤销预览", EXPECTED_REVERSE_DIFF)], self.ui.diffs)
+        self.assertEqual(1, self.ui.confirm_calls)
+        self.assertEqual(1, self.runtime.undo_latest_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertIn("已撤销最近一条任务的全部文件修改。", self.ui.text)
+
+    def test_undo_rejection_never_executes_after_preview(self) -> None:
+        """拒绝撤销后不得触发任何文件写入。"""
+        self.ui.answers = ["no"]
+
+        self.shell().execute("/undo")
+
+        self.assertEqual([("撤销预览", EXPECTED_REVERSE_DIFF)], self.ui.diffs)
+        self.assertEqual(1, self.ui.confirm_calls)
+        self.assertEqual(0, self.runtime.undo_latest_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertIn("已取消撤销。", self.ui.text)
+
+    def test_undo_reports_prepare_errors_without_confirmation(self) -> None:
+        """无历史和只读错误均由 Runtime 给出，Shell 不应继续确认或执行。"""
+        for message in ("当前 Session 没有可撤销的最近任务", "只读模式禁止撤销"):
+            with self.subTest(message=message):
+                self.runtime.prepare_undo_error = SessionRuntimeError(message)
+
+                self.shell().execute("/undo")
+
+                self.assertEqual(0, self.ui.confirm_calls)
+                self.assertEqual(0, self.runtime.undo_latest_calls)
+                self.assertTrue(any(message in item for item in self.ui.text))
+                self.runtime.prepare_undo_error = None
+                self.ui.text.clear()
+
+    def test_undo_reports_conflict_after_second_runtime_validation(self) -> None:
+        """确认后再次校验产生冲突时，Shell 只能报告而不能伪报成功。"""
+        self.ui.answers = ["y"]
+        self.runtime.undo_execution = UndoExecution(False, (), ("src/app.py",))
+
+        self.shell().execute("/undo")
+
+        self.assertEqual(1, self.runtime.undo_latest_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertTrue(any("冲突" in item for item in self.ui.text))
 
     def test_session_selection_confirms_cross_workspace(self) -> None:
         """跨工作区拒绝和确认分别保持与替换当前 Session。"""

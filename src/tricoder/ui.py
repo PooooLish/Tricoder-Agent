@@ -118,6 +118,8 @@ class TerminalUI:
             ("/status", "显示当前会话状态"),
             ("/model", "选择 OpenAI、DeepSeek 或 GLM"),
             ("/clear", "确认后清除当前会话上下文和摘要"),
+            ("/diff", "显示当前会话最近任务的文件变更"),
+            ("/undo", "预览并确认撤销当前会话最近任务的文件修改"),
             ("/session", "列出会话并按编号选择"),
             ("/session new <名称>", "创建并切换到新会话"),
             ("/session current", "显示当前会话详情"),
@@ -218,6 +220,24 @@ class TerminalUI:
         """以字面文本显示可恢复提示，避免 Rich 解析用户内容。"""
         self._stop_status()
         self.console.print(Text(message, style="yellow"))
+
+    def show_diff(self, diff: str, *, title: str) -> None:
+        """以字面差异渲染任务变更，禁止 Rich 将内容当作 markup。"""
+        self._stop_status()
+        self.console.print(
+            Panel(
+                Syntax(
+                    diff,
+                    "diff",
+                    theme="ansi_dark",
+                    word_wrap=False,
+                    background_color="default",
+                ),
+                title=Text(title, style="bold cyan"),
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
 
     def show_error(self, title: str, message: str) -> None:
         self._stop_status()

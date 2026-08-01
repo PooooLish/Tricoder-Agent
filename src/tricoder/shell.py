@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from tricoder.commands import CommandError, ParsedCommand, is_slash_command, parse_command
+from tricoder.changes import UndoExecution, UndoPreview
 from tricoder.models import RunResult
 from tricoder.session_runtime import SessionRuntimeError
 
@@ -37,6 +38,9 @@ class ShellUI(Protocol):
     def show_notice(self, message: str) -> None:
         """显示无需中断循环的一般提示。"""
 
+    def show_diff(self, diff: str, *, title: str) -> None:
+        """以字面形式显示任务变更或撤销预览。"""
+
     def show_error(self, title: str, message: str) -> None:
         """显示可恢复的本地错误。"""
 
@@ -52,6 +56,15 @@ class RuntimeLike(Protocol):
 
     def run_task(self, task: str) -> RunResult:
         """运行普通用户任务。"""
+
+    def diff_latest(self) -> str | None:
+        """返回最近任务的正向差异；没有历史时返回 None。"""
+
+    def prepare_undo(self) -> UndoPreview:
+        """校验并生成最近任务的反向差异预览。"""
+
+    def undo_latest(self) -> UndoExecution:
+        """在确认后再次校验并撤销最近任务。"""
 
     def switch(self, session_id: str, *, confirm: Callable[[object], bool]) -> object:
         """切换 Session。"""
@@ -151,6 +164,10 @@ class InteractiveShell:
             self._choose_model()
         elif command.name == "clear":
             self._clear_current()
+        elif command.name == "diff":
+            self._show_diff()
+        elif command.name == "undo":
+            self._undo_latest()
         elif command.name == "session":
             self._handle_session(command)
         elif command.name == "exit":
@@ -203,6 +220,36 @@ class InteractiveShell:
             return
         self.runtime.clear_current()
         self.ui.show_notice("当前会话记忆已清除")
+
+    def _show_diff(self) -> None:
+        """只读取最近一次任务变更，绝不进入 Agent 任务通道。"""
+        diff = self.runtime.diff_latest()
+        if diff is None:
+            self.ui.show_notice("当前 Session 没有最近任务变更。")
+            return
+        self.ui.show_diff(diff, title="最近任务变更")
+
+    def _undo_latest(self) -> None:
+        """先展示完整反向差异，收到明确确认后才请求 Runtime 撤销。"""
+        preview = self.runtime.prepare_undo()
+        self.ui.show_diff(preview.diff, title="撤销预览")
+        if not self.ui.confirm("撤销最近一条任务的全部文件修改？[y/N] "):
+            self.ui.show_notice("已取消撤销。")
+            return
+
+        execution = self.runtime.undo_latest()
+        if execution.ok:
+            self.ui.show_notice("已撤销最近一条任务的全部文件修改。")
+            return
+        if execution.conflicts:
+            paths = "、".join(execution.conflicts)
+            self.ui.show_error("撤销冲突", f"检测到文件冲突，未执行撤销：{paths}")
+            return
+        if execution.compensation_failed:
+            paths = "、".join(execution.compensation_failed)
+            self.ui.show_error("撤销失败", f"撤销未完成且补偿失败：{paths}")
+            return
+        self.ui.show_error("撤销失败", "撤销未完成，文件未被修改。")
 
     def _exit(self) -> int:
         """退出前重试持久化；失败时明确告警并返回非零状态。"""
