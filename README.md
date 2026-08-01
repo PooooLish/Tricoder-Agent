@@ -1,38 +1,54 @@
 # TriCoder CLI
 
-TriCoder CLI 是一个需要人工审批的本地 Coding Agent。它支持 OpenAI-compatible Chat Completions API，并提供一次性 `run` 与持续交互式会话两种入口。
+[![CI](https://github.com/PooooLish/Tricoder-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/PooooLish/Tricoder-Agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
 
-## 安装与帮助
+TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本地 Coding Agent MVP。它统一接入 OpenAI、DeepSeek 与 GLM 的原生 structured tool calling，并在文件写入和命令执行前要求人工审批。
 
-需要 Python 3.11+。在开发环境安装项目后：
+## 核心亮点
+
+- **统一 Provider 边界**：OpenAI、DeepSeek、GLM 响应统一归一化为内部 `ProviderResponse` 与 `ToolCall`。
+- **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
+- **可控本地执行**：读取、编辑、创建文件和运行受限命令；写操作与命令执行需要人工审批。
+- **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态。
+- **本地斜杠命令**：`/session`、`/model`、`/status`、`/clear` 等命令不会发送给 Provider。
+- **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。
+
+## 5 分钟快速体验
+
+需要 Python 3.11+。以下为 Windows PowerShell 主路径：
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -e .
-$env:PYTHONPATH = "src"
-python -B -m tricoder --help
-python -B -m tricoder doctor --help
-python -B -m tricoder run --help
-python -B -m tricoder chat --help
+Copy-Item .env.example .env.local
+python -m tricoder doctor --provider deepseek --workspace . --no-color
+python -m tricoder chat --provider deepseek --workspace .
 ```
 
-已安装命令入口时，也可以直接运行：
+`.env.local` 只在本机填写；Bash 使用 `source .venv/bin/activate` 和 `cp .env.example .env.local`。`doctor` 不发送模型请求；也可直接运行 `tricoder` 进入默认交互模式。
 
-```powershell
-tricoder --help
+## 架构与职责
+
+```mermaid
+flowchart LR
+    U["用户输入"] --> CLI["CLI / Slash Commands"]
+    CLI --> S["Session Runtime"]
+    S --> DB[("SQLite 安全摘要")]
+    CLI --> A["Agent Core"]
+    A <--> P["Provider Adapter"]
+    P <--> API["OpenAI / DeepSeek / GLM"]
+    A <--> T["Tool Runtime"]
+    T --> W["目标工作区"]
+    T --> J["JSONL 审计"]
 ```
 
-`--help` 只显示帮助，不会进入交互模式。
+斜杠命令只在本地处理，不会发送给 Provider；普通任务才进入 Agent、Provider 与工具运行时组成的循环。
 
 ## 配置与密钥安全
 
-将 `.env.example` 复制为仅供本机使用的 `.env.local`，再在自己的编辑器中填写所选服务商的 API Key：
-
-```powershell
-Copy-Item .env.example .env.local
-python -B -m tricoder doctor --provider deepseek --workspace .
-```
-
-不要将真实 Key 写入 `.tricoder.toml`、`.env.example`、日志、SQLite 数据库或 Git。也不要把 `.env.local` 提交到版本库；该文件仅应保留在本机。可以用 `--env-file` 显式指定密钥文件；进程环境变量的优先级更高。
+将 `.env.example` 复制为仅供本机使用的 `.env.local`，再在自己的编辑器中填写所选服务商的 API Key。不要将真实 Key 写入 `.tricoder.toml`、`.env.example`、日志、SQLite 数据库或 Git；也不要把 `.env.local` 提交到版本库。可以用 `--env-file` 显式指定密钥文件；进程环境变量的优先级更高。
 
 配置优先级为：命令行参数、进程环境变量、本地密钥文件、项目 `.tricoder.toml`、内置默认值。Provider 的默认 Key 变量和模型如下：
 
@@ -42,10 +58,9 @@ python -B -m tricoder doctor --provider deepseek --workspace .
 | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
 | GLM | `ZAI_API_KEY` | `glm-5.2` |
 
-三家 Provider 都支持原生 structured tool calling。TriCoder 默认使用 `native`：向
-Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响应归一化为
-`ProviderResponse`，Agent 每轮只接受一个结构化工具调用，并用对应的
-`tool_call_id` 回填工具结果。
+## 原生工具协议
+
+三家 Provider 都支持原生 structured tool calling。TriCoder 默认使用 `native`：向 Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响应归一化为 `ProviderResponse`，Agent 每轮只接受一个结构化工具调用，并用对应的 `tool_call_id` 回填工具结果。
 
 | Provider | 原生工具调用 | 当前适配说明 |
 | --- | --- | --- |
@@ -53,29 +68,21 @@ Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响�
 | DeepSeek | 支持 | 发送工具定义和自动工具选择 |
 | GLM | 支持 | 发送工具定义和自动工具选择 |
 
-`TRICODER_TOOL_PROTOCOL` 只接受 `native` 或 `legacy_json`，默认是 `native`。
-进程环境变量和 `.env.local` 都优先于项目 `.tricoder.toml`，其中进程环境变量
-优先级最高。`.env.example` 中的协议行默认已注释，因此复制模板后，下面的
-TOML 回滚可以直接生效。也可以先用临时进程环境变量显式回滚：
-
-```powershell
-$env:TRICODER_TOOL_PROTOCOL = "legacy_json"
-python -B -m tricoder doctor --provider openai --workspace . --no-color
-```
-
-也可以在项目配置中持久回滚：
+`TRICODER_TOOL_PROTOCOL` 只接受 `native` 或 `legacy_json`，默认是 `native`。环境变量和 `.env.local` 都优先于项目 `.tricoder.toml`，其中进程环境变量优先级最高。`.env.example` 中的协议行默认已注释，因此复制模板后，下面的 TOML 回滚可以直接生效：
 
 ```toml
 [agent]
 tool_protocol = "legacy_json"
 ```
 
-`doctor` 会显示当前工具协议，但只显示 Key 的变量名和掩码，不显示 Key
-内容。排查问题时不要把 Key 粘贴到命令参数、日志、Issue 或聊天记录中。
-确认 Provider 的原生协议兼容后，把配置改回 `native`。如果曾主动设置进程
-覆盖，可运行 `Remove-Item Env:TRICODER_TOOL_PROTOCOL`；如果在 `.env.local`
-取消注释并设置了该变量，则还必须删除该行、重新注释或改值，否则它仍会覆盖
-项目 TOML。
+也可以用临时进程环境变量显式回滚：
+
+```powershell
+$env:TRICODER_TOOL_PROTOCOL = "legacy_json"
+python -m tricoder doctor --provider openai --workspace . --no-color
+```
+
+`doctor` 会显示当前工具协议，但只显示 Key 的变量名和掩码，不显示 Key 内容。排查问题时不要把 Key 粘贴到命令参数、日志、Issue 或聊天记录中。确认 Provider 的原生协议兼容后，把配置改回 `native`。如果曾主动设置进程覆盖，可运行 `Remove-Item Env:TRICODER_TOOL_PROTOCOL`；如果在 `.env.local` 取消注释并设置了该变量，则还必须删除该行、重新注释或改值，否则它仍会覆盖项目 TOML。
 
 可选的项目配置示例：
 
@@ -93,17 +100,19 @@ base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 
 ## 使用方式
 
-先用不发送 API 请求的 `doctor` 检查本地配置：
+`--help` 只显示帮助，不会进入交互模式：
 
 ```powershell
-$env:PYTHONPATH = "src"
-python -B -m tricoder doctor --provider deepseek --workspace . --no-color
+python -m tricoder --help
+python -m tricoder doctor --help
+python -m tricoder run --help
+python -m tricoder chat --help
 ```
 
 一次性运行任务：
 
 ```powershell
-python -B -m tricoder run "修复重复提交问题并运行测试" `
+python -m tricoder run "修复重复提交问题并运行测试" `
   --provider deepseek `
   --workspace D:\path\to\project `
   --max-context-chars 60000
@@ -112,7 +121,7 @@ python -B -m tricoder run "修复重复提交问题并运行测试" `
 只读分析不会编辑文件或执行命令：
 
 ```powershell
-python -B -m tricoder run "分析项目结构和潜在风险" `
+python -m tricoder run "分析项目结构和潜在风险" `
   --provider openai `
   --workspace D:\path\to\project `
   --read-only
@@ -169,8 +178,6 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 - 允许的命令限于测试、静态检查和只读 Git 查询；审批不是操作系统或容器沙箱的替代品。
 - 发送任务会将相关代码片段交给所选 Provider；只应在获准发送的项目中使用。
 
-当前版本不支持 Session 删除、命令插件、跨设备/云同步、向量检索、自动补全，也不支持多个进程同时编辑同一个 Session。
-
 ## 审计、上下文与退出码
 
 每次 `run` 会写入 JSONL 审计文件。默认目录：Windows 为 `%LOCALAPPDATA%\TriCoder\runs`，其他系统为 `$XDG_STATE_HOME/tricoder/runs`；可用 `--audit-dir` 覆盖。只读模式下，审计目录不能位于目标工作区中。
@@ -183,30 +190,38 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 新增 Provider 时保持边界最小：
 
-1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL、模型和
-   允许的官方 Base URL。
-2. 在 `src/tricoder/providers.py` 声明 `ProviderCapabilities` 并注册工厂。若不是
-   OpenAI-compatible 协议，实现 `ModelProvider.complete(messages, tools)`。
-3. `complete()` 返回归一化的 `ProviderResponse`（其中包含 `ToolCall`）；厂商
-   响应无法解析或不满足协议时抛出 `ProviderProtocolError`。不要把厂商原始
-   响应或认证头传给 Agent、日志或终端。
-4. 在 `src/tricoder/cli.py` 的 `--provider` choices，以及
-   `src/tricoder/ui.py` 的 Provider label、帮助和选择列表等公开注册点加入名称。
+1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL、模型和允许的官方 Base URL。
+2. 在 `src/tricoder/providers.py` 声明 `ProviderCapabilities` 并注册工厂。若不是 OpenAI-compatible 协议，实现 `ModelProvider.complete(messages, tools)`。
+3. `complete()` 返回归一化的 `ProviderResponse`（其中包含 `ToolCall`）；厂商响应无法解析或不满足协议时抛出 `ProviderProtocolError`。不要把厂商原始响应或认证头传给 Agent、日志或终端。
+4. 在 `src/tricoder/cli.py` 的 `--provider` choices，以及 `src/tricoder/ui.py` 的 Provider label、帮助和选择列表等公开注册点加入名称。
 5. 为配置、请求序列化、响应解析、协议错误、UI/CLI 脱敏输出与交互选择补测试。
 
-只有在适配器确实验证了原生工具调用时才声明
-`native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新
-Provider 绕过结构化响应适配的默认实现。
+只有在适配器确实验证了原生工具调用时才声明 `native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新 Provider 绕过结构化响应适配的默认实现。
 
 ## 测试
 
-测试不需要网络或真实 API Key：
+### 无密钥自动化测试
+
+以下检查不联网，也不需要真实 API Key；GitHub Actions 会在 Windows/Linux 和 Python 3.11/3.12 上执行同样的验证：
 
 ```powershell
-$env:PYTHONPATH = "src"
-python -B -m unittest discover -s tests -v
-python -B -m compileall -q src tests
+python -m unittest discover -s tests -v
+python -m compileall -q src tests
 ```
+
+### 本地真实 API 冒烟测试
+
+真实 API 测试只在开发者明确配置 `.env.local` 后本地执行，可能产生费用，也可能受 Provider 网络状态影响，因此不纳入 CI。读取、修改和命令执行练习应在 [`test/`](test/README.md) 沙盒中进行，不要放入真实密钥、私人数据或重要文件。
+
+```powershell
+python -m tricoder run "只读检查 smoke_demo.py，并说明 add 函数的行为" --provider openai --workspace test --read-only
+```
+
+将 `--provider` 分别替换为 `deepseek` 和 `glm` 即可验证三家 Provider。涉及创建文件或运行命令的测试会进入人工审批流程，测试目标必须留在 `test/`。
+
+## 路线
+
+以下方向尚未实现：Session 删除与导出、命令插件/自动补全、可选检索记忆、演示 GIF。
 
 ## 开源参考
 
