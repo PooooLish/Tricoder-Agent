@@ -17,6 +17,32 @@ EXPECTED_DIFF = "--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
 EXPECTED_REVERSE_DIFF = "--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-new\n+old\n"
 
 
+class SpyProvider:
+    """记录正常任务路径是否意外触及 Provider。"""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.calls = 0
+
+    def complete(self) -> None:
+        self.calls += 1
+        self.events.append("provider")
+
+
+class SpyAgent:
+    """记录正常任务路径是否意外触及 Agent。"""
+
+    def __init__(self, provider: SpyProvider, events: list[str]) -> None:
+        self.provider = provider
+        self.events = events
+        self.calls = 0
+
+    def run(self) -> None:
+        self.calls += 1
+        self.events.append("agent")
+        self.provider.complete()
+
+
 def make_record(
     session_id: str,
     name: str,
@@ -40,6 +66,9 @@ class FakeRuntime:
     """记录 Shell 调用，确保测试不触发 Provider、文件或 SQLite。"""
 
     def __init__(self) -> None:
+        self.events: list[str] = []
+        self.provider = SpyProvider(self.events)
+        self.agent = SpyAgent(self.provider, self.events)
         self.first = make_record("first", "first", "D:/workspace/first")
         self.second = make_record("second", "second", "D:/workspace/second", "glm", "glm-test")
         self.sessions = [self.first, self.second]
@@ -83,20 +112,25 @@ class FakeRuntime:
     def run_task(self, task: str) -> RunResult:
         self.run_task_calls += 1
         self.tasks.append(task)
+        self.events.append("run_task")
+        self.agent.run()
         return self.run_result
 
     def diff_latest(self) -> str | None:
         self.diff_latest_calls += 1
+        self.events.append("diff_latest")
         return self.diff_result
 
     def prepare_undo(self) -> UndoPreview:
         self.prepare_undo_calls += 1
+        self.events.append("prepare_undo")
         if self.prepare_undo_error is not None:
             raise self.prepare_undo_error
         return self.undo_preview
 
     def undo_latest(self) -> UndoExecution:
         self.undo_latest_calls += 1
+        self.events.append("undo_latest")
         if self.undo_latest_error is not None:
             raise self.undo_latest_error
         return self.undo_execution
@@ -152,7 +186,8 @@ class FakeRuntime:
 class FakeUI:
     """可观测的 UI 替身，输入由测试直接安排。"""
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
         self.text: list[str] = []
         self.session_choice: str | None = None
         self.model_choice: str | None = None
@@ -179,9 +214,11 @@ class FakeUI:
 
     def confirm(self, _prompt: str) -> bool:
         self.confirm_calls += 1
+        self.events.append("confirm")
         return bool(self.answers) and self.answers.pop(0).strip().lower() in {"y", "yes"}
 
     def show_diff(self, diff: str, *, title: str) -> None:
+        self.events.append("show_diff")
         self.diffs.append((title, diff))
 
     def show_memory_warning(self, warning: str) -> None:
@@ -200,7 +237,7 @@ class FakeUI:
 class InteractiveShellTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = FakeRuntime()
-        self.ui = FakeUI()
+        self.ui = FakeUI(self.runtime.events)
 
     def shell(self, input_fn=lambda _prompt: "/exit") -> InteractiveShell:
         return InteractiveShell(self.runtime, self.ui, input_fn=input_fn)
@@ -244,6 +281,9 @@ class InteractiveShellTests(unittest.TestCase):
 
         self.assertEqual(1, self.runtime.diff_latest_calls)
         self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertEqual(["diff_latest", "show_diff"], self.runtime.events)
         self.assertEqual([("最近任务变更", EXPECTED_DIFF)], self.ui.diffs)
 
     def test_diff_without_history_shows_stable_notice(self) -> None:
@@ -263,10 +303,16 @@ class InteractiveShellTests(unittest.TestCase):
         self.shell().execute("/undo")
 
         self.assertEqual(1, self.runtime.prepare_undo_calls)
+        self.assertEqual(
+            ["prepare_undo", "show_diff", "confirm", "undo_latest"],
+            self.runtime.events,
+        )
         self.assertEqual([("撤销预览", EXPECTED_REVERSE_DIFF)], self.ui.diffs)
         self.assertEqual(1, self.ui.confirm_calls)
         self.assertEqual(1, self.runtime.undo_latest_calls)
         self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
         self.assertIn("已撤销最近一条任务的全部文件修改。", self.ui.text)
 
     def test_undo_rejection_never_executes_after_preview(self) -> None:
@@ -276,9 +322,12 @@ class InteractiveShellTests(unittest.TestCase):
         self.shell().execute("/undo")
 
         self.assertEqual([("撤销预览", EXPECTED_REVERSE_DIFF)], self.ui.diffs)
+        self.assertEqual(["prepare_undo", "show_diff", "confirm"], self.runtime.events)
         self.assertEqual(1, self.ui.confirm_calls)
         self.assertEqual(0, self.runtime.undo_latest_calls)
         self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
         self.assertIn("已取消撤销。", self.ui.text)
 
     def test_undo_reports_prepare_errors_without_confirmation(self) -> None:
@@ -305,6 +354,41 @@ class InteractiveShellTests(unittest.TestCase):
         self.assertEqual(1, self.runtime.undo_latest_calls)
         self.assertEqual(0, self.runtime.run_task_calls)
         self.assertTrue(any("冲突" in item for item in self.ui.text))
+        self.assertFalse(any("已撤销" in item for item in self.ui.text))
+
+    def test_undo_reports_compensation_failure_with_literal_path(self) -> None:
+        """补偿失败只显示稳定结果和路径，绝不伪报成功或泄露源码。"""
+        path = "src/[bold red]not markup[/bold red].py"
+        self.ui.answers = ["yes"]
+        self.runtime.undo_execution = UndoExecution(False, (), (), (path,))
+
+        self.shell().execute("/undo")
+
+        self.assertEqual(
+            ["prepare_undo", "show_diff", "confirm", "undo_latest"],
+            self.runtime.events,
+        )
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertEqual([f"撤销失败: 撤销未完成且补偿失败：{path}"], self.ui.text)
+        self.assertFalse(any("已撤销" in item for item in self.ui.text))
+        self.assertFalse(any("-new" in item or "+old" in item for item in self.ui.text))
+
+    def test_undo_reports_generic_failure_without_success_or_source(self) -> None:
+        """无冲突且无补偿失败时使用稳定失败提示，不附带预览源码。"""
+        self.ui.answers = ["yes"]
+        self.runtime.undo_execution = UndoExecution(False, ())
+
+        self.shell().execute("/undo")
+
+        self.assertEqual(
+            ["prepare_undo", "show_diff", "confirm", "undo_latest"],
+            self.runtime.events,
+        )
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertEqual(["撤销失败: 撤销未完成，文件未被修改。"], self.ui.text)
+        self.assertFalse(any("已撤销" in item or "-new" in item or "+old" in item for item in self.ui.text))
 
     def test_session_selection_confirms_cross_workspace(self) -> None:
         """跨工作区拒绝和确认分别保持与替换当前 Session。"""

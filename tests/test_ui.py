@@ -92,6 +92,28 @@ class TerminalUITests(unittest.TestCase):
         text = console.export_text()
         self.assertIn("撤销预览", text)
         self.assertIn("[bold red]not markup[/bold red]", text)
+
+    def test_undo_failure_path_renders_as_literal_text(self) -> None:
+        """撤销失败中的动态路径不能被 Rich 当作样式标记。"""
+        output = io.StringIO()
+        console = Console(
+            file=output,
+            width=100,
+            record=True,
+            markup=True,
+            force_terminal=False,
+            color_system=None,
+            no_color=True,
+        )
+        ui = TerminalUI(console=console)
+        path = "src/[bold red]not markup[/bold red].py"
+
+        ui.show_error("撤销失败", f"撤销未完成且补偿失败：{path}")
+
+        text = console.export_text()
+        self.assertIn("撤销失败", text)
+        self.assertIn(path, text)
+        self.assertNotIn("-new", text)
     def test_start_panel_exposes_task_provider_workspace_and_mode(self) -> None:
         """防止启动界面缺少执行前最重要的上下文。"""
         ui, console = recording_ui()
