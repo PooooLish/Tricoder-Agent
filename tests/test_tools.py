@@ -37,6 +37,38 @@ def patch_binding_close_failure() -> object:
     )
 
 
+class CleanupFailingBinding:
+    """保留真实目录绑定与发布，仅模拟提交后的临时文件清理失败。"""
+
+    def __init__(self, binding: object, target: Path) -> None:
+        self.binding = binding
+        self.target = target
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def unlink(self, temporary_name: str) -> None:
+        if self.target.exists():
+            raise PermissionError("simulated cleanup failure")
+        self.binding.unlink(temporary_name)  # type: ignore[attr-defined]
+
+
+def patch_binding_cleanup_failure(target: Path) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_failing_cleanup(
+        workspace: Path,
+        parent: Path,
+    ) -> CleanupFailingBinding:
+        return CleanupFailingBinding(real_open(workspace, parent), target)
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_failing_cleanup,
+    )
+
+
 class RecordingApprover:
     def __init__(self, decisions: list[bool]) -> None:
         self.decisions = list(decisions)
@@ -511,14 +543,8 @@ class ToolTests(unittest.TestCase):
     def test_create_file_reports_success_with_warning_after_cleanup_failure(self) -> None:
         """硬链接发布是提交点；之后清理失败不得把已创建文件伪装成失败。"""
         target = self.workspace / "src" / "committed.py"
-        real_unlink = os.unlink
 
-        def fail_committed_temp(path: object, *args: object, **kwargs: object) -> None:
-            if target.exists() and str(path).endswith(".tmp"):
-                raise PermissionError("simulated cleanup failure")
-            real_unlink(path, *args, **kwargs)
-
-        with patch("tricoder.tools.os.unlink", side_effect=fail_committed_temp):
+        with patch_binding_cleanup_failure(target):
             result = self.registry.execute(
                 "create_file",
                 {"path": "src/committed.py", "content": "committed = True\n"},

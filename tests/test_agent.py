@@ -54,6 +54,38 @@ def patch_binding_close_failure() -> object:
     )
 
 
+class CleanupFailingBinding:
+    """保留真实目录绑定与发布，仅模拟提交后的临时文件清理失败。"""
+
+    def __init__(self, binding: object, target: Path) -> None:
+        self.binding = binding
+        self.target = target
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def unlink(self, temporary_name: str) -> None:
+        if self.target.exists():
+            raise PermissionError("simulated cleanup failure")
+        self.binding.unlink(temporary_name)  # type: ignore[attr-defined]
+
+
+def patch_binding_cleanup_failure(target: Path) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_failing_cleanup(
+        workspace: Path,
+        parent: Path,
+    ) -> CleanupFailingBinding:
+        return CleanupFailingBinding(real_open(workspace, parent), target)
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_failing_cleanup,
+    )
+
+
 class ScriptedProvider:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
@@ -1503,14 +1535,8 @@ class AgentTests(unittest.TestCase):
         )
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
         target = self.workspace / "committed.py"
-        real_unlink = os.unlink
 
-        def fail_committed_temp(path: object, *args: object, **kwargs: object) -> None:
-            if target.exists() and str(path).endswith(".tmp"):
-                raise PermissionError("simulated cleanup failure")
-            real_unlink(path, *args, **kwargs)
-
-        with patch("tricoder.tools.os.unlink", side_effect=fail_committed_temp):
+        with patch_binding_cleanup_failure(target):
             result = agent.run("先验证再创建文件")
 
         self.assertFalse(result.ok)
