@@ -375,6 +375,52 @@ def patch_read_failure_after_successful_replace() -> object:
     )
 
 
+class UndoCreatePublishFailureBinding:
+    """在 undo 重建已删除文件的 link 前或发布后快照点注入故障。"""
+
+    def __init__(self, binding: object, stage: str) -> None:
+        self.binding = binding
+        self.stage = stage
+        self.fail_next_target_read = False
+        self.failed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def link(self, source_name: str, target_name: str) -> None:
+        if target_name == "deleted.py" and not self.failed:
+            if self.stage == "before":
+                self.failed = True
+                raise OSError("UNDO-CREATE-BEFORE-LINK-SENTINEL")
+            self.binding.link(source_name, target_name)  # type: ignore[attr-defined]
+            self.fail_next_target_read = True
+            return
+        self.binding.link(source_name, target_name)  # type: ignore[attr-defined]
+
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
+        if name == "deleted.py" and self.fail_next_target_read:
+            self.fail_next_target_read = False
+            self.failed = True
+            raise OSError("UNDO-CREATE-POST-LINK-READ-SENTINEL")
+        return self.binding.read_text(name)  # type: ignore[attr-defined,no-any-return]
+
+
+def patch_undo_create_publish_failure(stage: str) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_publish_failure(
+        workspace: Path,
+        parent: Path,
+    ) -> UndoCreatePublishFailureBinding:
+        return UndoCreatePublishFailureBinding(real_open(workspace, parent), stage)
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_publish_failure,
+    )
+
+
 class RecordingApprover:
     def __init__(self, decisions: list[bool]) -> None:
         self.decisions = list(decisions)
@@ -1746,6 +1792,7 @@ class ToolTests(unittest.TestCase):
         binding = object.__new__(tools_module._PosixDirectoryBinding)
         binding._fd = 71
         with (
+            patch.object(tools_module.os, "O_NOFOLLOW", 0x200000, create=True),
             patch.object(tools_module.os, "open", return_value=72) as opened,
             patch.object(tools_module.os, "fchmod", create=True) as fchmod,
             patch.object(tools_module.os, "close") as closed,
@@ -1753,7 +1800,7 @@ class ToolTests(unittest.TestCase):
         ):
             binding.chmod("app.py", 0o640)
 
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | 0x200000
         opened.assert_called_once_with("app.py", flags, dir_fd=71)
         fchmod.assert_called_once_with(72, 0o640)
         closed.assert_called_once_with(72)
@@ -1774,6 +1821,35 @@ class ToolTests(unittest.TestCase):
             patch.object(tools_module.os, "fchmod", None, create=True),
             patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
         ):
+            with self.assertRaises(tools_module.PolicyError):
+                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+
+        constructor.assert_not_called()
+
+    def test_posix_binding_rejects_zero_nofollow_flag_before_opening(self) -> None:
+        supported = {os.rename, os.open, os.link, os.unlink, os.stat}
+        with (
+            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(tools_module.os, "supports_dir_fd", supported),
+            patch.object(tools_module.os, "fchmod", create=True),
+            patch.object(tools_module.os, "O_NOFOLLOW", 0, create=True),
+            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+        ):
+            with self.assertRaises(tools_module.PolicyError):
+                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+
+        constructor.assert_not_called()
+
+    def test_posix_binding_rejects_missing_nofollow_flag_before_opening(self) -> None:
+        supported = {os.rename, os.open, os.link, os.unlink, os.stat}
+        with (
+            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(tools_module.os, "supports_dir_fd", supported),
+            patch.object(tools_module.os, "fchmod", create=True),
+            patch.dict(tools_module.os.__dict__, {}, clear=False),
+            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+        ):
+            tools_module.os.__dict__.pop("O_NOFOLLOW", None)
             with self.assertRaises(tools_module.PolicyError):
                 tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
 
@@ -1873,6 +1949,50 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(execution.ok)
         self.assertEqual((), execution.compensation_failed)
         self.assertEqual(after, self._file_snapshot(target, "src/app.py"))
+
+    def test_undo_recreate_failure_before_link_keeps_after_missing_without_compensation_error(
+        self,
+    ) -> None:
+        target = self.workspace / "src" / "deleted.py"
+        target.write_text("before deletion\n", encoding="utf-8")
+        before = self._file_snapshot(target, "src/deleted.py")
+        target.unlink()
+        journal = ChangeJournal()
+        journal.begin_task(("src/deleted.py",), "passed")
+        journal.record_committed("src/deleted.py", before, None)
+        change_set = journal.seal_task((), "passed")
+        self.assertIsNotNone(change_set)
+        self.registry.context.change_journal = journal
+
+        with patch_undo_create_publish_failure("before"):
+            execution = self.registry.undo_change_set(change_set)  # type: ignore[arg-type]
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertFalse(target.exists())
+        self.assertIs(change_set, journal.latest())
+
+    def test_undo_recreate_snapshot_failure_after_link_removes_published_file_cleanly(
+        self,
+    ) -> None:
+        target = self.workspace / "src" / "deleted.py"
+        target.write_text("before deletion\n", encoding="utf-8")
+        before = self._file_snapshot(target, "src/deleted.py")
+        target.unlink()
+        journal = ChangeJournal()
+        journal.begin_task(("src/deleted.py",), "passed")
+        journal.record_committed("src/deleted.py", before, None)
+        change_set = journal.seal_task((), "passed")
+        self.assertIsNotNone(change_set)
+        self.registry.context.change_journal = journal
+
+        with patch_undo_create_publish_failure("after"):
+            execution = self.registry.undo_change_set(change_set)  # type: ignore[arg-type]
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertFalse(target.exists())
+        self.assertIs(change_set, journal.latest())
 
     def test_approved_command_runs_without_shell(self) -> None:
         """防止合法检查命令在审批后仍无法执行。"""

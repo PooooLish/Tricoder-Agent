@@ -274,6 +274,20 @@ class RegistryJournalFactory:
         )
 
 
+class LegacyRegistryJournalFactory(RegistryJournalFactory):
+    """模拟旧代码只传 ActiveSession 的前五个位置参数。"""
+
+    def __call__(self, record, memory, options) -> ActiveSession:  # type: ignore[no-untyped-def]
+        candidate = super().__call__(record, memory, options)
+        return ActiveSession(
+            candidate.record,
+            candidate.memory,
+            candidate.context,
+            candidate.config,
+            candidate.agent,
+        )
+
+
 class SessionRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -443,6 +457,52 @@ class SessionRuntimeTests(unittest.TestCase):
         second_diff = runtime.diff_latest()
         execution = runtime.undo_latest()
 
+        self.assertIs(original_journal, runtime.current.journal)
+        self.assertIs(
+            original_journal,
+            runtime.current.tools.context.change_journal,  # type: ignore[union-attr]
+        )
+        self.assertIn("-v1", second_diff or "")
+        self.assertIn("+v2", second_diff or "")
+        self.assertNotIn("-v0", second_diff or "")
+        self.assertTrue(execution.ok)
+        self.assertEqual("v1\n", target.read_text(encoding="utf-8"))
+
+    def test_legacy_five_position_factory_rebinds_agent_registry_across_model_change(self) -> None:
+        source_dir = self.workspace / "src"
+        source_dir.mkdir()
+        target = source_dir / "model.py"
+        target.write_text("v0\n", encoding="utf-8")
+        factory = LegacyRegistryJournalFactory()
+
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            provider = kwargs["provider"]
+            return AppConfig(
+                workspace=self.workspace,
+                provider=ProviderConfig(
+                    provider,
+                    "test-key",
+                    "https://example.test",
+                    f"{provider}-model",
+                ),
+            )
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=factory,
+            config_loader=config_loader,
+        )
+        original_journal = runtime.current.journal
+        runtime.run_task("v0->v1")
+        runtime.change_model("glm")
+
+        runtime.run_task("v1->v2")
+        second_diff = runtime.diff_latest()
+        execution = runtime.undo_latest()
+
+        self.assertIsNotNone(runtime.current.tools)
         self.assertIs(original_journal, runtime.current.journal)
         self.assertIs(
             original_journal,

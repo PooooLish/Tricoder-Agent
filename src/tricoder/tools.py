@@ -96,13 +96,20 @@ class _DirectoryBinding:
     def open(cls, workspace: Path, parent: Path) -> "_DirectoryBinding":
         if _is_windows():
             return _WindowsDirectoryBinding(workspace, parent)
-        if not {
-            os.rename,
-            os.open,
-            os.link,
-            os.unlink,
-            os.stat,
-        }.issubset(os.supports_dir_fd) or not callable(getattr(os, "fchmod", None)):
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if (
+            not isinstance(nofollow, int)
+            or isinstance(nofollow, bool)
+            or nofollow == 0
+            or not {
+                os.rename,
+                os.open,
+                os.link,
+                os.unlink,
+                os.stat,
+            }.issubset(os.supports_dir_fd)
+            or not callable(getattr(os, "fchmod", None))
+        ):
             raise PolicyError("当前平台无法建立安全目录绑定，拒绝写入")
         return _PosixDirectoryBinding(parent)
 
@@ -146,7 +153,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
     def __init__(self, parent: Path) -> None:
         super().__init__(parent)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
         try:
             self._fd = os.open(parent, flags)
         except OSError as exc:
@@ -170,7 +177,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
 
     def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NOFOLLOW
         descriptor = os.open(name, flags, dir_fd=self._fd)
         with os.fdopen(descriptor, "r", encoding="utf-8") as file:
             metadata = os.fstat(file.fileno())
@@ -237,7 +244,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
 
     def chmod(self, name: str, mode: int) -> None:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NOFOLLOW
         descriptor = os.open(name, flags, dir_fd=self._fd)
         try:
             os.fchmod(descriptor, stat.S_IMODE(mode))
@@ -792,7 +799,16 @@ class ToolRegistry:
             try:
                 if entry.restored is None:
                     if binding.target_exists(item.path.name):
-                        raise PolicyError("补偿前目标不再缺失")
+                        current_state = self._snapshot(
+                            binding,
+                            item.path.name,
+                            item.change.path,
+                        )
+                        if (
+                            entry.publishing is None
+                            or current_state != entry.publishing
+                        ):
+                            raise PolicyError("补偿前目标不再缺失或受控发布状态")
                 else:
                     current_state = self._snapshot(
                         binding,
@@ -819,7 +835,8 @@ class ToolRegistry:
 
                 after = item.change.after
                 if after is None:
-                    binding.unlink(item.path.name)
+                    if binding.target_exists(item.path.name):
+                        binding.unlink(item.path.name)
                     if binding.target_exists(item.path.name):
                         raise OSError("补偿后目标仍存在")
                 else:
