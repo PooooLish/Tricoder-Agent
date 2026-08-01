@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from tricoder.changes import ChangeJournal, FileChange, FileIdentity, FileSnapshot
 from tricoder.models import ToolDefinition, ToolResult
+from tricoder.patches import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 
 
@@ -26,6 +27,26 @@ class _ToolRegistration:
 
     definition: ToolDefinition
     handler: Callable[[dict[str, Any]], ToolResult]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedFilePatch:
+    """审批前完全计算好的单文件补丁，不保留待执行的源码操作。"""
+
+    patch: FilePatch
+    path: Path
+    relative_path: str
+    before: FileSnapshot | None
+    after_content: str
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedFilePatch:
+    """已经发布到目标路径、可用于安全补偿核验的真实后态。"""
+
+    prepared: _PreparedFilePatch
+    after: FileSnapshot
 
 
 def _stat_identity(metadata: os.stat_result) -> FileIdentity:
@@ -439,6 +460,14 @@ class ToolRegistry:
             ),
             _ToolRegistration(
                 ToolDefinition(
+                    "apply_patch",
+                    "经一次审批后原子应用受限的多文件 unified diff。",
+                    self._schema({"patch": {"type": "string"}}, ["patch"]),
+                ),
+                self._apply_patch,
+            ),
+            _ToolRegistration(
+                ToolDefinition(
                     "run_command",
                     "经审批后在工作区内运行受策略允许的命令。",
                     self._schema(
@@ -809,6 +838,261 @@ class ToolRegistry:
             output += "；关闭警告：目录绑定未能正常关闭，文件创建已提交，请在验证时检查目录"
         return ToolResult(True, output, relative_path)
 
+    def _apply_patch(self, arguments: dict[str, Any]) -> ToolResult:
+        """全量预检后，以一次审批提交受限的多文件补丁。"""
+
+        if self.context.read_only:
+            return ToolResult(False, "只读模式禁止应用补丁")
+        source = self._required_str(arguments, "patch")
+        try:
+            file_patches = parse_unified_diff(source)
+        except PatchError as exc:
+            return ToolResult(False, f"补丁无效：{exc}")
+
+        workspace = self.context.workspace_policy.workspace
+        resolved: list[tuple[FilePatch, Path, str]] = []
+        seen_targets: set[str] = set()
+        for file_patch in file_patches:
+            path = self.context.workspace_policy.resolve_path(
+                file_patch.path,
+                must_exist=not file_patch.create,
+            )
+            relative_path = path.relative_to(workspace).as_posix()
+            if relative_path in seen_targets:
+                return ToolResult(False, f"补丁目标重复：{relative_path}")
+            seen_targets.add(relative_path)
+            if not path.parent.is_dir():
+                return ToolResult(False, f"补丁目标父目录不存在：{relative_path}")
+            if file_patch.create:
+                if path.exists():
+                    return ToolResult(False, f"补丁创建目标已存在：{relative_path}")
+            elif not path.is_file():
+                return ToolResult(False, f"补丁目标不是普通文件：{relative_path}")
+            resolved.append((file_patch, path, relative_path))
+
+        bindings: dict[Path, _DirectoryBinding] = {}
+        temporary_files: list[tuple[_DirectoryBinding, str]] = []
+        committed_paths: list[str] = []
+        close_warning = False
+        try:
+            for parent in sorted({path.parent for _, path, _ in resolved}, key=str):
+                bindings[parent] = _DirectoryBinding.open(workspace, parent)
+
+            prepared: list[_PreparedFilePatch] = []
+            for file_patch, path, relative_path in resolved:
+                binding = bindings[path.parent]
+                if not binding.verify_parent(path.parent):
+                    return ToolResult(False, f"补丁目标父目录身份已变化：{relative_path}")
+                if file_patch.create:
+                    if binding.target_exists(path.name):
+                        return ToolResult(False, f"补丁创建目标已存在：{relative_path}")
+                    before = None
+                    original = ""
+                    mode = 0o600
+                else:
+                    before = self._snapshot(binding, path.name, relative_path)
+                    original = before.content
+                    mode = before.mode
+                try:
+                    after_content = apply_file_patch(original, file_patch)
+                except PatchError as exc:
+                    return ToolResult(False, f"补丁无法应用到 {relative_path}：{exc}")
+                prepared.append(
+                    _PreparedFilePatch(
+                        file_patch,
+                        path,
+                        relative_path,
+                        before,
+                        after_content,
+                        mode,
+                    )
+                )
+
+            projected = tuple(
+                FileChange(
+                    item.relative_path,
+                    item.before,
+                    FileSnapshot(
+                        item.relative_path,
+                        item.after_content,
+                        item.mode,
+                        item.before.identity if item.before else FileIdentity(0, 0),
+                    ),
+                )
+                for item in prepared
+            )
+            self._reserve_changes(projected)
+            approval_detail = "".join(self._render_patch_diff(item) for item in prepared)
+            if not self.context.approver("apply_patch", approval_detail):
+                return ToolResult(False, "用户拒绝了多文件补丁")
+
+            for item in prepared:
+                verified = self.context.workspace_policy.resolve_path(
+                    item.patch.path,
+                    must_exist=not item.patch.create,
+                )
+                binding = bindings[item.path.parent]
+                if verified != item.path or not binding.verify_parent(verified.parent):
+                    return ToolResult(False, "审批后补丁目标父目录身份发生变化，拒绝写入")
+                if item.before is None:
+                    if binding.target_exists(item.path.name):
+                        return ToolResult(False, "审批后补丁创建目标已存在，拒绝覆盖")
+                else:
+                    current = self._snapshot(binding, item.path.name, item.relative_path)
+                    if current != item.before:
+                        return ToolResult(False, "审批后补丁目标发生变化，拒绝全部写入")
+
+            committed: list[_CommittedFilePatch] = []
+            failed_path = ""
+            try:
+                for item in sorted(prepared, key=lambda value: value.relative_path):
+                    failed_path = item.relative_path
+                    binding = bindings[item.path.parent]
+                    temporary_name = binding.create_temporary(
+                        item.path.name,
+                        item.after_content,
+                        item.mode,
+                    )
+                    temporary_files.append((binding, temporary_name))
+                    expected_after = self._snapshot(
+                        binding,
+                        temporary_name,
+                        item.relative_path,
+                    )
+                    if item.before is None:
+                        binding.link(temporary_name, item.path.name)
+                    else:
+                        binding.replace(temporary_name, item.path.name)
+                        temporary_files.pop()
+                    committed_item = _CommittedFilePatch(item, expected_after)
+                    committed.append(committed_item)
+                    after = self._snapshot(binding, item.path.name, item.relative_path)
+                    committed[-1] = _CommittedFilePatch(item, after)
+                    self._record_committed(item.relative_path, item.before, after)
+                    committed_paths.append(item.relative_path)
+                    if item.before is None:
+                        binding.unlink(temporary_name)
+                        temporary_files.pop()
+            except Exception:
+                compensation_failures = self._compensate_patch_commits(
+                    committed,
+                    bindings,
+                    temporary_files,
+                )
+                affected_paths = tuple(
+                    dict.fromkeys(
+                        [entry.prepared.relative_path for entry in committed]
+                        + ([failed_path] if failed_path else [])
+                    )
+                )
+                affected_text = "、".join(affected_paths)
+                output = f"补丁提交失败；受影响路径：{affected_text}"
+                if compensation_failures:
+                    output += f"；补偿未完成：{'、'.join(compensation_failures)}"
+                else:
+                    output += "；已完成安全补偿"
+                return ToolResult(
+                    False,
+                    output,
+                    modified_paths=tuple(compensation_failures),
+                )
+        finally:
+            for binding, temporary_name in reversed(temporary_files):
+                try:
+                    binding.unlink(temporary_name)
+                except OSError:
+                    pass
+            for binding in reversed(tuple(bindings.values())):
+                try:
+                    binding.close()
+                except OSError:
+                    if not committed_paths:
+                        raise
+                    close_warning = True
+
+        paths_text = "、".join(committed_paths)
+        output = f"已应用补丁到 {len(committed_paths)} 个文件：{paths_text}"
+        if close_warning:
+            output += "；关闭警告：目录绑定未能正常关闭，请验证受影响路径"
+        return ToolResult(True, output, modified_paths=tuple(committed_paths))
+
+    @staticmethod
+    def _render_patch_diff(item: _PreparedFilePatch) -> str:
+        """为一次审批渲染完整规范 diff，不复用模型输出上限。"""
+
+        before_lines = (
+            item.before.content.splitlines(keepends=True) if item.before is not None else []
+        )
+        return "".join(
+            difflib.unified_diff(
+                before_lines,
+                item.after_content.splitlines(keepends=True),
+                fromfile=item.relative_path if item.before is not None else "/dev/null",
+                tofile=item.relative_path,
+            )
+        )
+
+    def _compensate_patch_commits(
+        self,
+        committed: list[_CommittedFilePatch],
+        bindings: dict[Path, _DirectoryBinding],
+        temporary_files: list[tuple[_DirectoryBinding, str]],
+    ) -> tuple[str, ...]:
+        """逆序补偿已发布目标；身份不符时绝不覆盖并保留真实账本状态。"""
+
+        failures: list[str] = []
+        for entry in reversed(committed):
+            item = entry.prepared
+            binding = bindings[item.path.parent]
+            try:
+                current = self._snapshot(binding, item.path.name, item.relative_path)
+                if current != entry.after:
+                    raise PolicyError("补偿前目标状态不再匹配已提交后态")
+                if item.before is None:
+                    binding.unlink(item.path.name)
+                    if binding.target_exists(item.path.name):
+                        raise OSError("补偿后创建目标仍然存在")
+                    self._record_committed(item.relative_path, entry.after, None)
+                    continue
+
+                temporary_name = binding.create_temporary(
+                    item.path.name,
+                    item.before.content,
+                    item.before.mode,
+                )
+                temporary_files.append((binding, temporary_name))
+                binding.replace(temporary_name, item.path.name)
+                temporary_files.pop()
+                restored = self._snapshot(binding, item.path.name, item.relative_path)
+                if (
+                    restored.content != item.before.content
+                    or restored.mode != item.before.mode
+                ):
+                    raise OSError("补偿后的目标内容或权限不匹配原始快照")
+                self._record_committed(item.relative_path, entry.after, restored)
+            except Exception:
+                failures.append(item.relative_path)
+                self._record_actual_patch_state(entry, binding)
+        return tuple(sorted(failures))
+
+    def _record_actual_patch_state(
+        self,
+        entry: _CommittedFilePatch,
+        binding: _DirectoryBinding,
+    ) -> None:
+        """补偿失败后尽力把可观测的真实净状态写回活动账本。"""
+
+        item = entry.prepared
+        try:
+            actual = (
+                self._snapshot(binding, item.path.name, item.relative_path)
+                if binding.target_exists(item.path.name)
+                else None
+            )
+            self._record_committed(item.relative_path, entry.after, actual)
+        except Exception:
+            pass
+
     @staticmethod
     def _snapshot(
         binding: _DirectoryBinding,
@@ -825,6 +1109,12 @@ class ToolRegistry:
 
         if self.context.change_journal is not None:
             self.context.change_journal.reserve((change,))
+
+    def _reserve_changes(self, changes: tuple[FileChange, ...]) -> None:
+        """有活动账本时为一次多文件审批整体预留字符预算。"""
+
+        if self.context.change_journal is not None:
+            self.context.change_journal.reserve(changes)
 
     def _record_committed(
         self,

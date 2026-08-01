@@ -70,6 +70,46 @@ def patch_binding_cleanup_failure(target: Path) -> object:
     )
 
 
+class PublishFailingBinding:
+    """保留真实发布，仅在第二目标及可选回滚发布点注入失败。"""
+
+    def __init__(self, binding: object, *, rollback_fails: bool) -> None:
+        self.binding = binding
+        self.rollback_fails = rollback_fails
+        self.app_publish_count = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def replace(self, temporary_name: str, target_name: str) -> None:
+        if target_name == "other.py":
+            raise OSError("PUBLISH-SECOND-SENTINEL")
+        if target_name == "app.py":
+            self.app_publish_count += 1
+            if self.rollback_fails and self.app_publish_count > 1:
+                raise OSError("ROLLBACK-FIRST-SENTINEL")
+        self.binding.replace(temporary_name, target_name)  # type: ignore[attr-defined]
+
+
+def patch_binding_publish_failure(*, rollback_fails: bool = False) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_publish_failure(
+        workspace: Path,
+        parent: Path,
+    ) -> PublishFailingBinding:
+        return PublishFailingBinding(
+            real_open(workspace, parent),
+            rollback_fails=rollback_fails,
+        )
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_publish_failure,
+    )
+
+
 class RecordingApprover:
     def __init__(self, decisions: list[bool]) -> None:
         self.decisions = list(decisions)
@@ -114,6 +154,7 @@ class ToolTests(unittest.TestCase):
                 "search_text",
                 "edit_file",
                 "create_file",
+                "apply_patch",
                 "run_command",
                 "finish",
             ),
@@ -145,6 +186,7 @@ class ToolTests(unittest.TestCase):
                 {"path": {"type": "string"}, "content": {"type": "string"}},
                 ["path", "content"],
             ),
+            "apply_patch": ({"patch": {"type": "string"}}, ["patch"]),
             "run_command": (
                 {"command": {"type": "string"}, "cwd": {"type": "string"}},
                 ["command"],
@@ -387,6 +429,280 @@ class ToolTests(unittest.TestCase):
         self.assertEqual("create_file", self.approver.requests[0][0])
         self.assertIn("+答案 = '安全'", self.approver.requests[0][1])
         self.assertEqual([], list((self.workspace / "src").glob("*.tmp")))
+
+    def test_apply_patch_modifies_and_creates_files_with_one_approval(self) -> None:
+        """防止多文件补丁分批审批、乱序报告或只提交部分成功目标。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- /dev/null\n"
+            "+++ b/src/new.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+created = True\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(("src/app.py", "src/new.py"), result.modified_paths)
+        self.assertEqual(1, len(self.approver.requests))
+        self.assertEqual("apply_patch", self.approver.requests[0][0])
+        self.assertIn("--- src/app.py", self.approver.requests[0][1])
+        self.assertEqual(
+            "def answer():\n    return 42\n",
+            (self.workspace / "src" / "app.py").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            "created = True\n",
+            (self.workspace / "src" / "new.py").read_text(encoding="utf-8"),
+        )
+
+    def test_apply_patch_rejects_malformed_second_file_before_approval(self) -> None:
+        """防止解析首个文件后就在第二个畸形文件暴露前产生审批或写入。"""
+        target = self.workspace / "src" / "app.py"
+        original = target.read_bytes()
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- /dev/null\n"
+            "@@ -0,0 +1 @@\n"
+            "+malformed = True\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+        self.assertEqual(original, target.read_bytes())
+
+    def test_apply_patch_rejects_sensitive_path_before_approval(self) -> None:
+        """防止多文件补丁绕过工作区敏感路径策略。"""
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/.local/unsafe.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+unsafe = True\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+
+    def test_apply_patch_rejects_parent_traversal_before_approval(self) -> None:
+        """防止补丁头中的父目录穿越在路径规范化前进入审批。"""
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/src/../outside.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+outside = True\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+
+    def test_apply_patch_rejects_existing_create_target_before_approval(self) -> None:
+        """防止创建补丁覆盖已有文件或把冲突推迟到审批之后。"""
+        target = self.workspace / "src" / "app.py"
+        original = target.read_bytes()
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/src/app.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+overwritten = True\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+        self.assertEqual(original, target.read_bytes())
+
+    def test_apply_patch_rejects_budget_overflow_before_approval(self) -> None:
+        """防止多文件预测变更超预算后仍请求审批。"""
+        journal = ChangeJournal(max_chars=10)
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        target = self.workspace / "src" / "app.py"
+        original = target.read_bytes()
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual([], self.approver.requests)
+        self.assertEqual(original, target.read_bytes())
+        self.assertIsNone(journal.seal_task((), "not-run"))
+
+    def test_apply_patch_rechecks_all_targets_after_approval_before_writing(self) -> None:
+        """防止审批期间一个目标变化后仍先写入另一个目标。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        first_original = first.read_bytes()
+
+        def mutate_second(action: str, detail: str) -> bool:
+            self.assertEqual("apply_patch", action)
+            self.assertIn("src/other.py", detail)
+            second.write_text("external = True\n", encoding="utf-8")
+            return True
+
+        self.registry.context.approver = mutate_second
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(first_original, first.read_bytes())
+        self.assertEqual("external = True\n", second.read_text(encoding="utf-8"))
+
+    def test_apply_patch_read_only_rejects_before_parsing_or_approval(self) -> None:
+        """防止只读模式解析自由补丁文本或请求审批。"""
+        read_only = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(),
+                self.approver,
+                read_only=True,
+            )
+        )
+
+        result = read_only.execute("apply_patch", {"patch": "not-a-patch"})
+
+        self.assertFalse(result.ok)
+        self.assertIn("只读", result.output)
+        self.assertEqual([], self.approver.requests)
+
+    def test_apply_patch_rejects_invalid_provider_arguments(self) -> None:
+        """防止缺参、错误类型或额外字段进入补丁解析和审批。"""
+        valid_patch = (
+            "--- /dev/null\n"
+            "+++ b/src/extra-forbidden.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+created = True\n"
+        )
+        invalid_arguments = (
+            {},
+            {"patch": 42},
+            {"patch": valid_patch, "extra": True},
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                result = self.registry.execute("apply_patch", arguments)
+                self.assertFalse(result.ok)
+        self.assertFalse((self.workspace / "src" / "extra-forbidden.py").exists())
+        self.assertEqual([], self.approver.requests)
+
+    def test_apply_patch_compensates_prior_commit_when_later_publish_fails(self) -> None:
+        """防止第二个目标发布失败后保留第一个目标的部分提交。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        first_original = first.read_text(encoding="utf-8")
+        second_original = second.read_text(encoding="utf-8")
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        with patch_binding_publish_failure():
+            result = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task((), "not-run")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(first_original, first.read_text(encoding="utf-8"))
+        self.assertEqual(second_original, second.read_text(encoding="utf-8"))
+        self.assertIsNone(change_set)
+
+    def test_apply_patch_preserves_actual_journal_state_when_compensation_fails(
+        self,
+    ) -> None:
+        """防止补偿失败后把真实残留修改从结果和账本中抹掉。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        with patch_binding_publish_failure(rollback_fails=True):
+            result = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertFalse(result.ok)
+        self.assertIn("src/app.py", result.output)
+        self.assertIn("src/other.py", result.output)
+        self.assertNotIn("PUBLISH-SECOND-SENTINEL", result.output)
+        self.assertNotIn("ROLLBACK-FIRST-SENTINEL", result.output)
+        self.assertNotIn(str(self.workspace), result.output)
+        self.assertNotIn("return 42", result.output)
+        self.assertEqual("def answer():\n    return 42\n", first.read_text(encoding="utf-8"))
+        self.assertEqual("value = 1\n", second.read_text(encoding="utf-8"))
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/app.py",), tuple(change.path for change in change_set.changes))
+        self.assertEqual(
+            "def answer():\n    return 42\n",
+            change_set.changes[0].after.content,
+        )
 
     def test_create_file_records_missing_before_and_published_after_snapshot(self) -> None:
         """防止新建账本伪造前态，或沿用临时文件而非发布目标的身份。"""

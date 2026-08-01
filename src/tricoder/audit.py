@@ -17,6 +17,7 @@ _FREE_TEXT_KEYS = {
     "new_text",
     "old_text",
     "output",
+    "patch",
     "query",
     "reason",
     "summary",

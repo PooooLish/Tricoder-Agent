@@ -39,6 +39,28 @@ class AuditTests(unittest.TestCase):
             self.assertEqual("ok", decoded["status"])
             self.assertIn("timestamp", decoded)
 
+    def test_logger_replaces_patch_source_with_character_count(self) -> None:
+        """防止 unified diff 或源码哨兵进入持久化 JSONL。"""
+        sentinel = "PATCH-PRIVATE-SOURCE-SENTINEL-4E8F"
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1 +1 @@\n"
+            f"-{sentinel}\n"
+            "+safe = True\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "patch.jsonl"
+            logger = AuditLogger(path)
+
+            logger.log({"tool": "apply_patch", "arguments": {"patch": patch_text}})
+
+            serialized = path.read_text(encoding="utf-8")
+            event = json.loads(serialized)
+            self.assertNotIn(sentinel, serialized)
+            self.assertNotIn("patch", event["arguments"])
+            self.assertEqual(len(patch_text), event["arguments"]["patch_chars"])
+
     def test_logger_preflight_converts_directory_creation_failure_to_safe_error(self) -> None:
         """防止审计目录不可创建时泄露底层路径或延迟到运行期才失败。"""
         with tempfile.TemporaryDirectory() as directory:
