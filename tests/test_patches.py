@@ -45,6 +45,20 @@ INVALID_PATCHES = {
     "duplicate": UPDATE_PATCH + UPDATE_PATCH,
 }
 
+INVALID_PATH_PATCHES = {
+    "traversal": "--- a/dir/../app.py\n+++ b/dir/../app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "absolute_posix": "--- a//tmp/app.py\n+++ b//tmp/app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "absolute_windows": "--- a/C:/tmp/app.py\n+++ b/C:/tmp/app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "backslash": "--- a/dir\\app.py\n+++ b/dir\\app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "empty_segment": "--- a/dir//app.py\n+++ b/dir//app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "dot_segment": "--- a/./app.py\n+++ b/./app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "missing_prefix": "--- app.py\n+++ app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "alias_duplicate": (
+        "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+        "--- a/dir/../app.py\n+++ b/dir/../app.py\n@@ -1 +1 @@\n-old\n+new\n"
+    ),
+}
+
 
 class PatchParserTests(unittest.TestCase):
     def test_parses_and_applies_exact_update_hunk(self) -> None:
@@ -70,6 +84,13 @@ class PatchParserTests(unittest.TestCase):
     def test_rejects_disallowed_or_malformed_patch_forms(self) -> None:
         """防止删除、改名和畸形 hunk 绕过受限语法。"""
         for name, source in INVALID_PATCHES.items():
+            with self.subTest(name=name):
+                with self.assertRaises(PatchError):
+                    parse_unified_diff(source)
+
+    def test_rejects_noncanonical_or_aliasing_patch_paths(self) -> None:
+        """防止路径别名绕过同一目标的重复补丁拒绝。"""
+        for name, source in INVALID_PATH_PATCHES.items():
             with self.subTest(name=name):
                 with self.assertRaises(PatchError):
                     parse_unified_diff(source)

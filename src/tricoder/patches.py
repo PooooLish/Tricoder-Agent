@@ -135,9 +135,9 @@ def _parse_file_header(
         raise PatchError("补丁不支持删除文件")
 
     create = old_raw == "/dev/null"
-    old_path = old_raw.removeprefix("a/")
-    new_path = new_raw.removeprefix("b/")
-    if not new_path or (not create and old_path != new_path):
+    old_path = "" if create else _normalize_patch_path(old_raw, "a/")
+    new_path = _normalize_patch_path(new_raw, "b/")
+    if not create and old_path != new_path:
         raise PatchError("补丁仅支持同路径修改或创建")
     return old_path, new_path, create, index + 2
 
@@ -148,6 +148,24 @@ def _header_path(line: str, prefix: str) -> str:
         path = path[:-1]
     if not path:
         raise PatchError("补丁文件路径不能为空")
+    return path
+
+
+def _normalize_patch_path(raw_path: str, required_prefix: str) -> str:
+    """移除一个标准前缀并验证得到的是规范的相对路径。"""
+
+    if not raw_path.startswith(required_prefix):
+        raise PatchError("补丁文件路径前缀无效")
+    path = raw_path[len(required_prefix) :]
+    segments = path.split("/")
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or ":" in path
+        or any(segment in ("", ".", "..") for segment in segments)
+    ):
+        raise PatchError("补丁文件路径不是规范相对路径")
     return path
 
 
