@@ -671,6 +671,52 @@ class ToolTests(unittest.TestCase):
         change_set = journal.seal_task(("src/app.py",), "not-run")
         self.assertEqual("src/app.py", change_set.changes[0].path)
 
+    def test_edit_reports_success_and_records_saved_snapshot_when_post_commit_read_fails(
+        self,
+    ) -> None:
+        """原子替换后的回读失败不得掩盖提交或丢失可用的真实快照。"""
+        target = self.workspace / "src" / "app.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        real_snapshot = ToolRegistry._snapshot
+
+        def fail_published_target_read(
+            binding: object,
+            name: str,
+            relative: str,
+        ) -> object:
+            if name == "app.py" and "return 42" in target.read_text(encoding="utf-8"):
+                raise OSError("simulated post-commit snapshot failure")
+            return real_snapshot(binding, name, relative)  # type: ignore[arg-type]
+
+        with patch.object(
+            ToolRegistry,
+            "_snapshot",
+            side_effect=fail_published_target_read,
+        ):
+            result = self.registry.execute(
+                "edit_file",
+                {
+                    "path": "src/app.py",
+                    "old_text": "return 41",
+                    "new_text": "return 42",
+                },
+            )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual("src/app.py", result.relative_path)
+        self.assertIn("账本警告", result.output)
+        self.assertEqual("def answer():\n    return 42\n", target.read_text(encoding="utf-8"))
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        metadata = target.stat()
+        self.assertEqual(
+            FileIdentity(metadata.st_dev, metadata.st_ino),
+            change_set.changes[0].after.identity,
+        )
+
     def test_create_reports_success_with_warning_after_binding_close_failure(
         self,
     ) -> None:
@@ -697,6 +743,34 @@ class ToolTests(unittest.TestCase):
         )
         change_set = journal.seal_task(("src/close-warning.py",), "not-run")
         self.assertEqual("src/close-warning.py", change_set.changes[0].path)
+
+    def test_create_reports_success_with_warning_when_post_commit_record_fails(
+        self,
+    ) -> None:
+        """硬链接发布后的账本异常不得把已提交文件伪装成失败。"""
+        target = self.workspace / "src" / "record-warning.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+
+        with patch.object(
+            self.registry,
+            "_record_committed",
+            side_effect=RuntimeError("simulated post-commit record failure"),
+        ):
+            result = self.registry.execute(
+                "create_file",
+                {
+                    "path": "src/record-warning.py",
+                    "content": "committed = True\n",
+                },
+            )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual("src/record-warning.py", result.relative_path)
+        self.assertIn("账本警告", result.output)
+        self.assertEqual("committed = True\n", target.read_text(encoding="utf-8"))
+        self.assertIsNone(journal.seal_task(("src/record-warning.py",), "not-run"))
 
     def test_create_file_rejects_sensitive_path(self) -> None:
         """防止创建工具绕过工作区敏感路径策略。"""

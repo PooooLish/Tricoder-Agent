@@ -621,6 +621,7 @@ class ToolRegistry:
         temporary_name: str | None = None
         committed = False
         close_warning = False
+        journal_warning = False
         try:
             preapproved = self.context.workspace_policy.resolve_path(raw_path)
             if preapproved != path or not binding.verify_parent(preapproved.parent):
@@ -665,11 +666,19 @@ class ToolRegistry:
                 updated,
                 before.mode,
             )
+            published_after = self._snapshot(binding, temporary_name, relative_path)
             binding.replace(temporary_name, path.name)
             committed = True
             temporary_name = None
-            after = self._snapshot(binding, path.name, relative_path)
-            self._record_committed(relative_path, before, after)
+            try:
+                after = self._snapshot(binding, path.name, relative_path)
+            except Exception:
+                after = published_after
+                journal_warning = True
+            try:
+                self._record_committed(relative_path, before, after)
+            except Exception:
+                journal_warning = True
         finally:
             if temporary_name is not None:
                 try:
@@ -683,6 +692,8 @@ class ToolRegistry:
                     raise
                 close_warning = True
         output = f"已修改 {relative}"
+        if journal_warning:
+            output += "；账本警告：提交后快照或记录失败，文件修改已提交，请在验证时检查路径"
         if close_warning:
             output += "；关闭警告：目录绑定未能正常关闭，文件修改已提交，请在验证时检查目录"
         return ToolResult(True, output, relative_path)
@@ -728,6 +739,7 @@ class ToolRegistry:
         committed = False
         cleanup_warning = False
         close_warning = False
+        journal_warning = False
         try:
             preapproved = self.context.workspace_policy.resolve_path(
                 raw_path,
@@ -756,13 +768,21 @@ class ToolRegistry:
                 return ToolResult(False, "审批后目标文件已存在，拒绝覆盖")
 
             temporary_name = binding.create_temporary(path.name, content, 0o600)
+            published_after = self._snapshot(binding, temporary_name, relative_path)
             try:
                 binding.link(temporary_name, path.name)
             except OSError:
                 return ToolResult(False, "create_file 无法原子发布文件，拒绝覆盖")
             committed = True
-            after = self._snapshot(binding, path.name, relative_path)
-            self._record_committed(relative_path, None, after)
+            try:
+                after = self._snapshot(binding, path.name, relative_path)
+            except Exception:
+                after = published_after
+                journal_warning = True
+            try:
+                self._record_committed(relative_path, None, after)
+            except Exception:
+                journal_warning = True
             try:
                 binding.unlink(temporary_name)
             except OSError:
@@ -781,6 +801,8 @@ class ToolRegistry:
                     raise
                 close_warning = True
         output = f"已创建 {relative}"
+        if journal_warning:
+            output += "；账本警告：提交后快照或记录失败，文件创建已提交，请在验证时检查路径"
         if cleanup_warning:
             output += "；清理警告：临时链接未能删除，请在验证时检查目录"
         if close_warning:

@@ -160,6 +160,15 @@ class MultiPathToolRegistry(PublicToolRegistry):
         return super().execute(name, arguments)
 
 
+class FailedMultiPathToolRegistry(PublicToolRegistry):
+    """模拟失败结果仍携带旧式和多路径元数据的工具。"""
+
+    def execute(self, name: str, arguments: dict[str, object]) -> object:
+        if name == "edit_file":
+            return ToolResult(False, "failed", "legacy.py", ("a.py", "legacy.py"))
+        return super().execute(name, arguments)
+
+
 class FailingProvider:
     """记录请求后模拟可恢复的 Provider 错误。"""
 
@@ -1041,6 +1050,29 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(("a.py", "b.py"), result.modified_files)
         self.assertEqual("待验证", result.verification)
+
+    def test_failed_result_does_not_record_legacy_or_multi_file_paths(self) -> None:
+        """失败工具即使携带路径元数据，也不得污染修改列表或验证状态。"""
+        provider = ScriptedProvider(
+            [
+                action(
+                    "edit_file",
+                    {"path": "sample.py", "old_text": "1", "new_text": "2"},
+                ),
+                action("finish", {"summary": "未修改"}),
+            ]
+        )
+        agent = LegacyCodingAgent(
+            provider,
+            FailedMultiPathToolRegistry(self.tools),
+            max_rounds=2,
+        )
+
+        result = agent.run("尝试修改多个文件")
+
+        self.assertTrue(result.ok)
+        self.assertEqual((), result.modified_files)
+        self.assertEqual("未运行", result.verification)
 
     def test_tiny_budget_still_sends_latest_complete_tool_round(self) -> None:
         """当前任务的完整工具回合即使超预算也必须发送给 Provider。"""

@@ -544,11 +544,11 @@ class CodingAgent:
                     ([result.relative_path] if result.relative_path is not None else [])
                     + list(result.modified_paths)
                 )
-            )
+            ) if result.ok else ()
             for changed_path in changed_paths:
                 if changed_path not in modified_files:
                     modified_files.append(changed_path)
-            if result.ok and changed_paths:
+            if changed_paths:
                 # 成功写入会使此前命令验证立即失效，必须重新验证。
                 verification = "待验证"
             if action.tool == "run_command":
