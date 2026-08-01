@@ -496,7 +496,16 @@ class SessionRuntime:
         """构建完整候选对象，调用方在成功返回前不会修改 ``current``。"""
         if self._active_session_factory is not None:
             candidate = self._active_session_factory(record, memory, self.options)
-            return replace(candidate, journal=journal) if journal is not None else candidate
+            if journal is None:
+                return candidate
+            if candidate.tools is not None:
+                try:
+                    candidate.tools.context.change_journal = journal
+                except (AttributeError, TypeError) as exc:
+                    raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本") from exc
+                if candidate.tools.context.change_journal is not journal:
+                    raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本")
+            return replace(candidate, journal=journal)
         loaded = config or self._load_config(record.workspace, record.provider, record.model)
         provider = self._provider_factory(loaded.provider, loaded.timeout)
         workspace_policy = self._workspace_policy_factory(loaded.workspace)

@@ -73,6 +73,7 @@ class _CommittedUndo:
     prepared: _PreparedUndo
     restored: FileSnapshot | None
     backup_name: str | None
+    publishing: FileSnapshot | None = None
 
 
 def _stat_identity(metadata: os.stat_result) -> FileIdentity:
@@ -96,13 +97,12 @@ class _DirectoryBinding:
         if _is_windows():
             return _WindowsDirectoryBinding(workspace, parent)
         if not {
-            os.chmod,
             os.rename,
             os.open,
             os.link,
             os.unlink,
             os.stat,
-        }.issubset(os.supports_dir_fd):
+        }.issubset(os.supports_dir_fd) or not callable(getattr(os, "fchmod", None)):
             raise PolicyError("当前平台无法建立安全目录绑定，拒绝写入")
         return _PosixDirectoryBinding(parent)
 
@@ -205,11 +205,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
                     newline="",
                 ) as temporary:
                     temporary.write(content)
-                os.chmod(
-                    temporary_name,
-                    stat.S_IMODE(mode),
-                    dir_fd=self._fd,
-                )
+                    os.fchmod(temporary.fileno(), stat.S_IMODE(mode))
             except BaseException:
                 try:
                     os.unlink(temporary_name, dir_fd=self._fd)
@@ -240,7 +236,13 @@ class _PosixDirectoryBinding(_DirectoryBinding):
         os.unlink(temporary_name, dir_fd=self._fd)
 
     def chmod(self, name: str, mode: int) -> None:
-        os.chmod(name, mode, dir_fd=self._fd, follow_symlinks=False)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=self._fd)
+        try:
+            os.fchmod(descriptor, stat.S_IMODE(mode))
+        finally:
+            os.close(descriptor)
 
 
 class _WindowsDirectoryBinding(_DirectoryBinding):
@@ -609,20 +611,52 @@ class ToolRegistry:
                     committed.append(
                         _CommittedUndo(item, item.change.after, backup_name)
                     )
-                    # Windows 不能替换或删除只读目标；硬链接备份让后续补偿仍可恢复原 identity。
-                    binding.chmod(
-                        item.path.name,
-                        item.change.after.mode | stat.S_IWUSR,
+                    backup_after = self._snapshot(
+                        binding,
+                        backup_name,
+                        item.change.path,
                     )
-                    writable_after = self._snapshot(
+                    if backup_after != item.change.after:
+                        raise PolicyError("撤销备份不再等于 after 快照")
+                    if _is_windows():
+                        # 只解锁已核验 identity 的硬链接；不得按可被替换的公开目标名 chmod。
+                        binding.chmod(
+                            backup_name,
+                            item.change.after.mode | stat.S_IWUSR,
+                        )
+                        writable_backup = self._snapshot(
+                            binding,
+                            backup_name,
+                            item.change.path,
+                        )
+                        if (
+                            writable_backup.content != item.change.after.content
+                            or writable_backup.identity != item.change.after.identity
+                        ):
+                            raise PolicyError("撤销备份 identity 在解锁时发生变化")
+                        committed[-1] = _CommittedUndo(
+                            item,
+                            writable_backup,
+                            backup_name,
+                        )
+                    current_after_link = self._snapshot(
                         binding,
                         item.path.name,
                         item.change.path,
                     )
-                    committed[-1] = _CommittedUndo(item, writable_after, backup_name)
-                restored = self._restore_before(item, binding, temporary_files)
+                    if current_after_link != committed[-1].restored:
+                        raise PolicyError("撤销目标在备份与发布之间发生变化")
+                restored = self._restore_before(
+                    item,
+                    binding,
+                    temporary_files,
+                    committed,
+                )
                 if backup_name is None:
-                    committed.append(_CommittedUndo(item, restored, None))
+                    if committed and committed[-1].prepared == item:
+                        committed[-1] = _CommittedUndo(item, restored, None)
+                    else:
+                        committed.append(_CommittedUndo(item, restored, None))
                 else:
                     committed[-1] = _CommittedUndo(item, restored, backup_name)
         except Exception:
@@ -701,6 +735,7 @@ class ToolRegistry:
         item: _PreparedUndo,
         binding: _DirectoryBinding,
         temporary_files: list[tuple[_DirectoryBinding, str]],
+        committed: list[_CommittedUndo],
     ) -> FileSnapshot | None:
         """发布 before 内容；调用方已为存在的 after 保留同 inode 备份。"""
 
@@ -717,6 +752,19 @@ class ToolRegistry:
             before.mode,
         )
         temporary_files.append((binding, temporary_name))
+        publishing = self._snapshot(binding, temporary_name, item.change.path)
+        if publishing.content != before.content or publishing.mode != before.mode:
+            raise OSError("撤销临时文件不匹配 before 快照")
+        if committed and committed[-1].prepared == item:
+            entry = committed[-1]
+            committed[-1] = _CommittedUndo(
+                item,
+                entry.restored,
+                entry.backup_name,
+                publishing,
+            )
+        else:
+            committed.append(_CommittedUndo(item, None, None, publishing))
         if item.change.after is None:
             binding.link(temporary_name, item.path.name)
             binding.unlink(temporary_name)
@@ -758,7 +806,15 @@ class ToolRegistry:
                         and current_state.content == item.change.after.content
                         and current_state.identity == item.change.after.identity
                     )
-                    if current_state != entry.restored and not controlled_unlock:
+                    published_before = (
+                        entry.publishing is not None
+                        and current_state == entry.publishing
+                    )
+                    if (
+                        current_state != entry.restored
+                        and not controlled_unlock
+                        and not published_before
+                    ):
                         raise PolicyError("补偿前目标不再等于受控恢复状态")
 
                 after = item.change.after
@@ -776,7 +832,8 @@ class ToolRegistry:
                     else:
                         binding.replace(entry.backup_name, item.path.name)
                     backup_files.remove((binding, entry.backup_name))
-                    binding.chmod(item.path.name, after.mode)
+                    if _is_windows():
+                        binding.chmod(item.path.name, after.mode)
                     if self._snapshot(binding, item.path.name, item.change.path) != after:
                         raise OSError("补偿后的目标不等于 after 快照")
             except Exception:

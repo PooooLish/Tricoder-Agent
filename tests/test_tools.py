@@ -236,6 +236,145 @@ def patch_post_chmod_read_failure() -> object:
     )
 
 
+class PosixSemanticsBinding:
+    """在 Windows 测试机上模拟 POSIX rename/unlink 不要求解除只读。"""
+
+    def __init__(self, binding: object) -> None:
+        self.binding = binding
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def chmod(self, _name: str, _mode: int) -> None:
+        raise AssertionError("POSIX undo 不应为 rename/unlink 主动 chmod")
+
+    def replace(self, temporary_name: str, target_name: str) -> None:
+        if self.binding.target_exists(target_name):  # type: ignore[attr-defined]
+            self.binding.chmod(target_name, 0o600)  # type: ignore[attr-defined]
+        self.binding.replace(temporary_name, target_name)  # type: ignore[attr-defined]
+
+    def unlink(self, name: str) -> None:
+        if self.binding.target_exists(name):  # type: ignore[attr-defined]
+            self.binding.chmod(name, 0o600)  # type: ignore[attr-defined]
+        self.binding.unlink(name)  # type: ignore[attr-defined]
+
+
+def patch_posix_semantics_binding() -> object:
+    def open_posix_semantics(workspace: Path, parent: Path) -> PosixSemanticsBinding:
+        return PosixSemanticsBinding(
+            tools_module._WindowsDirectoryBinding(workspace, parent)
+        )
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_posix_semantics,
+    )
+
+
+class ReplaceAfterBackupLinkBinding:
+    """在 after 硬链接建立后、解锁前注入外部 identity 替换。"""
+
+    def __init__(
+        self,
+        binding: object,
+        replacement: Path,
+        backup_mode: int,
+        external_mode: int,
+    ) -> None:
+        self.binding = binding
+        self.replacement = replacement
+        self.backup_mode = backup_mode
+        self.external_mode = external_mode
+        self.replaced = False
+        self.chmod_names: list[str] = []
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def link(self, source_name: str, target_name: str) -> None:
+        self.binding.link(source_name, target_name)  # type: ignore[attr-defined]
+        if source_name == "app.py" and target_name.startswith(".app.py."):
+            self.binding.chmod(source_name, 0o600)  # type: ignore[attr-defined]
+            os.chmod(self.replacement, 0o600)
+            os.replace(self.replacement, self.binding.parent / source_name)  # type: ignore[attr-defined]
+            self.binding.chmod(target_name, self.backup_mode)  # type: ignore[attr-defined]
+            self.binding.chmod(source_name, self.external_mode)  # type: ignore[attr-defined]
+            self.replaced = True
+
+    def chmod(self, name: str, mode: int) -> None:
+        self.chmod_names.append(name)
+        self.binding.chmod(name, mode)  # type: ignore[attr-defined]
+
+
+def patch_replace_after_backup_link(
+    replacement: Path,
+    backup_mode: int,
+    external_mode: int,
+    probes: list[ReplaceAfterBackupLinkBinding],
+) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_replacement(
+        workspace: Path,
+        parent: Path,
+    ) -> ReplaceAfterBackupLinkBinding:
+        binding = ReplaceAfterBackupLinkBinding(
+            real_open(workspace, parent),
+            replacement,
+            backup_mode,
+            external_mode,
+        )
+        probes.append(binding)
+        return binding
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_replacement,
+    )
+
+
+class ReadFailingAfterSuccessfulReplaceBinding:
+    """真实发布 before 后，让第一次目标快照读取失败。"""
+
+    def __init__(self, binding: object) -> None:
+        self.binding = binding
+        self.fail_next_target_read = False
+        self.failed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def replace(self, temporary_name: str, target_name: str) -> None:
+        self.binding.replace(temporary_name, target_name)  # type: ignore[attr-defined]
+        if target_name == "app.py" and not self.failed:
+            self.fail_next_target_read = True
+
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
+        if name == "app.py" and self.fail_next_target_read:
+            self.fail_next_target_read = False
+            self.failed = True
+            raise OSError("POST-REPLACE-READ-SENTINEL")
+        return self.binding.read_text(name)  # type: ignore[attr-defined,no-any-return]
+
+
+def patch_read_failure_after_successful_replace() -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_read_failure(
+        workspace: Path,
+        parent: Path,
+    ) -> ReadFailingAfterSuccessfulReplaceBinding:
+        return ReadFailingAfterSuccessfulReplaceBinding(real_open(workspace, parent))
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_read_failure,
+    )
+
+
 class RecordingApprover:
     def __init__(self, decisions: list[bool]) -> None:
         self.decisions = list(decisions)
@@ -1598,6 +1737,138 @@ class ToolTests(unittest.TestCase):
 
         with patch_post_chmod_read_failure():
             execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertEqual(after, self._file_snapshot(target, "src/app.py"))
+
+    def test_posix_binding_chmod_uses_nofollow_descriptor_and_fchmod(self) -> None:
+        binding = object.__new__(tools_module._PosixDirectoryBinding)
+        binding._fd = 71
+        with (
+            patch.object(tools_module.os, "open", return_value=72) as opened,
+            patch.object(tools_module.os, "fchmod", create=True) as fchmod,
+            patch.object(tools_module.os, "close") as closed,
+            patch.object(tools_module.os, "chmod") as path_chmod,
+        ):
+            binding.chmod("app.py", 0o640)
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        opened.assert_called_once_with("app.py", flags, dir_fd=71)
+        fchmod.assert_called_once_with(72, 0o640)
+        closed.assert_called_once_with(72)
+        path_chmod.assert_not_called()
+
+    def test_posix_binding_requires_fchmod_capability_before_opening(self) -> None:
+        supported = {
+            os.chmod,
+            os.rename,
+            os.open,
+            os.link,
+            os.unlink,
+            os.stat,
+        }
+        with (
+            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(tools_module.os, "supports_dir_fd", supported),
+            patch.object(tools_module.os, "fchmod", None, create=True),
+            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+        ):
+            with self.assertRaises(tools_module.PolicyError):
+                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+
+        constructor.assert_not_called()
+
+    def test_posix_update_undo_does_not_chmod_target(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("after\n", encoding="utf-8")
+        after = self._file_snapshot(target, "src/app.py")
+
+        with (
+            patch_posix_semantics_binding(),
+            patch.object(tools_module, "_is_windows", return_value=False),
+        ):
+            execution = self.registry.undo_change_set(
+                self._change_set(FileChange("src/app.py", before, after))
+            )
+
+        self.assertTrue(execution.ok)
+        self.assertEqual(before.content, target.read_text(encoding="utf-8"))
+
+    def test_posix_created_read_only_file_undo_does_not_chmod_target(self) -> None:
+        target = self.workspace / "src" / "created.py"
+        target.write_text("created\n", encoding="utf-8")
+        os.chmod(target, 0o400)
+        after = self._file_snapshot(target, "src/created.py")
+
+        with (
+            patch_posix_semantics_binding(),
+            patch.object(tools_module, "_is_windows", return_value=False),
+        ):
+            execution = self.registry.undo_change_set(
+                self._change_set(FileChange("src/created.py", None, after))
+            )
+
+        self.assertTrue(execution.ok)
+        self.assertFalse(target.exists())
+
+    def test_posix_read_only_update_undo_does_not_chmod_target(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("after\n", encoding="utf-8")
+        os.chmod(target, 0o400)
+        after = self._file_snapshot(target, "src/app.py")
+
+        with (
+            patch_posix_semantics_binding(),
+            patch.object(tools_module, "_is_windows", return_value=False),
+        ):
+            execution = self.registry.undo_change_set(
+                self._change_set(FileChange("src/app.py", before, after))
+            )
+
+        self.assertTrue(execution.ok)
+        self.assertEqual(before.content, target.read_text(encoding="utf-8"))
+        self.assertEqual(before.mode, stat.S_IMODE(target.stat().st_mode))
+
+    def test_external_replace_after_backup_link_is_not_chmodded_or_overwritten(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("after\n", encoding="utf-8")
+        os.chmod(target, 0o400)
+        after = self._file_snapshot(target, "src/app.py")
+        replacement = self.workspace / "src" / "external.py"
+        replacement.write_text("external\n", encoding="utf-8")
+        os.chmod(replacement, 0o400)
+        external = self._file_snapshot(replacement, "src/app.py")
+        probes: list[ReplaceAfterBackupLinkBinding] = []
+
+        with patch_replace_after_backup_link(
+            replacement,
+            after.mode,
+            external.mode,
+            probes,
+        ):
+            execution = self.registry.undo_change_set(
+                self._change_set(FileChange("src/app.py", before, after))
+            )
+
+        self.assertFalse(execution.ok)
+        self.assertTrue(probes[0].replaced, execution)
+        self.assertNotIn("app.py", probes[0].chmod_names)
+        self.assertEqual(external, self._file_snapshot(target, "src/app.py"))
+
+    def test_snapshot_failure_after_successful_replace_compensates_exact_after(self) -> None:
+        target = self.workspace / "src" / "app.py"
+        before = self._file_snapshot(target, "src/app.py")
+        target.write_text("after\n", encoding="utf-8")
+        after = self._file_snapshot(target, "src/app.py")
+
+        with patch_read_failure_after_successful_replace():
+            execution = self.registry.undo_change_set(
+                self._change_set(FileChange("src/app.py", before, after))
+            )
 
         self.assertFalse(execution.ok)
         self.assertEqual((), execution.compensation_failed)

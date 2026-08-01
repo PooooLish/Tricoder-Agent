@@ -171,6 +171,31 @@ class RegistryWritingAgent:
         )
 
 
+class VersionWritingAgent:
+    """从任务参数读取明确版本，经真实 ToolRegistry 提交一次编辑。"""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self.registry = registry
+
+    def run_with_context(self, task: str, context: SessionContext) -> SessionTurnResult:
+        old_text, new_text = task.split("->", 1)
+        result = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/model.py",
+                "old_text": f"{old_text}\n",
+                "new_text": f"{new_text}\n",
+            },
+        )
+        if not result.ok:
+            raise AssertionError(result)
+        paths = ("src/model.py",)
+        return SessionTurnResult(
+            RunResult(True, "完成", 1, modified_files=paths, verification="passed"),
+            replace(context, modified_files=paths, verification="passed"),
+        )
+
+
 class ExplodingJournalAgent:
     """在真实提交账本记录后抛出同一个异常实例。"""
 
@@ -205,6 +230,47 @@ class JournalSessionFactory:
             config,
             JournalWritingAgent(journal, record.name),
             journal=journal,
+        )
+
+
+class RegistryJournalFactory:
+    """保持旧三参数签名，并让每次候选构建先产生自己的新账本。"""
+
+    def __init__(self) -> None:
+        self.journals: list[ChangeJournal] = []
+
+    def __call__(self, record, memory, _options) -> ActiveSession:  # type: ignore[no-untyped-def]
+        journal = ChangeJournal()
+        self.journals.append(journal)
+        registry = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(record.workspace),
+                CommandPolicy(),
+                lambda _action, _detail: True,
+                change_journal=journal,
+            )
+        )
+        config = AppConfig(
+            workspace=record.workspace,
+            provider=ProviderConfig(
+                record.provider,
+                "test-key",
+                "https://example.test",
+                record.model,
+            ),
+        )
+        return ActiveSession(
+            record,
+            memory,
+            SessionContext(
+                persisted_summary=memory.summary,
+                modified_files=memory.modified_files,
+                verification=memory.verification,
+            ),
+            config,
+            VersionWritingAgent(registry),
+            registry,
+            journal,
         )
 
 
@@ -342,6 +408,51 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.diff_latest(), diff_a)
         runtime.switch(session_b, confirm=lambda _workspace: True)
         self.assertEqual(runtime.diff_latest(), diff_b)
+
+    def test_three_argument_factory_model_change_rebinds_tools_to_existing_journal(self) -> None:
+        source_dir = self.workspace / "src"
+        source_dir.mkdir()
+        target = source_dir / "model.py"
+        target.write_text("v0\n", encoding="utf-8")
+        factory = RegistryJournalFactory()
+
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            provider = kwargs["provider"]
+            return AppConfig(
+                workspace=self.workspace,
+                provider=ProviderConfig(
+                    provider,
+                    "test-key",
+                    "https://example.test",
+                    f"{provider}-model",
+                ),
+            )
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=factory,
+            config_loader=config_loader,
+        )
+        original_journal = runtime.current.journal
+        runtime.run_task("v0->v1")
+        runtime.change_model("glm")
+
+        runtime.run_task("v1->v2")
+        second_diff = runtime.diff_latest()
+        execution = runtime.undo_latest()
+
+        self.assertIs(original_journal, runtime.current.journal)
+        self.assertIs(
+            original_journal,
+            runtime.current.tools.context.change_journal,  # type: ignore[union-attr]
+        )
+        self.assertIn("-v1", second_diff or "")
+        self.assertIn("+v2", second_diff or "")
+        self.assertNotIn("-v0", second_diff or "")
+        self.assertTrue(execution.ok)
+        self.assertEqual("v1\n", target.read_text(encoding="utf-8"))
 
     def test_restart_does_not_restore_source_snapshots(self) -> None:
         runtime = SessionRuntime(
