@@ -162,7 +162,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 
 每次非空 Agent 任务的文件净变更只保存在当前进程中对应 Session 的内存账本里。`/diff` 正向预览最近一条非空任务，在 `--read-only` 下仍可使用；`/undo` 先完整预览反向 diff，再以 `y` 或 `yes` 明确确认。`--read-only` 会在预览或确认前稳定拒绝 `/undo`。撤销会重新核验每个目标的内容、权限模式与文件身份；只要发现任一外部冲突，就拒绝全部写入。经确认后，撤销也可能删除由该任务创建的文件。
 
-源码快照、正向/反向 diff 和 Provider 的补丁文本不会写入 SQLite、JSONL 审计记录或 Provider 请求。内存账本总预算为 2,000,000 个字符，进程重启后历史即消失。MVP 不提供 `/redo`、多级撤销、按历史记录选择撤销、持久化撤销历史，也不依赖 Git；`apply_patch` 同样不支持文件删除或重命名补丁。
+源码快照以及本地生成的正向/反向 diff 不会写入 SQLite、JSONL 审计记录或发送给 Provider。`apply_patch` 的补丁文本由 Provider 生成并作为原生工具调用参数进入当前进程的消息上下文；同一任务继续推理时，它可能随后续轮次的消息历史再次发送给 Provider，但不会写入 SQLite 或 JSONL 审计记录。内存账本总预算为 2,000,000 个字符，进程重启后历史即消失。MVP 不提供 `/redo`、多级撤销、按历史记录选择撤销、持久化撤销历史，也不依赖 Git；`apply_patch` 同样不支持文件删除或重命名补丁。
 
 ## Session 数据与恢复
 

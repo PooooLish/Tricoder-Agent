@@ -6,7 +6,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tricoder.audit import AuditLogger
-from tricoder.changes import ChangeJournal, FileIdentity, FileSnapshot
+from tricoder.changes import (
+    ChangeJournal,
+    FileIdentity,
+    FileSnapshot,
+    UndoExecution,
+)
 from tricoder.config import ConfigError
 from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionMemory, SessionTurnResult
 from tricoder.policy import CommandPolicy, WorkspacePolicy
@@ -648,6 +653,134 @@ class SessionRuntimeTests(unittest.TestCase):
 
         self.assertEqual(diff, runtime.diff_latest())
         self.assertEqual("value = 'AFTER_SENTINEL'\n", (self.workspace / "src" / "app.py").read_text(encoding="utf-8"))
+
+    def test_preview_conflict_reports_only_canonical_paths(self) -> None:
+        """防止首次撤销冲突被改写成无路径泛化错误或泄漏底层状态。"""
+        runtime, audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        sentinel = "PREVIEW-PRIVATE-CONFLICT-SENTINEL-5F10"
+        created = self.workspace / "src" / "created.py"
+        created.write_text(f"{sentinel}\n", encoding="utf-8")
+
+        with self.assertRaises(SessionRuntimeError) as captured:
+            runtime.prepare_undo()
+
+        self.assertEqual(
+            "无法撤销，文件状态冲突：src/created.py",
+            str(captured.exception),
+        )
+        self.assertNotIn(sentinel, str(captured.exception))
+        self.assertNotIn(str(self.workspace), str(captured.exception))
+        serialized = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn(sentinel, serialized)
+        event = json.loads(serialized.splitlines()[-1])
+        self.assertEqual("undo", event["event"])
+        self.assertEqual("conflicted", event["status"])
+        self.assertEqual(["src/app.py", "src/created.py"], event["paths"])
+        self.assertEqual(2, event["file_count"])
+        self.assertEqual(1, event["conflict_count"])
+        self.assertEqual("not-required", event["compensation_status"])
+
+    def test_failed_undo_execution_audits_conflict_without_private_state(self) -> None:
+        """防止确认后的第二次校验冲突没有结构化失败审计。"""
+        runtime, audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        runtime.prepare_undo()
+        sentinel = "EXECUTION-PRIVATE-CONFLICT-SENTINEL-8C22"
+        created = self.workspace / "src" / "created.py"
+        created.write_text(f"{sentinel}\n", encoding="utf-8")
+
+        execution = runtime.undo_latest()
+
+        self.assertFalse(execution.ok)
+        serialized = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn(sentinel, serialized)
+        event = json.loads(serialized.splitlines()[-1])
+        self.assertEqual("undo", event["event"])
+        self.assertEqual("conflicted", event["status"])
+        self.assertEqual(["src/created.py"], event["conflicts"])
+        self.assertEqual(1, event["conflict_count"])
+        self.assertEqual("not-required", event["compensation_status"])
+
+    def test_failed_undo_execution_audits_compensation_failure_paths(self) -> None:
+        """防止部分撤销补偿失败缺少安全结构化事件。"""
+        runtime, audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+
+        class CompensationFailingTools:
+            def undo_change_set(self, _change_set) -> UndoExecution:  # type: ignore[no-untyped-def]
+                return UndoExecution(
+                    False,
+                    ("src/app.py", "src/created.py"),
+                    compensation_failed=("src/app.py",),
+                )
+
+        runtime.current = replace(
+            runtime.current,
+            tools=CompensationFailingTools(),  # type: ignore[arg-type]
+        )
+
+        execution = runtime.undo_latest()
+
+        self.assertFalse(execution.ok)
+        event = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual("undo", event["event"])
+        self.assertEqual("failed", event["status"])
+        self.assertEqual(["src/app.py"], event["compensation_failed"])
+        self.assertEqual("failed", event["compensation_status"])
+        self.assertEqual(0, event["conflict_count"])
+
+    def test_undo_execution_exception_is_safely_audited_and_wrapped(self) -> None:
+        """防止最终撤销打开/核验异常越过运行时且漏记失败事件。"""
+        runtime, audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        sentinel = "UNDO-EXECUTION-PRIVATE-ERROR-SENTINEL-0A19"
+        absolute = str(self.workspace)
+
+        class ExplodingTools:
+            def undo_change_set(self, _change_set) -> UndoExecution:  # type: ignore[no-untyped-def]
+                raise OSError(f"{absolute} {sentinel}")
+
+        runtime.current = replace(
+            runtime.current,
+            tools=ExplodingTools(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaises(SessionRuntimeError) as captured:
+            runtime.undo_latest()
+
+        self.assertEqual("无法安全执行最近任务的撤销", str(captured.exception))
+        self.assertNotIn(sentinel, str(captured.exception))
+        serialized = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn(sentinel, serialized)
+        event = json.loads(serialized.splitlines()[-1])
+        self.assertEqual("undo", event["event"])
+        self.assertEqual("failed", event["status"])
+        self.assertEqual(["src/app.py", "src/created.py"], event["paths"])
+        self.assertEqual(2, event["file_count"])
+        self.assertEqual(0, event["conflict_count"])
+        self.assertEqual("not-required", event["compensation_status"])
+
+    def test_diff_rejects_tainted_change_set_without_rendering_snapshots(self) -> None:
+        """防止失去所有权证明的任务继续回显账本源码。"""
+        journal = ChangeJournal()
+        before = FileSnapshot("src/app.py", "before-private\n", 0o644, FileIdentity(1, 1))
+        after = FileSnapshot("src/app.py", "after-private\n", 0o644, FileIdentity(1, 2))
+        journal.begin_task((), "not-run")
+        journal.record_committed("src/app.py", before, after)
+        journal.mark_tainted("src/app.py")
+        journal.seal_task(("src/app.py",), "not-run")
+        self.runtime.current = replace(self.runtime.current, journal=journal)
+
+        with self.assertRaises(SessionRuntimeError) as captured:
+            self.runtime.diff_latest()
+
+        self.assertEqual(
+            "无法显示，任务文件状态冲突：src/app.py",
+            str(captured.exception),
+        )
+        self.assertNotIn("before-private", str(captured.exception))
+        self.assertNotIn("after-private", str(captured.exception))
 
     def test_startup_restores_only_latest_session_for_current_workspace(self) -> None:
         """防止启动时错误跳转到另一个工作区的最新会话。"""

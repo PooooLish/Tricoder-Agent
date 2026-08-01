@@ -52,6 +52,7 @@ def parse_unified_diff(source: str) -> tuple[FilePatch, ...]:
         hunks: list[PatchHunk] = []
         previous_start: int | None = None
         previous_end: int | None = None
+        line_delta = 0
         while index < len(lines) and lines[index].startswith("@@"):
             hunk, index = _parse_hunk(lines, index)
             if create and hunk.old_count != 0:
@@ -60,8 +61,11 @@ def parse_unified_diff(source: str) -> tuple[FilePatch, ...]:
                 hunk.old_start <= previous_start or hunk.old_start < previous_end
             ):
                 raise PatchError("补丁 hunk 的旧范围重叠或未递增")
+            if _target_index(hunk) != _source_index(hunk) + line_delta:
+                raise PatchError("补丁 hunk 的新起始行与累计行差不一致")
             previous_start = hunk.old_start
             previous_end = hunk.old_start + hunk.old_count
+            line_delta += hunk.new_count - hunk.old_count
             hunks.append(hunk)
 
         if not hunks:
@@ -84,6 +88,7 @@ def apply_file_patch(original: str, patch: FilePatch) -> str:
     source_index = 0
     previous_start: int | None = None
     previous_end: int | None = None
+    line_delta = 0
 
     for hunk in patch.hunks:
         _validate_hunk(hunk)
@@ -93,8 +98,11 @@ def apply_file_patch(original: str, patch: FilePatch) -> str:
             hunk.old_start <= previous_start or hunk.old_start < previous_end
         ):
             raise PatchError("补丁 hunk 的旧范围重叠或未递增")
+        if _target_index(hunk) != _source_index(hunk) + line_delta:
+            raise PatchError("补丁 hunk 的新起始行与累计行差不一致")
         previous_start = hunk.old_start
         previous_end = hunk.old_start + hunk.old_count
+        line_delta += hunk.new_count - hunk.old_count
 
         start_index = _source_index(hunk)
         if start_index < source_index or start_index > len(original_lines):
@@ -163,6 +171,7 @@ def _normalize_patch_path(raw_path: str, required_prefix: str) -> str:
         or path.startswith("/")
         or "\\" in path
         or ":" in path
+        or "\x00" in path
         or any(segment in ("", ".", "..") for segment in segments)
     ):
         raise PatchError("补丁文件路径不是规范相对路径")
@@ -241,6 +250,10 @@ def _validate_positions(
 
 def _source_index(hunk: PatchHunk) -> int:
     return hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1
+
+
+def _target_index(hunk: PatchHunk) -> int:
+    return hunk.new_start if hunk.new_count == 0 else hunk.new_start - 1
 
 
 def _is_no_newline_marker(line: str) -> bool:

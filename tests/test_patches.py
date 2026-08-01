@@ -50,6 +50,7 @@ INVALID_PATH_PATCHES = {
     "absolute_posix": "--- a//tmp/app.py\n+++ b//tmp/app.py\n@@ -1 +1 @@\n-old\n+new\n",
     "absolute_windows": "--- a/C:/tmp/app.py\n+++ b/C:/tmp/app.py\n@@ -1 +1 @@\n-old\n+new\n",
     "backslash": "--- a/dir\\app.py\n+++ b/dir\\app.py\n@@ -1 +1 @@\n-old\n+new\n",
+    "nul": "--- a/dir/\x00app.py\n+++ b/dir/\x00app.py\n@@ -1 +1 @@\n-old\n+new\n",
     "empty_segment": "--- a/dir//app.py\n+++ b/dir//app.py\n@@ -1 +1 @@\n-old\n+new\n",
     "dot_segment": "--- a/./app.py\n+++ b/./app.py\n@@ -1 +1 @@\n-old\n+new\n",
     "missing_prefix": "--- app.py\n+++ app.py\n@@ -1 +1 @@\n-old\n+new\n",
@@ -80,6 +81,31 @@ class PatchParserTests(unittest.TestCase):
         patch = parse_unified_diff(NO_NEWLINE_PATCH)[0]
 
         self.assertEqual("value = 2", apply_file_patch("value = 1", patch))
+
+    def test_rejects_new_start_that_ignores_cumulative_line_delta(self) -> None:
+        """防止新侧 hunk 行号脱离旧侧游标与此前 hunk 的累计行差。"""
+        valid = (
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1,2 @@\n"
+            " alpha\n"
+            "+inserted\n"
+            "@@ -4 +5 @@\n"
+            "-delta\n"
+            "+changed\n"
+        )
+        invalid_first = valid.replace("@@ -1 +1,2 @@", "@@ -1 +999,2 @@")
+        invalid_second = valid.replace("@@ -4 +5 @@", "@@ -4 +4 @@")
+
+        parsed = parse_unified_diff(valid)[0]
+        self.assertEqual(
+            "alpha\ninserted\nbeta\ngamma\nchanged\n",
+            apply_file_patch("alpha\nbeta\ngamma\ndelta\n", parsed),
+        )
+        for source in (invalid_first, invalid_second):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(PatchError, "新.*行|累计"):
+                    parse_unified_diff(source)
 
     def test_rejects_disallowed_or_malformed_patch_forms(self) -> None:
         """防止删除、改名和畸形 hunk 绕过受限语法。"""

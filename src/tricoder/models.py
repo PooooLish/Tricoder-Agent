@@ -145,6 +145,8 @@ class ToolResult:
     output: str
     relative_path: str | None = None
     modified_paths: tuple[str, ...] = ()
+    audit_paths: tuple[str, ...] = ()
+    change_chars: int = 0
 
 
 @dataclass(frozen=True, slots=True)

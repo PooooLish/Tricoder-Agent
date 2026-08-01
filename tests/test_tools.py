@@ -8,10 +8,12 @@ from unittest.mock import patch
 from tricoder import tools as tools_module
 from tricoder.changes import (
     ChangeJournal,
+    ChangeJournalError,
     FileChange,
     FileIdentity,
     FileSnapshot,
     TaskChangeSet,
+    render_change_set_diff,
 )
 from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
@@ -193,6 +195,65 @@ def patch_external_replacement_before_compensation(
         tools_module._DirectoryBinding,
         "open",
         side_effect=open_with_external_replace,
+    )
+
+
+class LateCommitRaceBinding:
+    """在全量复核后，于发布前或发布后注入外部 identity 替换。"""
+
+    def __init__(self, binding: object, *, stage: str, target: str, content: str) -> None:
+        self.binding = binding
+        self.stage = stage
+        self.target = target
+        self.content = content
+        self.replaced = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def _replace_external(self, target_name: str) -> None:
+        parent = self.binding.parent  # type: ignore[attr-defined]
+        external = parent / f".{target_name}.late-race-external.tmp"
+        external.write_text(self.content, encoding="utf-8")
+        os.replace(external, parent / target_name)
+        self.replaced = True
+
+    def create_temporary(self, target_name: str, content: str, mode: int) -> str:
+        temporary_name = self.binding.create_temporary(  # type: ignore[attr-defined]
+            target_name,
+            content,
+            mode,
+        )
+        if self.stage == "before" and target_name == self.target and not self.replaced:
+            self._replace_external(target_name)
+        return temporary_name
+
+    def replace(self, temporary_name: str, target_name: str) -> None:
+        self.binding.replace(temporary_name, target_name)  # type: ignore[attr-defined]
+        if self.stage == "after" and target_name == self.target and not self.replaced:
+            self._replace_external(target_name)
+
+    def link(self, source_name: str, target_name: str) -> None:
+        self.binding.link(source_name, target_name)  # type: ignore[attr-defined]
+        if self.stage == "after" and target_name == self.target and not self.replaced:
+            self._replace_external(target_name)
+
+
+def patch_late_commit_race(*, stage: str, target: str, content: str) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_late_race(workspace: Path, parent: Path) -> LateCommitRaceBinding:
+        return LateCommitRaceBinding(
+            real_open(workspace, parent),
+            stage=stage,
+            target=target,
+            content=content,
+        )
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_late_race,
     )
 
 
@@ -621,6 +682,176 @@ class ToolTests(unittest.TestCase):
             change_set.changes[0].after.identity,
         )
 
+    def test_sequential_write_rejects_external_state_and_taints_without_absorbing_source(
+        self,
+    ) -> None:
+        """防止连续工具调用把两次调用之间的外部源码吸收到任务后态。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        self.approver.decisions.append(True)
+        target = self.workspace / "src" / "app.py"
+
+        first = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/app.py",
+                "old_text": "return 41",
+                "new_text": "return 42",
+            },
+        )
+        external_sentinel = "EXTERNAL-PRIVATE-SOURCE-SENTINEL-73A1"
+        replacement = self.workspace / "src" / "external-replacement.py"
+        replacement.write_text(f"{external_sentinel}\n", encoding="utf-8")
+        os.replace(replacement, target)
+
+        second = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/app.py",
+                "old_text": external_sentinel,
+                "new_text": "agent-second-write",
+            },
+        )
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual("任务内文件状态不连续：src/app.py", second.output)
+        self.assertEqual(1, len(self.approver.requests))
+        self.assertEqual(f"{external_sentinel}\n", target.read_text(encoding="utf-8"))
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/app.py",), change_set.tainted_paths)
+        self.assertEqual(
+            "def answer():\n    return 42\n",
+            change_set.changes[0].after.content,
+        )
+        self.assertNotIn(external_sentinel, repr(change_set))
+        with self.assertRaisesRegex(ChangeJournalError, "src/app.py"):
+            render_change_set_diff(change_set)
+        with self.assertRaisesRegex(tools_module.PolicyError, "src/app.py"):
+            self.registry.preview_undo(change_set)
+        execution = self.registry.undo_change_set(change_set)
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/app.py",), execution.conflicts)
+        self.assertEqual(f"{external_sentinel}\n", target.read_text(encoding="utf-8"))
+
+    def test_net_zero_writes_keep_continuity_guard_against_later_external_state(
+        self,
+    ) -> None:
+        """防止 A→B→A 的净零聚合遗失最后一次已证明后态。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        self.approver.decisions.extend((True, True))
+        target = self.workspace / "src" / "app.py"
+
+        first = self.registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 41", "new_text": "return 42"},
+        )
+        second = self.registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 42", "new_text": "return 41"},
+        )
+        external_sentinel = "NET-ZERO-EXTERNAL-SENTINEL-1A4E"
+        replacement = self.workspace / "src" / "net-zero-external.py"
+        replacement.write_text(f"{external_sentinel}\n", encoding="utf-8")
+        os.replace(replacement, target)
+
+        third = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/app.py",
+                "old_text": external_sentinel,
+                "new_text": "agent-third-write",
+            },
+        )
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.ok)
+        self.assertFalse(third.ok)
+        self.assertEqual("任务内文件状态不连续：src/app.py", third.output)
+        self.assertEqual(2, len(self.approver.requests))
+        self.assertEqual(f"{external_sentinel}\n", target.read_text(encoding="utf-8"))
+        self.assertTrue(journal.is_tainted("src/app.py"))
+        self.assertIsNone(journal.seal_task((), "not-run"))
+
+    def test_edit_file_rejects_post_publish_external_snapshot_without_absorbing_it(
+        self,
+    ) -> None:
+        """防止单文件替换发布后的竞态外部源码被记为任务 after。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        self.approver.decisions.append(True)
+        target = self.workspace / "src" / "app.py"
+        first = self.registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 41", "new_text": "return 42"},
+        )
+        external_sentinel = "EDIT-POST-PUBLISH-EXTERNAL-SENTINEL-881F\n"
+
+        with patch_late_commit_race(
+            stage="after",
+            target="app.py",
+            content=external_sentinel,
+        ):
+            second = self.registry.execute(
+                "edit_file",
+                {"path": "src/app.py", "old_text": "return 42", "new_text": "return 43"},
+            )
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(external_sentinel, target.read_text(encoding="utf-8"))
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/app.py",), change_set.tainted_paths)
+        self.assertEqual("def answer():\n    return 42\n", change_set.changes[0].after.content)
+        self.assertNotIn(external_sentinel.strip(), repr(change_set))
+        self.assertNotIn(external_sentinel.strip(), second.output)
+
+    def test_create_file_rejects_post_publish_external_snapshot_without_absorbing_it(
+        self,
+    ) -> None:
+        """防止单文件创建发布后的竞态外部源码被记入任务账本。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        self.approver.decisions.append(True)
+        first = self.registry.execute(
+            "edit_file",
+            {"path": "src/app.py", "old_text": "return 41", "new_text": "return 42"},
+        )
+        external_sentinel = "CREATE-POST-PUBLISH-EXTERNAL-SENTINEL-291C\n"
+
+        with patch_late_commit_race(
+            stage="after",
+            target="created.py",
+            content=external_sentinel,
+        ):
+            second = self.registry.execute(
+                "create_file",
+                {"path": "src/created.py", "content": "agent-created\n"},
+            )
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(
+            external_sentinel,
+            (self.workspace / "src" / "created.py").read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/created.py",), change_set.tainted_paths)
+        self.assertEqual(("src/app.py",), tuple(change.path for change in change_set.changes))
+        self.assertNotIn(external_sentinel.strip(), repr(change_set))
+        self.assertNotIn(external_sentinel.strip(), second.output)
+
     def test_edit_file_rejects_journal_over_budget_before_approval(self) -> None:
         """防止预算不足时仍请求审批或触碰原文件。"""
         journal = ChangeJournal(max_chars=10)
@@ -794,6 +1025,40 @@ class ToolTests(unittest.TestCase):
         self.assertIn("创建空文件", approval_detail)
         self.assertEqual("", (self.workspace / "src" / "empty.py").read_text(encoding="utf-8"))
 
+    def test_apply_patch_approval_marks_missing_newlines_and_separates_files(self) -> None:
+        """防止审批 diff 的无换行源码与下一文件头粘连。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        first.write_text("old", encoding="utf-8")
+        second.write_text("before", encoding="utf-8")
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "\\ No newline at end of file\n"
+            "+new\n"
+            "\\ No newline at end of file\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "\\ No newline at end of file\n"
+            "+after\n"
+            "\\ No newline at end of file\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertTrue(result.ok, result.output)
+        approval = self.approver.requests[0][1]
+        self.assertIn(
+            "-old\n\\ No newline at end of file\n"
+            "+new\n\\ No newline at end of file\n",
+            approval,
+        )
+        self.assertIn("\n--- src/other.py\n+++ src/other.py\n", approval)
+
     def test_apply_patch_rejects_existing_file_no_op_before_approval(self) -> None:
         """防止无净变化补丁仍替换文件并把路径报告为已修改。"""
         target = self.workspace / "src" / "app.py"
@@ -847,6 +1112,84 @@ class ToolTests(unittest.TestCase):
                 self.assertNotIn(sentinel, result.output)
                 self.assertNotIn("return 42", result.output)
                 self.assertEqual(original, target.read_text(encoding="utf-8"))
+
+    def test_apply_patch_maps_preflight_filesystem_errors_to_safe_paths(self) -> None:
+        """防止预检边界异常泄漏绝对路径、临时名或自由文本。"""
+        absolute_sentinel = str(self.workspace / "PRIVATE-ABSOLUTE-SENTINEL")
+        temporary_sentinel = ".app.py.PRIVATE-TEMP-SENTINEL.tmp"
+        unicode_sentinel = "PRIVATE-UNICODE-SENTINEL-雪"
+        value_sentinel = "PRIVATE-VALUE-SENTINEL"
+        type_sentinel = "PRIVATE-TYPE-SENTINEL"
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+        )
+        failures = (
+            patch.object(
+                tools_module._DirectoryBinding,
+                "open",
+                side_effect=OSError(f"{absolute_sentinel} {temporary_sentinel}"),
+            ),
+            patch.object(
+                ToolRegistry,
+                "_snapshot",
+                side_effect=UnicodeError(unicode_sentinel),
+            ),
+            patch.object(
+                tools_module._DirectoryBinding,
+                "open",
+                side_effect=ValueError(f"{absolute_sentinel} {value_sentinel}"),
+            ),
+            patch.object(
+                tools_module._DirectoryBinding,
+                "open",
+                side_effect=TypeError(f"{temporary_sentinel} {type_sentinel}"),
+            ),
+        )
+
+        for failure in failures:
+            with self.subTest(failure=failure):
+                with failure:
+                    result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+                self.assertFalse(result.ok)
+                self.assertEqual("补丁文件系统操作失败：src/app.py", result.output)
+                self.assertNotIn(absolute_sentinel, result.output)
+                self.assertNotIn(temporary_sentinel, result.output)
+                self.assertNotIn(unicode_sentinel, result.output)
+                self.assertNotIn(value_sentinel, result.output)
+                self.assertNotIn(type_sentinel, result.output)
+                self.assertEqual(("src/app.py",), result.audit_paths)
+                self.assertEqual(
+                    len("    return 41\n") + len("    return 42\n"),
+                    result.change_chars,
+                )
+        self.assertEqual([], self.approver.requests)
+
+    def test_apply_patch_context_failure_keeps_safe_audit_metadata(self) -> None:
+        """防止纯解析成功后的 hunk 失败把路径与变更字符数审计清空。"""
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 99\n"
+            "+    return 42\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(("src/app.py",), result.audit_paths)
+        self.assertEqual(
+            len("    return 99\n") + len("    return 42\n"),
+            result.change_chars,
+        )
+        self.assertEqual([], self.approver.requests)
 
     def test_apply_patch_rejects_malformed_second_file_before_approval(self) -> None:
         """防止解析首个文件后就在第二个畸形文件暴露前产生审批或写入。"""
@@ -934,6 +1277,7 @@ class ToolTests(unittest.TestCase):
         result = self.registry.execute("apply_patch", {"patch": patch_text})
 
         self.assertFalse(result.ok)
+        self.assertIn("变更预算不足", result.output)
         self.assertEqual([], self.approver.requests)
         self.assertEqual(original, target.read_bytes())
         self.assertIsNone(journal.seal_task((), "not-run"))
@@ -972,6 +1316,91 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(first_original, first.read_bytes())
         self.assertEqual("external = True\n", second.read_text(encoding="utf-8"))
 
+    def test_apply_patch_rechecks_each_target_immediately_before_publish(self) -> None:
+        """防止全量复核后、逐文件发布前的晚到外部替换被覆盖。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        first_original = first.read_text(encoding="utf-8")
+        external_sentinel = "LATE-RACE-EXTERNAL-BEFORE-PUBLISH-42D9\n"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        with patch_late_commit_race(
+            stage="before",
+            target="other.py",
+            content=external_sentinel,
+        ):
+            result = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task((), "not-run")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(first_original, first.read_text(encoding="utf-8"))
+        self.assertEqual(external_sentinel, second.read_text(encoding="utf-8"))
+        self.assertIsNone(change_set)
+        self.assertNotIn(external_sentinel.strip(), result.output)
+        self.assertNotIn(str(self.workspace), result.output)
+
+    def test_apply_patch_rejects_post_publish_snapshot_mismatch_as_tainted(self) -> None:
+        """防止发布后的外部替换被记录成工具 expected_after 或可撤销状态。"""
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        self.approver.decisions.append(True)
+        target = self.workspace / "src" / "app.py"
+        first = self.registry.execute(
+            "edit_file",
+            {
+                "path": "src/app.py",
+                "old_text": "return 41",
+                "new_text": "return 42",
+            },
+        )
+        external_sentinel = "LATE-RACE-EXTERNAL-AFTER-PUBLISH-87B1\n"
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 42\n"
+            "+    return 43\n"
+        )
+
+        with patch_late_commit_race(
+            stage="after",
+            target="app.py",
+            content=external_sentinel,
+        ):
+            second = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertTrue(first.ok)
+        self.assertFalse(second.ok)
+        self.assertEqual(external_sentinel, target.read_text(encoding="utf-8"))
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/app.py",), change_set.tainted_paths)
+        self.assertEqual(
+            "def answer():\n    return 42\n",
+            change_set.changes[0].after.content,
+        )
+        self.assertNotIn(external_sentinel.strip(), repr(change_set))
+        self.assertNotIn(external_sentinel.strip(), second.output)
+
     def test_apply_patch_read_only_rejects_before_parsing_or_approval(self) -> None:
         """防止只读模式解析自由补丁文本或请求审批。"""
         read_only = ToolRegistry(
@@ -983,10 +1412,21 @@ class ToolTests(unittest.TestCase):
             )
         )
 
-        result = read_only.execute("apply_patch", {"patch": "not-a-patch"})
+        for arguments in (
+            {"patch": "not-a-patch"},
+            {"patch": "not-a-patch", "extra": True},
+        ):
+            with self.subTest(arguments=arguments):
+                with patch.object(
+                    tools_module,
+                    "parse_unified_diff",
+                    side_effect=AssertionError("read-only must not parse patch text"),
+                ):
+                    result = read_only.execute("apply_patch", arguments)
 
-        self.assertFalse(result.ok)
-        self.assertIn("只读", result.output)
+                self.assertFalse(result.ok)
+                if "extra" not in arguments:
+                    self.assertIn("只读", result.output)
         self.assertEqual([], self.approver.requests)
 
     def test_apply_patch_rejects_invalid_provider_arguments(self) -> None:
@@ -1005,7 +1445,12 @@ class ToolTests(unittest.TestCase):
 
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
-                result = self.registry.execute("apply_patch", arguments)
+                with patch.object(
+                    tools_module,
+                    "parse_unified_diff",
+                    side_effect=AssertionError("invalid arguments must not parse patch text"),
+                ):
+                    result = self.registry.execute("apply_patch", arguments)
                 self.assertFalse(result.ok)
         self.assertFalse((self.workspace / "src" / "extra-forbidden.py").exists())
         self.assertEqual([], self.approver.requests)
@@ -1160,12 +1605,18 @@ class ToolTests(unittest.TestCase):
         assert change_set is not None
         change = change_set.changes[0]
         self.assertEqual("src/app.py", change.path)
-        self.assertEqual("external = True\n", change.after.content)
-        metadata = first.stat()
+        self.assertEqual("def answer():\n    return 42\n", change.after.content)
         self.assertEqual(
-            FileIdentity(metadata.st_dev, metadata.st_ino),
-            change.after.identity,
+            ("src/app.py",),
+            change_set.tainted_paths,
         )
+        self.assertNotIn("external = True", repr(change_set))
+        with self.assertRaisesRegex(tools_module.PolicyError, "src/app.py"):
+            self.registry.preview_undo(change_set)
+        execution = self.registry.undo_change_set(change_set)
+        self.assertFalse(execution.ok)
+        self.assertEqual(("src/app.py",), execution.conflicts)
+        self.assertEqual("external = True\n", first.read_text(encoding="utf-8"))
 
     def test_create_file_records_missing_before_and_published_after_snapshot(self) -> None:
         """防止新建账本伪造前态，或沿用临时文件而非发布目标的身份。"""
@@ -1450,10 +1901,10 @@ class ToolTests(unittest.TestCase):
         change_set = journal.seal_task(("src/app.py",), "not-run")
         self.assertEqual("src/app.py", change_set.changes[0].path)
 
-    def test_edit_reports_success_and_records_saved_snapshot_when_post_commit_read_fails(
+    def test_edit_taints_expected_snapshot_when_post_commit_read_fails(
         self,
     ) -> None:
-        """原子替换后的回读失败不得掩盖提交或丢失可用的真实快照。"""
+        """原子替换后无法核验公开目标时只能记录预期态并标记 taint。"""
         target = self.workspace / "src" / "app.py"
         journal = ChangeJournal()
         journal.begin_task((), "not-run")
@@ -1483,18 +1934,95 @@ class ToolTests(unittest.TestCase):
                 },
             )
 
-        self.assertTrue(result.ok, result.output)
-        self.assertEqual("src/app.py", result.relative_path)
-        self.assertIn("账本警告", result.output)
+        self.assertFalse(result.ok)
+        self.assertEqual("文件发布后状态无法验证：src/app.py", result.output)
         self.assertEqual("def answer():\n    return 42\n", target.read_text(encoding="utf-8"))
         change_set = journal.seal_task(("src/app.py",), "not-run")
         self.assertIsNotNone(change_set)
         assert change_set is not None
+        self.assertEqual(("src/app.py",), change_set.tainted_paths)
         metadata = target.stat()
         self.assertEqual(
             FileIdentity(metadata.st_dev, metadata.st_ino),
             change_set.changes[0].after.identity,
         )
+        with self.assertRaisesRegex(ChangeJournalError, "src/app.py"):
+            render_change_set_diff(change_set)
+
+    def test_create_taints_expected_snapshot_when_post_commit_read_fails(self) -> None:
+        """硬链接发布后无法核验公开目标时不得产生可预览、可撤销账本。"""
+        target = self.workspace / "src" / "read-failed-create.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        real_snapshot = ToolRegistry._snapshot
+
+        def fail_published_target_read(
+            binding: object,
+            name: str,
+            relative: str,
+        ) -> object:
+            if name == target.name and target.exists():
+                raise OSError("CREATE-POST-COMMIT-PRIVATE-SENTINEL")
+            return real_snapshot(binding, name, relative)  # type: ignore[arg-type]
+
+        with patch.object(
+            ToolRegistry,
+            "_snapshot",
+            side_effect=fail_published_target_read,
+        ):
+            result = self.registry.execute(
+                "create_file",
+                {"path": "src/read-failed-create.py", "content": "created\n"},
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            "文件发布后状态无法验证：src/read-failed-create.py",
+            result.output,
+        )
+        self.assertEqual("created\n", target.read_text(encoding="utf-8"))
+        change_set = journal.seal_task(("src/read-failed-create.py",), "not-run")
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual(("src/read-failed-create.py",), change_set.tainted_paths)
+        self.assertEqual("created\n", change_set.changes[0].after.content)
+
+    def test_create_reports_cleanup_warning_when_unverified_publish_link_remains(
+        self,
+    ) -> None:
+        """发布后核验与临时硬链接清理同时失败时必须公开固定清理警告。"""
+        target = self.workspace / "src" / "unverified-cleanup.py"
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        real_snapshot = ToolRegistry._snapshot
+
+        def fail_published_target_read(
+            binding: object,
+            name: str,
+            relative: str,
+        ) -> object:
+            if name == target.name and target.exists():
+                raise OSError("UNVERIFIED-CLEANUP-PRIVATE-SENTINEL")
+            return real_snapshot(binding, name, relative)  # type: ignore[arg-type]
+
+        with patch_binding_cleanup_failure(target):
+            with patch.object(
+                ToolRegistry,
+                "_snapshot",
+                side_effect=fail_published_target_read,
+            ):
+                result = self.registry.execute(
+                    "create_file",
+                    {"path": "src/unverified-cleanup.py", "content": "created\n"},
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("文件发布后状态无法验证：src/unverified-cleanup.py", result.output)
+        self.assertIn("清理警告", result.output)
+        self.assertNotIn("UNVERIFIED-CLEANUP-PRIVATE-SENTINEL", result.output)
+        self.assertEqual(1, len(list((self.workspace / "src").glob(".unverified-cleanup.py.*.tmp"))))
 
     def test_create_reports_success_with_warning_after_binding_close_failure(
         self,
@@ -1627,6 +2155,56 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(before.content, target.read_text(encoding="utf-8"))
         self.assertEqual(before.mode, stat.S_IMODE(target.stat().st_mode))
 
+    def test_preview_closes_opened_bindings_when_later_parent_open_fails(self) -> None:
+        """防止第二个父目录绑定失败时泄漏此前已打开的绑定。"""
+        other_parent = self.workspace / "z-other"
+        other_parent.mkdir()
+        other = other_parent / "other.py"
+        other.write_text("after\n", encoding="utf-8")
+        app = self.workspace / "src" / "app.py"
+        change_set = self._change_set(
+            FileChange("src/app.py", None, self._file_snapshot(app, "src/app.py")),
+            FileChange(
+                "z-other/other.py",
+                None,
+                self._file_snapshot(other, "z-other/other.py"),
+            ),
+        )
+        real_open = tools_module._DirectoryBinding.open
+        state = {"closed": False}
+        opened: list[object] = []
+
+        class TrackingBinding:
+            def __init__(self, binding: object) -> None:
+                self.binding = binding
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.binding, name)
+
+            def close(self) -> None:
+                self.binding.close()  # type: ignore[attr-defined]
+                state["closed"] = True
+
+        def fail_second_open(workspace: Path, parent: Path) -> object:
+            if parent == other_parent:
+                raise OSError("SECOND-OPEN-SENTINEL")
+            binding = TrackingBinding(real_open(workspace, parent))
+            opened.append(binding)
+            return binding
+
+        try:
+            with patch.object(
+                tools_module._DirectoryBinding,
+                "open",
+                side_effect=fail_second_open,
+            ):
+                with self.assertRaisesRegex(OSError, "SECOND-OPEN-SENTINEL"):
+                    self.registry.preview_undo(change_set)
+            self.assertTrue(state["closed"])
+        finally:
+            if opened and not state["closed"]:
+                opened[0].close()  # type: ignore[attr-defined]
+
     def test_undo_mixed_update_and_creation_deletes_created_file(self) -> None:
         updated = self.workspace / "src" / "app.py"
         before = self._file_snapshot(updated, "src/app.py")
@@ -1646,6 +2224,32 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(("src/app.py", "src/created.py"), execution.paths)
         self.assertEqual(before.content, updated.read_text(encoding="utf-8"))
         self.assertFalse(created.exists())
+
+    def test_partial_undo_restores_deleted_created_file_from_verified_backup(self) -> None:
+        """防止先删任务新文件后，后续发布失败让补偿因公开目标缺失而失败。"""
+        created = self.workspace / "src" / "aaa-created.py"
+        created.write_text("created-after\n", encoding="utf-8")
+        created_after = self._file_snapshot(created, "src/aaa-created.py")
+        other = self.workspace / "src" / "other.py"
+        other.write_text("other-before\n", encoding="utf-8")
+        other_before = self._file_snapshot(other, "src/other.py")
+        other.write_text("other-after\n", encoding="utf-8")
+        other_after = self._file_snapshot(other, "src/other.py")
+        change_set = self._change_set(
+            FileChange("src/aaa-created.py", None, created_after),
+            FileChange("src/other.py", other_before, other_after),
+        )
+
+        with patch_binding_publish_failure():
+            execution = self.registry.undo_change_set(change_set)
+
+        self.assertFalse(execution.ok)
+        self.assertEqual((), execution.compensation_failed)
+        self.assertEqual(
+            created_after,
+            self._file_snapshot(created, "src/aaa-created.py"),
+        )
+        self.assertEqual(other_after, self._file_snapshot(other, "src/other.py"))
 
     def test_undo_content_conflict_makes_entire_change_set_zero_write(self) -> None:
         updated = self.workspace / "src" / "app.py"

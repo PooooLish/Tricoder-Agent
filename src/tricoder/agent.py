@@ -592,7 +592,7 @@ class CodingAgent:
                         else "unknown"
                     ),
                     "reason_chars": len(action.reason),
-                    "arguments": self._audit_arguments(action),
+                    "arguments": self._audit_arguments(action, result),
                     "output_chars": len(result.output),
                     "duration_ms": duration_ms,
                 }
@@ -661,7 +661,11 @@ class CodingAgent:
             verification,
         )
 
-    def _audit_arguments(self, action: ToolAction) -> dict[str, Any]:
+    def _audit_arguments(
+        self,
+        action: ToolAction,
+        result: ToolResult,
+    ) -> dict[str, Any]:
         """只保留审计所需元数据，避免重复保存源码和任务摘要。"""
 
         arguments = action.arguments
@@ -691,6 +695,9 @@ class CodingAgent:
             patch_text = arguments.get("patch", "")
             return {
                 "patch_chars": len(patch_text) if isinstance(patch_text, str) else 0,
+                "paths": result.audit_paths,
+                "file_count": len(result.audit_paths),
+                "change_chars": result.change_chars,
             }
         if action.tool == "run_command":
             command = arguments.get("command", "")

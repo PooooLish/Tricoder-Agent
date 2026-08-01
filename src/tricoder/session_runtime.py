@@ -32,7 +32,7 @@ from tricoder.sessions import (
     safe_requirement_summary,
     validate_session_name,
 )
-from tricoder.tools import ToolContext, ToolRegistry
+from tricoder.tools import ToolContext, ToolRegistry, UndoConflictError
 
 
 class SessionRuntimeError(RuntimeError):
@@ -351,23 +351,65 @@ class SessionRuntime:
         latest = self.current.journal.latest()
         if latest is None:
             return None
+        if latest.tainted_paths:
+            raise SessionRuntimeError(
+                f"无法显示，任务文件状态冲突：{'、'.join(latest.tainted_paths)}"
+            )
         return render_change_set_diff(latest)
 
     def prepare_undo(self) -> UndoPreview:
         """在用户确认前首次全量核验，并只返回反向差异与结构化路径。"""
 
         change_set, tools = self._undo_inputs()
+        paths = tuple(change.path for change in change_set.changes)
         try:
             return tools.preview_undo(change_set)
+        except UndoConflictError as exc:
+            self._audit_undo(
+                status="conflicted",
+                paths=paths,
+                conflicts=exc.conflicts,
+                compensation_status="not-required",
+            )
+            raise SessionRuntimeError(
+                f"无法撤销，文件状态冲突：{'、'.join(exc.conflicts)}"
+            ) from None
         except (PolicyError, OSError, UnicodeError, ValueError) as exc:
+            self._audit_undo(
+                status="failed",
+                paths=paths,
+                compensation_status="not-required",
+            )
             raise SessionRuntimeError("无法安全预览最近任务的撤销") from exc
 
     def undo_latest(self) -> UndoExecution:
         """执行第二次全量核验；仅在文件全部恢复后提交会话状态。"""
 
         change_set, tools = self._undo_inputs()
-        execution = tools.undo_change_set(change_set)
+        paths = tuple(sorted(change.path for change in change_set.changes))
+        try:
+            execution = tools.undo_change_set(change_set)
+        except (PolicyError, OSError, UnicodeError, ValueError, TypeError):
+            self._audit_undo(
+                status="failed",
+                paths=paths,
+                compensation_status="not-required",
+            )
+            raise SessionRuntimeError("无法安全执行最近任务的撤销") from None
         if not execution.ok:
+            self._audit_undo(
+                status="conflicted" if execution.conflicts else "failed",
+                paths=execution.paths,
+                conflicts=execution.conflicts,
+                compensation_failed=execution.compensation_failed,
+                compensation_status=(
+                    "failed"
+                    if execution.compensation_failed
+                    else "not-required"
+                    if execution.conflicts
+                    else "succeeded"
+                ),
+            )
             return execution
 
         self.current.journal.clear_latest()
@@ -384,19 +426,40 @@ class SessionRuntime:
         self.current = replace(self.current, memory=memory, context=context)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
-        if self.current.audit is not None:
-            self.current.audit.log(
-                {
-                    "event": "undo",
-                    "status": "succeeded",
-                    "paths": execution.paths,
-                    "file_count": len(execution.paths),
-                    "conflict_count": len(execution.conflicts),
-                    "compensation_status": "not-required",
-                }
-            )
+        self._audit_undo(
+            status="succeeded",
+            paths=execution.paths,
+            compensation_status="not-required",
+        )
         self.persist_current()
         return execution
+
+    def _audit_undo(
+        self,
+        *,
+        status: str,
+        paths: tuple[str, ...],
+        compensation_status: str,
+        conflicts: tuple[str, ...] = (),
+        compensation_failed: tuple[str, ...] = (),
+    ) -> None:
+        """只以结构化规范路径记录撤销结果，不写入源码或异常文本。"""
+
+        if self.current.audit is None:
+            return
+        event: dict[str, object] = {
+            "event": "undo",
+            "status": status,
+            "paths": paths,
+            "file_count": len(paths),
+            "conflict_count": len(conflicts),
+            "compensation_status": compensation_status,
+        }
+        if conflicts:
+            event["conflicts"] = conflicts
+        if compensation_failed:
+            event["compensation_failed"] = compensation_failed
+        self.current.audit.log(event)
 
     def _undo_inputs(self) -> tuple[TaskChangeSet, ToolRegistry]:
         """在任何预览、审批或写入前统一拒绝不可撤销状态。"""

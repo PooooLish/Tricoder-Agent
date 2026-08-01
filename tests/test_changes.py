@@ -13,6 +13,8 @@ from tricoder.changes import (
     FileChange,
     FileIdentity,
     FileSnapshot,
+    TaskChangeSet,
+    render_change_set_diff,
 )
 
 
@@ -21,6 +23,10 @@ def snapshot(path: str, content: str, inode: int) -> FileSnapshot:
 
 
 class ChangeJournalTests(unittest.TestCase):
+    @staticmethod
+    def _change_set(*changes: FileChange) -> TaskChangeSet:
+        return TaskChangeSet(tuple(changes), (), "not-run", (), "not-run")
+
     def test_same_file_keeps_first_before_and_last_after(self) -> None:
         """防止连续修改同一文件时丢失最早快照或最终快照。"""
         journal = ChangeJournal()
@@ -120,6 +126,64 @@ class ChangeJournalTests(unittest.TestCase):
         result = journal.seal_task(("a.py",), "not-run")
 
         self.assertEqual((FileChange("a.py", before, current_after),), result.changes)
+
+    def test_diff_marks_missing_final_newlines_and_separates_multiple_files(self) -> None:
+        """防止无末尾换行的 +/- 行粘连，或下一文件头接在源码行后。"""
+        first_before = snapshot("a.py", "old", 1)
+        first_after = snapshot("a.py", "new", 2)
+        second_before = snapshot("b.py", "before\n", 3)
+        second_after = snapshot("b.py", "after\n", 4)
+        change_set = self._change_set(
+            FileChange("b.py", second_before, second_after),
+            FileChange("a.py", first_before, first_after),
+        )
+
+        forward = render_change_set_diff(change_set)
+        reverse = render_change_set_diff(change_set, reverse=True)
+
+        self.assertIn(
+            "-old\n\\ No newline at end of file\n"
+            "+new\n\\ No newline at end of file\n",
+            forward,
+        )
+        self.assertIn("\n--- b.py\n+++ b.py\n", forward)
+        self.assertIn(
+            "-new\n\\ No newline at end of file\n"
+            "+old\n\\ No newline at end of file\n",
+            reverse,
+        )
+        self.assertIn("\n--- b.py\n+++ b.py\n", reverse)
+
+    def test_diff_renders_trailing_newline_only_changes_in_both_directions(self) -> None:
+        """防止仅新增或移除末尾换行时正反向 diff 为空。"""
+        before = snapshot("newline.py", "same", 1)
+        after = snapshot("newline.py", "same\n", 2)
+        change_set = self._change_set(FileChange("newline.py", before, after))
+
+        forward = render_change_set_diff(change_set)
+        reverse = render_change_set_diff(change_set, reverse=True)
+
+        self.assertIn(
+            "-same\n\\ No newline at end of file\n+same\n",
+            forward,
+        )
+        self.assertIn(
+            "-same\n+same\n\\ No newline at end of file\n",
+            reverse,
+        )
+
+    def test_diff_renders_mode_only_changes_in_both_directions(self) -> None:
+        """防止仅权限变化得到空的正向或反向预览。"""
+        before = FileSnapshot("mode.py", "same\n", 0o644, FileIdentity(1, 1))
+        after = FileSnapshot("mode.py", "same\n", 0o755, FileIdentity(1, 2))
+        change_set = self._change_set(FileChange("mode.py", before, after))
+
+        forward = render_change_set_diff(change_set)
+        reverse = render_change_set_diff(change_set, reverse=True)
+
+        self.assertIn("--- mode.py\n+++ mode.py\n", forward)
+        self.assertIn("old mode 0644\nnew mode 0755\n", forward)
+        self.assertIn("old mode 0755\nnew mode 0644\n", reverse)
 
 
 if __name__ == "__main__":

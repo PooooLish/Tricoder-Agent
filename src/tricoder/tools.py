@@ -8,11 +8,12 @@ import os
 import secrets
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from tricoder.changes import (
+    ChangeBudgetError,
     ChangeJournal,
     FileChange,
     FileIdentity,
@@ -21,6 +22,7 @@ from tricoder.changes import (
     UndoExecution,
     UndoPreview,
     render_change_set_diff,
+    render_file_diff,
 )
 from tricoder.models import ToolDefinition, ToolResult
 from tricoder.patches import FilePatch, PatchError, apply_file_patch, parse_unified_diff
@@ -28,6 +30,14 @@ from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 
 
 Approver = Callable[[str, str], bool]
+
+
+class UndoConflictError(PolicyError):
+    """携带已规范化冲突路径，公共消息不依赖底层异常文本。"""
+
+    def __init__(self, conflicts: tuple[str, ...]) -> None:
+        self.conflicts = tuple(sorted(set(conflicts)))
+        super().__init__(f"无法撤销，文件状态冲突：{'、'.join(self.conflicts)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,9 +584,72 @@ class ToolRegistry:
             return ToolResult(False, f"未知工具：{name}")
         try:
             self._validate_arguments(registration.definition.parameters, arguments)
-            return registration.handler(arguments)
-        except (PolicyError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        except (ValueError, TypeError) as exc:
             return ToolResult(False, str(exc))
+        try:
+            result = registration.handler(arguments)
+            if name == "apply_patch" and not self.context.read_only:
+                audit_paths, change_chars = self._safe_patch_audit_metadata(arguments)
+                return replace(
+                    result,
+                    audit_paths=audit_paths,
+                    change_chars=change_chars,
+                )
+            return result
+        except PolicyError as exc:
+            result = ToolResult(False, str(exc))
+        except ChangeBudgetError as exc:
+            result = ToolResult(False, str(exc))
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            if name == "apply_patch" and not self.context.read_only:
+                result = ToolResult(
+                    False,
+                    self._safe_patch_filesystem_error(arguments),
+                )
+            elif isinstance(exc, (OSError, UnicodeError)):
+                result = ToolResult(False, "文件系统操作失败")
+            else:
+                result = ToolResult(False, str(exc))
+        if name == "apply_patch" and not self.context.read_only:
+            audit_paths, change_chars = self._safe_patch_audit_metadata(arguments)
+            return replace(
+                result,
+                audit_paths=audit_paths,
+                change_chars=change_chars,
+            )
+        return result
+
+    @staticmethod
+    def _safe_patch_filesystem_error(arguments: dict[str, Any]) -> str:
+        """仅从纯解析结果公开规范相对路径，不回显底层异常文本。"""
+
+        paths, _change_chars = ToolRegistry._safe_patch_audit_metadata(arguments)
+        if paths:
+            return f"补丁文件系统操作失败：{'、'.join(paths)}"
+        return "补丁文件系统操作失败"
+
+    @staticmethod
+    def _safe_patch_audit_metadata(
+        arguments: dict[str, Any],
+    ) -> tuple[tuple[str, ...], int]:
+        """只用纯解析结果生成补丁审计路径与字符计数。"""
+
+        source = arguments.get("patch")
+        if not isinstance(source, str):
+            return (), 0
+        try:
+            file_patches = parse_unified_diff(source)
+        except (PatchError, ValueError, TypeError, UnicodeError):
+            return (), 0
+        paths = tuple(sorted({file_patch.path for file_patch in file_patches}))
+        change_chars = sum(
+            len(line[1:])
+            for file_patch in file_patches
+            for hunk in file_patch.hunks
+            for line in hunk.lines
+            if line.startswith(("+", "-"))
+        )
+        return paths, change_chars
 
     def preview_undo(self, change_set: TaskChangeSet) -> UndoPreview:
         """首次全量核验 after 快照，并生成不落盘的反向差异。"""
@@ -584,10 +657,12 @@ class ToolRegistry:
         if self.context.read_only:
             raise PolicyError("只读模式禁止撤销")
         paths = tuple(sorted(change.path for change in change_set.changes))
+        if change_set.tainted_paths:
+            raise UndoConflictError(change_set.tainted_paths)
         _prepared, bindings, conflicts = self._open_undo_targets(change_set)
         self._close_bindings(bindings)
         if conflicts:
-            raise PolicyError(f"无法撤销，文件状态冲突：{'、'.join(conflicts)}")
+            raise UndoConflictError(conflicts)
         return UndoPreview(render_change_set_diff(change_set, reverse=True), paths)
 
     def undo_change_set(self, change_set: TaskChangeSet) -> UndoExecution:
@@ -596,6 +671,8 @@ class ToolRegistry:
         paths = tuple(sorted(change.path for change in change_set.changes))
         if self.context.read_only:
             return UndoExecution(False, paths, conflicts=paths)
+        if change_set.tainted_paths:
+            return UndoExecution(False, paths, conflicts=change_set.tainted_paths)
         prepared, bindings, conflicts = self._open_undo_targets(change_set)
         if conflicts:
             self._close_bindings(bindings)
@@ -709,14 +786,18 @@ class ToolRegistry:
             prepared.append(_PreparedUndo(change, path))
 
         bindings: dict[Path, _DirectoryBinding] = {}
-        for parent in sorted({item.path.parent for item in prepared}, key=str):
-            bindings[parent] = _DirectoryBinding.open(workspace, parent)
-        for item in prepared:
-            binding = bindings[item.path.parent]
-            if not binding.verify_parent(item.path.parent) or not self._undo_target_matches(
-                item, binding
-            ):
-                conflicts.append(item.change.path)
+        try:
+            for parent in sorted({item.path.parent for item in prepared}, key=str):
+                bindings[parent] = _DirectoryBinding.open(workspace, parent)
+            for item in prepared:
+                binding = bindings[item.path.parent]
+                if not binding.verify_parent(
+                    item.path.parent
+                ) or not self._undo_target_matches(item, binding):
+                    conflicts.append(item.change.path)
+        except Exception:
+            self._close_bindings(bindings)
+            raise
         return prepared, bindings, tuple(sorted(set(conflicts)))
 
     def _undo_target_matches(
@@ -842,12 +923,19 @@ class ToolRegistry:
                 else:
                     if entry.backup_name is None:
                         raise OSError("补偿缺少 after 备份")
-                    current = self._snapshot(binding, item.path.name, item.change.path)
-                    if current.identity == after.identity:
-                        if binding.target_exists(entry.backup_name):
-                            binding.unlink(entry.backup_name)
-                    else:
+                    if not binding.target_exists(item.path.name):
                         binding.replace(entry.backup_name, item.path.name)
+                    else:
+                        current = self._snapshot(
+                            binding,
+                            item.path.name,
+                            item.change.path,
+                        )
+                        if current.identity == after.identity:
+                            if binding.target_exists(entry.backup_name):
+                                binding.unlink(entry.backup_name)
+                        else:
+                            binding.replace(entry.backup_name, item.path.name)
                     backup_files.remove((binding, entry.backup_name))
                     if _is_windows():
                         binding.chmod(item.path.name, after.mode)
@@ -989,6 +1077,8 @@ class ToolRegistry:
             relative = path.relative_to(self.context.workspace_policy.workspace)
             relative_path = relative.as_posix()
             before = self._snapshot(binding, path.name, relative_path)
+            if not self._journal_before_is_continuous(relative_path, before):
+                return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
             original = before.content
             if original.count(old_text) != 1:
                 return ToolResult(
@@ -1033,8 +1123,21 @@ class ToolRegistry:
             try:
                 after = self._snapshot(binding, path.name, relative_path)
             except Exception:
-                after = published_after
-                journal_warning = True
+                self._record_unverified_expected(
+                    relative_path,
+                    before,
+                    published_after,
+                )
+                return ToolResult(
+                    False,
+                    f"文件发布后状态无法验证：{relative_path}",
+                )
+            if after != published_after:
+                self._mark_journal_tainted(relative_path)
+                return ToolResult(
+                    False,
+                    f"文件发布后状态无法验证：{relative_path}",
+                )
             try:
                 self._record_committed(relative_path, before, after)
             except Exception:
@@ -1100,6 +1203,7 @@ class ToolRegistry:
         cleanup_warning = False
         close_warning = False
         journal_warning = False
+        verification_failed = False
         try:
             preapproved = self.context.workspace_policy.resolve_path(
                 raw_path,
@@ -1108,6 +1212,8 @@ class ToolRegistry:
             if preapproved != path or not binding.verify_parent(preapproved.parent):
                 return ToolResult(False, "目标父目录身份发生变化，拒绝请求审批")
             relative_path = relative.as_posix()
+            if not self._journal_before_is_continuous(relative_path, None):
+                return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
             projected_after = FileSnapshot(
                 relative_path,
                 content,
@@ -1134,22 +1240,34 @@ class ToolRegistry:
             except OSError:
                 return ToolResult(False, "create_file 无法原子发布文件，拒绝覆盖")
             committed = True
+            snapshot_failed = False
             try:
                 after = self._snapshot(binding, path.name, relative_path)
             except Exception:
-                after = published_after
-                journal_warning = True
-            try:
-                self._record_committed(relative_path, None, after)
-            except Exception:
-                journal_warning = True
+                self._record_unverified_expected(
+                    relative_path,
+                    None,
+                    published_after,
+                )
+                snapshot_failed = True
+                verification_failed = True
+            else:
+                verification_failed = after != published_after
+            if verification_failed and not snapshot_failed:
+                self._mark_journal_tainted(relative_path)
+            if not verification_failed:
+                try:
+                    self._record_committed(relative_path, None, after)
+                except Exception:
+                    journal_warning = True
             try:
                 binding.unlink(temporary_name)
             except OSError:
                 cleanup_warning = True
-            temporary_name = None
+            else:
+                temporary_name = None
         finally:
-            if temporary_name is not None and not committed:
+            if temporary_name is not None:
                 try:
                     binding.unlink(temporary_name)
                 except OSError:
@@ -1160,6 +1278,13 @@ class ToolRegistry:
                 if not committed:
                     raise
                 close_warning = True
+        if verification_failed:
+            output = f"文件发布后状态无法验证：{relative_path}"
+            if cleanup_warning:
+                output += "；清理警告：临时链接未能删除，请验证受影响路径"
+            if close_warning:
+                output += "；关闭警告：目录绑定未能正常关闭，请验证受影响路径"
+            return ToolResult(False, output)
         output = f"已创建 {relative}"
         if journal_warning:
             output += "；账本警告：提交后快照或记录失败，文件创建已提交，请在验证时检查路径"
@@ -1224,6 +1349,8 @@ class ToolRegistry:
                     before = self._snapshot(binding, path.name, relative_path)
                     original = before.content
                     mode = before.mode
+                if not self._journal_before_is_continuous(relative_path, before):
+                    return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
                 try:
                     after_content = apply_file_patch(original, file_patch)
                 except PatchError as exc:
@@ -1241,6 +1368,16 @@ class ToolRegistry:
                     )
                 )
 
+            audit_paths = tuple(
+                sorted(item.relative_path for item in prepared)
+            )
+            change_chars = sum(
+                len(line[1:])
+                for item in prepared
+                for hunk in item.patch.hunks
+                for line in hunk.lines
+                if line.startswith(("+", "-"))
+            )
             projected = tuple(
                 FileChange(
                     item.relative_path,
@@ -1259,9 +1396,19 @@ class ToolRegistry:
             try:
                 approved = self.context.approver("apply_patch", approval_detail)
             except (OSError, ValueError, TypeError):
-                return ToolResult(False, "补丁审批失败，未执行写入")
+                return ToolResult(
+                    False,
+                    "补丁审批失败，未执行写入",
+                    audit_paths=audit_paths,
+                    change_chars=change_chars,
+                )
             if not approved:
-                return ToolResult(False, "用户拒绝了多文件补丁")
+                return ToolResult(
+                    False,
+                    "用户拒绝了多文件补丁",
+                    audit_paths=audit_paths,
+                    change_chars=change_chars,
+                )
 
             for item in prepared:
                 verified = self.context.workspace_policy.resolve_path(
@@ -1270,14 +1417,29 @@ class ToolRegistry:
                 )
                 binding = bindings[item.path.parent]
                 if verified != item.path or not binding.verify_parent(verified.parent):
-                    return ToolResult(False, "审批后补丁目标父目录身份发生变化，拒绝写入")
+                    return ToolResult(
+                        False,
+                        "审批后补丁目标父目录身份发生变化，拒绝写入",
+                        audit_paths=audit_paths,
+                        change_chars=change_chars,
+                    )
                 if item.before is None:
                     if binding.target_exists(item.path.name):
-                        return ToolResult(False, "审批后补丁创建目标已存在，拒绝覆盖")
+                        return ToolResult(
+                            False,
+                            "审批后补丁创建目标已存在，拒绝覆盖",
+                            audit_paths=audit_paths,
+                            change_chars=change_chars,
+                        )
                 else:
                     current = self._snapshot(binding, item.path.name, item.relative_path)
                     if current != item.before:
-                        return ToolResult(False, "审批后补丁目标发生变化，拒绝全部写入")
+                        return ToolResult(
+                            False,
+                            "审批后补丁目标发生变化，拒绝全部写入",
+                            audit_paths=audit_paths,
+                            change_chars=change_chars,
+                        )
 
             committed: list[_CommittedFilePatch] = []
             failed_path = ""
@@ -1296,6 +1458,9 @@ class ToolRegistry:
                         temporary_name,
                         item.relative_path,
                     )
+                    if not self._patch_target_matches_before(item, binding):
+                        self._mark_journal_tainted(item.relative_path)
+                        raise PolicyError("补丁目标在逐文件发布前发生变化")
                     if item.before is None:
                         binding.link(temporary_name, item.path.name)
                     else:
@@ -1303,8 +1468,14 @@ class ToolRegistry:
                         temporary_files.pop()
                     committed_item = _CommittedFilePatch(item, expected_after)
                     committed.append(committed_item)
-                    after = self._snapshot(binding, item.path.name, item.relative_path)
-                    committed[-1] = _CommittedFilePatch(item, after)
+                    try:
+                        after = self._snapshot(binding, item.path.name, item.relative_path)
+                    except Exception:
+                        self._mark_journal_tainted(item.relative_path)
+                        raise
+                    if after != expected_after:
+                        self._mark_journal_tainted(item.relative_path)
+                        raise PolicyError("补丁发布后目标状态不匹配预期后态")
                     self._record_committed(item.relative_path, item.before, after)
                     committed_paths.append(item.relative_path)
                     if item.before is None:
@@ -1332,6 +1503,8 @@ class ToolRegistry:
                     False,
                     output,
                     modified_paths=tuple(compensation_failures),
+                    audit_paths=audit_paths,
+                    change_chars=change_chars,
                 )
         finally:
             for binding, temporary_name in reversed(temporary_files):
@@ -1351,27 +1524,43 @@ class ToolRegistry:
         output = f"已应用补丁到 {len(committed_paths)} 个文件：{paths_text}"
         if close_warning:
             output += "；关闭警告：目录绑定未能正常关闭，请验证受影响路径"
-        return ToolResult(True, output, modified_paths=tuple(committed_paths))
+        return ToolResult(
+            True,
+            output,
+            modified_paths=tuple(committed_paths),
+            audit_paths=audit_paths,
+            change_chars=change_chars,
+        )
+
+    def _patch_target_matches_before(
+        self,
+        item: _PreparedFilePatch,
+        binding: _DirectoryBinding,
+    ) -> bool:
+        """在每次 link/replace 紧前再次比较完整前态或不存在状态。"""
+
+        try:
+            if item.before is None:
+                return not binding.target_exists(item.path.name)
+            if not binding.target_exists(item.path.name):
+                return False
+            return (
+                self._snapshot(binding, item.path.name, item.relative_path)
+                == item.before
+            )
+        except (OSError, UnicodeError):
+            return False
 
     @staticmethod
     def _render_patch_diff(item: _PreparedFilePatch) -> str:
         """为一次审批渲染完整规范 diff，不复用模型输出上限。"""
 
-        if item.before is None and not item.after_content:
-            return (
-                f"--- /dev/null\n+++ {item.relative_path}\n"
-                "@@ -0,0 +0,0 @@\n（创建空文件，内容为 0 字符）\n"
-            )
-        before_lines = (
-            item.before.content.splitlines(keepends=True) if item.before is not None else []
-        )
-        return "".join(
-            difflib.unified_diff(
-                before_lines,
-                item.after_content.splitlines(keepends=True),
-                fromfile=item.relative_path if item.before is not None else "/dev/null",
-                tofile=item.relative_path,
-            )
+        return render_file_diff(
+            item.relative_path,
+            item.before.content if item.before is not None else None,
+            item.after_content,
+            before_mode=item.before.mode if item.before is not None else None,
+            after_mode=item.mode,
         )
 
     def _compensate_patch_commits(
@@ -1422,7 +1611,7 @@ class ToolRegistry:
         entry: _CommittedFilePatch,
         binding: _DirectoryBinding,
     ) -> None:
-        """补偿失败后尽力把可观测的真实净状态写回活动账本。"""
+        """补偿失败后只记录可证明的工具状态；外部状态仅标记冲突。"""
 
         item = entry.prepared
         try:
@@ -1431,9 +1620,14 @@ class ToolRegistry:
                 if binding.target_exists(item.path.name)
                 else None
             )
-            self._record_committed(item.relative_path, entry.after, actual)
+            if actual == entry.after:
+                return
+            if actual is None and item.before is None:
+                self._record_committed(item.relative_path, entry.after, None)
+                return
         except Exception:
             pass
+        self._mark_journal_tainted(item.relative_path)
 
     @staticmethod
     def _snapshot(
@@ -1468,6 +1662,49 @@ class ToolRegistry:
 
         if self.context.change_journal is not None:
             self.context.change_journal.record_committed(path, before, after)
+
+    def _journal_before_is_continuous(
+        self,
+        path: str,
+        before: FileSnapshot | None,
+    ) -> bool:
+        """由工具边界证明连续调用仍从上一已提交 after 开始。"""
+
+        journal = self.context.change_journal
+        if journal is None:
+            return True
+        if journal.is_tainted(path):
+            return False
+        has_previous, expected_after = journal.active_after(path)
+        if not has_previous or expected_after == before:
+            return True
+        journal.mark_tainted(path)
+        return False
+
+    def _record_unverified_expected(
+        self,
+        path: str,
+        before: FileSnapshot | None,
+        expected_after: FileSnapshot | None,
+    ) -> None:
+        """保存工具预期态并标记不可预览/撤销，绝不读取或记录外部态。"""
+
+        try:
+            self._record_committed(path, before, expected_after)
+        except Exception:
+            pass
+        self._mark_journal_tainted(path)
+
+    def _mark_journal_tainted(self, path: str) -> None:
+        """尽力标记无法证明归属的路径，且不读取或保存其源码。"""
+
+        journal = self.context.change_journal
+        if journal is None:
+            return
+        try:
+            journal.mark_tainted(path)
+        except Exception:
+            pass
 
     def _run_command(self, arguments: dict[str, Any]) -> ToolResult:
         if self.context.read_only:

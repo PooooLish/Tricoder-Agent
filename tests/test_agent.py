@@ -1489,8 +1489,8 @@ class AgentTests(unittest.TestCase):
         )
         self.assertNotIn("secret = 987654", audit_path.read_text(encoding="utf-8"))
 
-    def test_apply_patch_agent_audit_records_only_patch_character_count(self) -> None:
-        """防止真实 Agent 审计丢失 patch_chars 或持久化补丁源码。"""
+    def test_apply_patch_agent_audit_records_safe_structured_change_metadata(self) -> None:
+        """防止补丁审计缺少规范路径/计数，或持久化补丁源码。"""
         sentinel = "AGENT-PATCH-PRIVATE-SENTINEL-9D26"
         patch_text = (
             "--- a/sample.py\n"
@@ -1523,7 +1523,13 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn(sentinel, serialized)
         self.assertNotIn("patch", patch_event["arguments"])
         self.assertEqual(
-            {"patch_chars": len(patch_text)},
+            {
+                "patch_chars": len(patch_text),
+                "paths": ["sample.py"],
+                "file_count": 1,
+                "change_chars": len("value = 1\n")
+                + len(f"value = 2  # {sentinel}\n"),
+            },
             patch_event["arguments"],
         )
 
