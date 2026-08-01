@@ -1489,6 +1489,44 @@ class AgentTests(unittest.TestCase):
         )
         self.assertNotIn("secret = 987654", audit_path.read_text(encoding="utf-8"))
 
+    def test_apply_patch_agent_audit_records_only_patch_character_count(self) -> None:
+        """防止真实 Agent 审计丢失 patch_chars 或持久化补丁源码。"""
+        sentinel = "AGENT-PATCH-PRIVATE-SENTINEL-9D26"
+        patch_text = (
+            "--- a/sample.py\n"
+            "+++ b/sample.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            f"+value = 2  # {sentinel}\n"
+        )
+        provider = ScriptedProvider(
+            [
+                action("apply_patch", {"patch": patch_text}),
+                action("run_command", {"command": "python -m compileall -q sample.py"}),
+                action("finish", {"summary": "补丁完成"}),
+            ]
+        )
+        audit_path = self.workspace / "runtime" / "apply-patch.jsonl"
+        agent = LegacyCodingAgent(
+            provider,
+            self.tools,
+            max_rounds=3,
+            audit=AuditLogger(audit_path),
+        )
+
+        result = agent.run("应用补丁")
+        serialized = audit_path.read_text(encoding="utf-8")
+        events = [json.loads(line) for line in serialized.splitlines()]
+        patch_event = next(event for event in events if event.get("tool") == "apply_patch")
+
+        self.assertTrue(result.ok, result.summary)
+        self.assertNotIn(sentinel, serialized)
+        self.assertNotIn("patch", patch_event["arguments"])
+        self.assertEqual(
+            {"patch_chars": len(patch_text)},
+            patch_event["arguments"],
+        )
+
     def test_finish_without_file_modification_succeeds(self) -> None:
         """防止无文件修改的只读任务被错误地要求运行验证命令。"""
         provider = ScriptedProvider([action("finish", {"summary": "已完成检查"})])

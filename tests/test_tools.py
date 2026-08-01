@@ -110,6 +110,85 @@ def patch_binding_publish_failure(*, rollback_fails: bool = False) -> object:
     )
 
 
+class NewFileCompensationProbeBinding(PublishFailingBinding):
+    """要求补偿删除新建目标前刚通过绑定读取该目标快照。"""
+
+    def __init__(self, binding: object, state: dict[str, object]) -> None:
+        super().__init__(binding, rollback_fails=False)
+        self.state = state
+        self.last_read_name = ""
+
+    def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
+        result = self.binding.read_text(name)  # type: ignore[attr-defined]
+        self.last_read_name = name
+        return result
+
+    def unlink(self, name: str) -> None:
+        if name == "aaa-new.py":
+            if self.last_read_name != name:
+                raise AssertionError("新建目标未经绑定快照核验即删除")
+            verified_deletes = self.state.setdefault("verified_deletes", [])
+            assert isinstance(verified_deletes, list)
+            verified_deletes.append(name)
+        self.binding.unlink(name)  # type: ignore[attr-defined]
+
+
+def patch_new_file_compensation_probe(
+    state: dict[str, object],
+) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_probe(workspace: Path, parent: Path) -> NewFileCompensationProbeBinding:
+        return NewFileCompensationProbeBinding(real_open(workspace, parent), state)
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_probe,
+    )
+
+
+class ExternalReplacementBinding:
+    """第二目标发布失败前，以新 inode 外部替换已经提交的首目标。"""
+
+    def __init__(self, binding: object, state: dict[str, object]) -> None:
+        self.binding = binding
+        self.state = state
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.binding, name)
+
+    def replace(self, temporary_name: str, target_name: str) -> None:
+        if target_name == "other.py":
+            parent = self.binding.parent  # type: ignore[attr-defined]
+            external = parent / ".external-replacement.tmp"
+            external.write_text("external = True\n", encoding="utf-8")
+            os.replace(external, parent / "app.py")
+            self.state["external_replaced"] = True
+            raise OSError("PUBLISH-AFTER-EXTERNAL-REPLACE")
+        if target_name == "app.py" and self.state.get("external_replaced"):
+            self.state["unsafe_overwrite"] = True
+        self.binding.replace(temporary_name, target_name)  # type: ignore[attr-defined]
+
+
+def patch_external_replacement_before_compensation(
+    state: dict[str, object],
+) -> object:
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_with_external_replace(
+        workspace: Path,
+        parent: Path,
+    ) -> ExternalReplacementBinding:
+        return ExternalReplacementBinding(real_open(workspace, parent), state)
+
+    return patch.object(
+        tools_module._DirectoryBinding,
+        "open",
+        side_effect=open_with_external_replace,
+    )
+
+
 class RecordingApprover:
     def __init__(self, decisions: list[bool]) -> None:
         self.decisions = list(decisions)
@@ -464,6 +543,79 @@ class ToolTests(unittest.TestCase):
             (self.workspace / "src" / "new.py").read_text(encoding="utf-8"),
         )
 
+    def test_apply_patch_empty_creation_names_target_in_approval(self) -> None:
+        """防止合法空文件创建以空白审批详情绕过用户确认。"""
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/src/empty.py\n"
+            "@@ -0,0 +0,0 @@\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(("src/empty.py",), result.modified_paths)
+        self.assertEqual(1, len(self.approver.requests))
+        approval_detail = self.approver.requests[0][1]
+        self.assertIn("--- /dev/null", approval_detail)
+        self.assertIn("+++ src/empty.py", approval_detail)
+        self.assertIn("创建空文件", approval_detail)
+        self.assertEqual("", (self.workspace / "src" / "empty.py").read_text(encoding="utf-8"))
+
+    def test_apply_patch_rejects_existing_file_no_op_before_approval(self) -> None:
+        """防止无净变化补丁仍替换文件并把路径报告为已修改。"""
+        target = self.workspace / "src" / "app.py"
+        before = target.stat()
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "     return 41\n"
+        )
+
+        result = self.registry.execute("apply_patch", {"patch": patch_text})
+        after = target.stat()
+
+        self.assertFalse(result.ok)
+        self.assertEqual((), result.modified_paths)
+        self.assertEqual([], self.approver.requests)
+        self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+        self.assertEqual(
+            "def answer():\n    return 41\n",
+            target.read_text(encoding="utf-8"),
+        )
+
+    def test_apply_patch_hides_approver_exception_detail(self) -> None:
+        """防止审批器异常把完整 diff 或源码原文复制到工具结果。"""
+        sentinel = "APPROVER-PATCH-PRIVATE-SENTINEL-71C4"
+        target = self.workspace / "src" / "app.py"
+        original = target.read_text(encoding="utf-8")
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            f"+    return 42  # {sentinel}\n"
+        )
+
+        for exception_type in (OSError, ValueError, TypeError):
+            with self.subTest(exception_type=exception_type.__name__):
+                def fail_approval(action: str, detail: str) -> bool:
+                    self.assertEqual("apply_patch", action)
+                    self.assertIn(sentinel, detail)
+                    raise exception_type(f"{sentinel}\n{detail}")
+
+                self.registry.context.approver = fail_approval
+                result = self.registry.execute("apply_patch", {"patch": patch_text})
+
+                self.assertFalse(result.ok)
+                self.assertIn("补丁审批失败", result.output)
+                self.assertNotIn(sentinel, result.output)
+                self.assertNotIn("return 42", result.output)
+                self.assertEqual(original, target.read_text(encoding="utf-8"))
+
     def test_apply_patch_rejects_malformed_second_file_before_approval(self) -> None:
         """防止解析首个文件后就在第二个畸形文件暴露前产生审批或写入。"""
         target = self.workspace / "src" / "app.py"
@@ -702,6 +854,85 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(
             "def answer():\n    return 42\n",
             change_set.changes[0].after.content,
+        )
+
+    def test_apply_patch_removes_committed_new_file_after_later_publish_failure(
+        self,
+    ) -> None:
+        """防止后续发布失败时遗漏经身份核验的新建目标补偿。"""
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        state: dict[str, object] = {}
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/src/aaa-new.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+created = True\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        with patch_new_file_compensation_probe(state):
+            result = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task((), "not-run")
+
+        self.assertFalse(result.ok)
+        self.assertEqual((), result.modified_paths)
+        self.assertFalse((self.workspace / "src" / "aaa-new.py").exists())
+        self.assertEqual("value = 1\n", second.read_text(encoding="utf-8"))
+        self.assertEqual(["aaa-new.py"], state.get("verified_deletes"))
+        self.assertIsNone(change_set)
+
+    def test_apply_patch_refuses_to_overwrite_external_replacement_during_compensation(
+        self,
+    ) -> None:
+        """防止补偿覆盖发布失败前由外部替换的真实目标状态。"""
+        first = self.workspace / "src" / "app.py"
+        second = self.workspace / "src" / "other.py"
+        second.write_text("value = 1\n", encoding="utf-8")
+        journal = ChangeJournal()
+        journal.begin_task((), "not-run")
+        self.registry.context.change_journal = journal
+        state: dict[str, object] = {}
+        patch_text = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def answer():\n"
+            "-    return 41\n"
+            "+    return 42\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1 +1 @@\n"
+            "-value = 1\n"
+            "+value = 2\n"
+        )
+
+        with patch_external_replacement_before_compensation(state):
+            result = self.registry.execute("apply_patch", {"patch": patch_text})
+        change_set = journal.seal_task(("src/app.py",), "not-run")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(("src/app.py",), result.modified_paths)
+        self.assertTrue(state.get("external_replaced"))
+        self.assertNotIn("unsafe_overwrite", state)
+        self.assertEqual("external = True\n", first.read_text(encoding="utf-8"))
+        self.assertEqual("value = 1\n", second.read_text(encoding="utf-8"))
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        change = change_set.changes[0]
+        self.assertEqual("src/app.py", change.path)
+        self.assertEqual("external = True\n", change.after.content)
+        metadata = first.stat()
+        self.assertEqual(
+            FileIdentity(metadata.st_dev, metadata.st_ino),
+            change.after.identity,
         )
 
     def test_create_file_records_missing_before_and_published_after_snapshot(self) -> None:

@@ -687,6 +687,11 @@ class CodingAgent:
                 "path": arguments.get("path"),
                 "content_chars": len(content) if isinstance(content, str) else 0,
             }
+        if action.tool == "apply_patch":
+            patch_text = arguments.get("patch", "")
+            return {
+                "patch_chars": len(patch_text) if isinstance(patch_text, str) else 0,
+            }
         if action.tool == "run_command":
             command = arguments.get("command", "")
             metadata = self.tools.context.command_policy.audit_metadata(

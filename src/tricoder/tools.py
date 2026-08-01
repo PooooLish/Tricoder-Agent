@@ -897,6 +897,8 @@ class ToolRegistry:
                     after_content = apply_file_patch(original, file_patch)
                 except PatchError as exc:
                     return ToolResult(False, f"补丁无法应用到 {relative_path}：{exc}")
+                if not file_patch.create and after_content == original:
+                    return ToolResult(False, f"补丁对现有文件没有净变化：{relative_path}")
                 prepared.append(
                     _PreparedFilePatch(
                         file_patch,
@@ -923,7 +925,11 @@ class ToolRegistry:
             )
             self._reserve_changes(projected)
             approval_detail = "".join(self._render_patch_diff(item) for item in prepared)
-            if not self.context.approver("apply_patch", approval_detail):
+            try:
+                approved = self.context.approver("apply_patch", approval_detail)
+            except (OSError, ValueError, TypeError):
+                return ToolResult(False, "补丁审批失败，未执行写入")
+            if not approved:
                 return ToolResult(False, "用户拒绝了多文件补丁")
 
             for item in prepared:
@@ -1020,6 +1026,11 @@ class ToolRegistry:
     def _render_patch_diff(item: _PreparedFilePatch) -> str:
         """为一次审批渲染完整规范 diff，不复用模型输出上限。"""
 
+        if item.before is None and not item.after_content:
+            return (
+                f"--- /dev/null\n+++ {item.relative_path}\n"
+                "@@ -0,0 +0,0 @@\n（创建空文件，内容为 0 字符）\n"
+            )
         before_lines = (
             item.before.content.splitlines(keepends=True) if item.before is not None else []
         )
