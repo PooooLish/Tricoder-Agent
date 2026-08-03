@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from typing import Any, Protocol
 
 from tricoder.audit import AuditLogger
-from tricoder.models import Message, RunResult, SessionContext, SessionTurnResult, ToolAction
+from tricoder.models import (
+    Message,
+    RunResult,
+    SessionContext,
+    SessionTurnResult,
+    TokenUsage,
+    ToolAction,
+)
 from tricoder.policy import PolicyError
 from tricoder.providers import ModelProvider, ProviderError, ProviderProtocolError
 from tricoder.tools import ToolRegistry
@@ -210,6 +218,8 @@ class AgentObserver(Protocol):
 
     def on_round_start(self, round_number: int, max_rounds: int) -> None: ...
 
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None: ...
+
     def on_action(self, action: ToolAction) -> None: ...
 
     def on_tool_result(
@@ -226,6 +236,9 @@ class NullObserver:
     """在库调用或测试中保持完全静默的默认观察者。"""
 
     def on_round_start(self, round_number: int, max_rounds: int) -> None:
+        return None
+
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None:
         return None
 
     def on_action(self, action: ToolAction) -> None:
@@ -326,6 +339,7 @@ class CodingAgent:
         tool_calls = 0
         modified_files = list(context.modified_files)
         verification = context.verification
+        accumulated_usage: TokenUsage | None = None
 
         def current_task_has_complete_round() -> bool:
             """只在当前任务已有完整工具回合时保留其中间状态。"""
@@ -350,7 +364,7 @@ class CodingAgent:
             rollback_task: bool = False,
         ) -> SessionTurnResult:
             return SessionTurnResult(
-                result,
+                replace(result, usage=accumulated_usage),
                 SessionContext(
                     messages=(
                         context.messages
@@ -439,6 +453,26 @@ class CodingAgent:
                     ),
                     rollback_task=True,
                 )
+
+            if response.usage is not None:
+                accumulated_usage = (
+                    response.usage
+                    if accumulated_usage is None
+                    else accumulated_usage.merge(response.usage)
+                )
+                on_provider_usage = getattr(self.observer, "on_provider_usage", None)
+                if callable(on_provider_usage):
+                    on_provider_usage(round_number, response.usage)
+                if not self._audit_usage(round_number, response.usage):
+                    return turn_result(
+                        self._audit_failure_result(
+                            round_number,
+                            tool_calls,
+                            modified_files,
+                            verification,
+                        ),
+                        rollback_task=True,
+                    )
 
             tool_call_id: str | None = None
             if self.tool_protocol == "native":
@@ -644,6 +678,18 @@ class CodingAgent:
             self.observer.on_error(AUDIT_FAILURE_MESSAGE)
             return False
         return True
+
+    def _audit_usage(self, round_number: int, usage: TokenUsage) -> bool:
+        event: dict[str, Any] = {"round": round_number, "status": "provider_usage"}
+        for field, value in (
+            ("input", usage.input_tokens),
+            ("output", usage.output_tokens),
+            ("cached", usage.cached_tokens),
+            ("cache_miss", usage.cache_miss_tokens),
+        ):
+            if value is not None:
+                event[field] = value
+        return self._log(event)
 
     @staticmethod
     def _audit_failure_result(

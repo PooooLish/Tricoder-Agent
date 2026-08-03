@@ -19,6 +19,7 @@ from tricoder.models import (
     ProviderResponse,
     RunResult,
     SessionContext,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
     ToolResult,
@@ -232,6 +233,9 @@ class RecordingObserver:
             f"result:{current_action.tool}:{result.ok}"  # type: ignore[attr-defined]
         )
 
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None:
+        self.events.append(f"usage:{round_number}:{usage.cached_tokens}")
+
     def on_error(self, message: str) -> None:
         self.events.append(f"error:{message}")
 
@@ -299,6 +303,183 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertEqual("tool", tool.role)
         self.assertEqual("call-read", tool.tool_call_id)
         self.assertIn('"tool": "read_file"', tool.content or "")
+
+    def test_provider_usage_is_observed_aggregated_and_kept_out_of_history(self) -> None:
+        """Removing response usage handling must lose the public event and total."""
+        first_usage = TokenUsage(100, 10, 60, 40)
+        second_usage = TokenUsage(50, 5, 35, 15)
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(ToolCall("call-read", "read_file", {"path": "sample.py"}),),
+                    finish_reason="tool_calls",
+                    usage=first_usage,
+                ),
+                ProviderResponse(
+                    tool_calls=(ToolCall("call-finish", "finish", {"summary": "读取完成"}),),
+                    finish_reason="tool_calls",
+                    usage=second_usage,
+                ),
+            ]
+        )
+        observer = RecordingObserver()
+
+        result = CodingAgent(
+            provider, self.tools, max_rounds=2, observer=observer
+        ).run("读取示例")
+
+        self.assertTrue(result.ok)
+        self.assertIn("usage:1:60", observer.events)
+        self.assertIn("usage:2:35", observer.events)
+        self.assertEqual(TokenUsage(150, 15, 95, 55), result.usage)
+        self.assertEqual(
+            provider.histories[0],
+            provider.histories[1][: len(provider.histories[0])],
+        )
+        self.assertFalse(
+            any(
+                str(value) in (message.content or "")
+                for message in provider.histories[1]
+                for value in (60, 35, 95, 55)
+            )
+        )
+
+    def test_usage_does_not_break_existing_observers(self) -> None:
+        """A pre-usage observer must not abort an otherwise valid tool turn."""
+
+        class LegacyObserver:
+            def on_round_start(self, round_number: int, max_rounds: int) -> None:
+                return None
+
+            def on_action(self, current_action: object) -> None:
+                return None
+
+            def on_tool_result(
+                self,
+                current_action: object,
+                result: object,
+                duration_ms: int,
+            ) -> None:
+                return None
+
+            def on_error(self, message: str) -> None:
+                return None
+
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(ToolCall("call-finish", "finish", {"summary": "完成"}),),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(1, 1, 0, 1),
+                )
+            ]
+        )
+
+        result = CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=1,
+            observer=LegacyObserver(),  # type: ignore[arg-type]
+        ).run("兼容已有观察者")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(TokenUsage(1, 1, 0, 1), result.usage)
+
+    def test_provider_usage_audit_is_numeric_metadata_only(self) -> None:
+        """Adding provider or tool text to usage audit records must fail this boundary."""
+        task_sentinel = "TASK-PRIVATE-SENTINEL"
+        provider_sentinel = "PROVIDER-CONTENT-PRIVATE-SENTINEL"
+        tool_sentinel = "TOOL-OUTPUT-PRIVATE-SENTINEL"
+        (self.workspace / "sample.py").write_text(tool_sentinel, encoding="utf-8")
+        audit_path = self.workspace / "runtime" / "provider-usage.jsonl"
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    content=provider_sentinel,
+                    tool_calls=(ToolCall("call-read", "read_file", {"path": "sample.py"}),),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(100, 10, 60, 40),
+                ),
+                ProviderResponse(
+                    tool_calls=(ToolCall("call-finish", "finish", {"summary": "完成"}),),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(50, None, 35, None),
+                ),
+            ]
+        )
+
+        result = CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=2,
+            audit=AuditLogger(audit_path),
+        ).run(task_sentinel)
+
+        self.assertTrue(result.ok)
+        trail = audit_path.read_text(encoding="utf-8")
+        audit_events = [json.loads(line) for line in trail.splitlines()]
+        usage_events = [
+            event for event in audit_events if event["status"] == "provider_usage"
+        ]
+        self.assertEqual(2, len(usage_events))
+        self.assertEqual(
+            {
+                "timestamp",
+                "round",
+                "status",
+                "input",
+                "output",
+                "cached",
+                "cache_miss",
+            },
+            set(usage_events[0]),
+        )
+        self.assertEqual(1, usage_events[0]["round"])
+        self.assertEqual(100, usage_events[0]["input"])
+        self.assertEqual(10, usage_events[0]["output"])
+        self.assertEqual(60, usage_events[0]["cached"])
+        self.assertEqual(40, usage_events[0]["cache_miss"])
+        self.assertEqual(
+            {"timestamp", "round", "status", "input", "cached"},
+            set(usage_events[1]),
+        )
+        self.assertTrue(
+            all(
+                isinstance(value, int) and value >= 0
+                for event in usage_events
+                for field, value in event.items()
+                if field in {"input", "output", "cached", "cache_miss"}
+            )
+        )
+        for sentinel in (task_sentinel, provider_sentinel, tool_sentinel):
+            self.assertNotIn(sentinel, trail)
+
+    def test_provider_usage_audit_failure_stops_before_tool_execution(self) -> None:
+        """Ignoring a failed usage audit must not permit a pending write tool."""
+        target = self.workspace / "must-not-exist.py"
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "call-create",
+                            "create_file",
+                            {"path": target.name, "content": "created = True\n"},
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(1, 2, 0, 1),
+                )
+            ]
+        )
+
+        result = CodingAgent(
+            provider, self.tools, max_rounds=1, audit=FailingAudit()
+        ).run("审计不可写时不执行工具")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(target.exists())
+        self.assertEqual(TokenUsage(1, 2, 0, 1), result.usage)
 
     def test_plain_text_gets_controlled_feedback_without_parsing_content_json(self) -> None:
         """原生模式不得把普通文本中的 JSON 当作工具调用执行。"""
