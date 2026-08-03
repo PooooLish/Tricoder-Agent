@@ -157,6 +157,120 @@ class ProviderTests(unittest.TestCase):
 
                 self.assertEqual(expected, response.usage)
 
+    def test_deepseek_cache_hit_falls_back_to_compatible_nested_usage(self) -> None:
+        cases = (
+            ({"prompt_tokens_details": {"cached_tokens": 61}}, 61),
+            (
+                {
+                    "prompt_cache_hit_tokens": "malformed",
+                    "prompt_tokens_details": {"cached_tokens": 62},
+                },
+                62,
+            ),
+        )
+
+        for usage, expected_cached_tokens in cases:
+            with self.subTest(usage=usage):
+                provider, _ = make_provider(
+                    "deepseek",
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": usage,
+                    },
+                )
+
+                response = provider.complete([Message("user", "hello")], [])
+
+                self.assertEqual(
+                    TokenUsage(cached_tokens=expected_cached_tokens),
+                    response.usage,
+                )
+
+    def test_openai_style_cache_hit_falls_back_to_compatible_direct_usage(self) -> None:
+        cases = (
+            ("openai", {"prompt_cache_hit_tokens": 64}, 64),
+            (
+                "glm",
+                {
+                    "prompt_tokens_details": {"cached_tokens": True},
+                    "prompt_cache_hit_tokens": 65,
+                },
+                65,
+            ),
+        )
+
+        for provider_name, usage, expected_cached_tokens in cases:
+            with self.subTest(provider=provider_name, usage=usage):
+                provider, _ = make_provider(
+                    provider_name,
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": usage,
+                    },
+                )
+
+                response = provider.complete([Message("user", "hello")], [])
+
+                self.assertEqual(
+                    TokenUsage(cached_tokens=expected_cached_tokens),
+                    response.usage,
+                )
+
+    def test_usage_primary_dialect_wins_and_direct_cache_miss_is_preserved(self) -> None:
+        cases = (
+            (
+                "deepseek",
+                {
+                    "prompt_cache_hit_tokens": 63,
+                    "prompt_cache_miss_tokens": 37,
+                    "prompt_tokens_details": {"cached_tokens": 999},
+                },
+                TokenUsage(cached_tokens=63, cache_miss_tokens=37),
+            ),
+            (
+                "openai",
+                {
+                    "prompt_tokens_details": {"cached_tokens": 66},
+                    "prompt_cache_hit_tokens": 999,
+                    "prompt_cache_miss_tokens": 34,
+                },
+                TokenUsage(cached_tokens=66, cache_miss_tokens=34),
+            ),
+        )
+
+        for provider_name, usage, expected in cases:
+            with self.subTest(provider=provider_name):
+                provider, _ = make_provider(
+                    provider_name,
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": usage,
+                    },
+                )
+
+                response = provider.complete([Message("user", "hello")], [])
+
+                self.assertEqual(expected, response.usage)
+
+    def test_all_unknown_compatible_usage_fields_yields_none(self) -> None:
+        provider, _ = make_provider(
+            "openai",
+            {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": True,
+                    "completion_tokens": -1,
+                    "prompt_tokens_details": {"cached_tokens": "malformed"},
+                    "prompt_cache_hit_tokens": False,
+                    "prompt_cache_miss_tokens": -1,
+                },
+            },
+        )
+
+        response = provider.complete([Message("user", "hello")], [])
+
+        self.assertIsNone(response.usage)
+
     def test_ignores_malformed_optional_usage_without_rejecting_content(self) -> None:
         malformed_usages = (
             {"prompt_tokens": True},
@@ -463,6 +577,31 @@ class ProviderTests(unittest.TestCase):
             ["alpha", "weather"],
             [tool["function"]["name"] for tool in first_tools],  # type: ignore[index,union-attr]
         )
+
+    def test_rejects_duplicate_tool_names_before_transport_without_leaking_schema(self) -> None:
+        schema_sentinel = "SCHEMA-PRIVATE-SENTINEL"
+        secret_sentinel = "SECRET-PRIVATE-SENTINEL"
+        duplicate_weather = ToolDefinition(
+            name=WEATHER_TOOL.name,
+            description=secret_sentinel,
+            parameters={"private_schema": schema_sentinel},
+        )
+        provider, transport = make_provider(
+            "openai",
+            {
+                "choices": [{"message": {"content": "must-not-be-used"}}],
+            },
+        )
+
+        with self.assertRaises(ProviderError) as caught:
+            provider.complete(
+                [Message("user", "hello")],
+                [WEATHER_TOOL, duplicate_weather],
+            )
+
+        self.assertEqual([], transport.calls)
+        self.assertNotIn(schema_sentinel, str(caught.exception))
+        self.assertNotIn(secret_sentinel, str(caught.exception))
 
     def test_serializes_tool_call_arguments_with_stable_key_order(self) -> None:
         """防止 ToolCall 参数的插入顺序改变发送给 Provider 的 JSON 字符串。"""

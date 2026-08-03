@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from tricoder import tools as tools_module
 from tricoder.agent import (
+    AgentObserver,
     CONTEXT_COMPACTION_NOTICE,
     LEGACY_SYSTEM_PROMPT,
     CodingAgent,
@@ -344,6 +345,45 @@ class NativeToolCallingTests(unittest.TestCase):
             )
         )
 
+    def test_accumulated_usage_is_preserved_after_later_provider_error(self) -> None:
+        first_usage = TokenUsage(100, 10, 60, 40)
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall("call-read", "read_file", {"path": "sample.py"}),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=first_usage,
+                ),
+                ProviderError("later request failed"),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("读取后失败")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(first_usage, result.usage)
+
+    def test_accumulated_usage_is_preserved_after_reaching_max_rounds(self) -> None:
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    content="no tool call",
+                    usage=TokenUsage(100, 10, 60, 40),
+                ),
+                ProviderResponse(
+                    content="still no tool call",
+                    usage=TokenUsage(50, 5, 35, 15),
+                ),
+            ]
+        )
+
+        result = CodingAgent(provider, self.tools, max_rounds=2).run("达到轮数上限")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(TokenUsage(150, 15, 95, 55), result.usage)
+
     def test_usage_does_not_break_existing_observers(self) -> None:
         """A pre-usage observer must not abort an otherwise valid tool turn."""
 
@@ -365,6 +405,14 @@ class NativeToolCallingTests(unittest.TestCase):
             def on_error(self, message: str) -> None:
                 return None
 
+        try:
+            legacy_observer_is_compatible = isinstance(
+                LegacyObserver(), AgentObserver
+            )
+        except TypeError:
+            legacy_observer_is_compatible = False
+        self.assertTrue(legacy_observer_is_compatible)
+
         provider = StructuredScriptedProvider(
             [
                 ProviderResponse(
@@ -379,7 +427,7 @@ class NativeToolCallingTests(unittest.TestCase):
             provider,
             self.tools,
             max_rounds=1,
-            observer=LegacyObserver(),  # type: ignore[arg-type]
+            observer=LegacyObserver(),
         ).run("兼容已有观察者")
 
         self.assertTrue(result.ok)

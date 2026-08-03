@@ -193,6 +193,10 @@ class OpenAICompatibleProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        tool_names = [tool.name for tool in tools]
+        if len(set(tool_names)) != len(tool_names):
+            raise ProviderError("工具名称必须唯一")
+
         payload: dict[str, object] = {
             "model": self._config.model,
             "messages": [self._serialize_message(message) for message in messages],
@@ -307,19 +311,29 @@ class OpenAICompatibleProvider:
 
         input_tokens = _optional_token_count(raw_usage.get("prompt_tokens"))
         output_tokens = _optional_token_count(raw_usage.get("completion_tokens"))
-        cached_tokens: int | None = None
-        cache_miss_tokens: int | None = None
+        direct_cached_tokens = _optional_token_count(
+            raw_usage.get("prompt_cache_hit_tokens")
+        )
+        cache_miss_tokens = _optional_token_count(
+            raw_usage.get("prompt_cache_miss_tokens")
+        )
+        nested_cached_tokens: int | None = None
+        details = raw_usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            nested_cached_tokens = _optional_token_count(details.get("cached_tokens"))
+
         if self._profile.usage_dialect == "deepseek":
-            cached_tokens = _optional_token_count(
-                raw_usage.get("prompt_cache_hit_tokens")
-            )
-            cache_miss_tokens = _optional_token_count(
-                raw_usage.get("prompt_cache_miss_tokens")
+            cached_tokens = (
+                direct_cached_tokens
+                if direct_cached_tokens is not None
+                else nested_cached_tokens
             )
         else:
-            details = raw_usage.get("prompt_tokens_details")
-            if isinstance(details, dict):
-                cached_tokens = _optional_token_count(details.get("cached_tokens"))
+            cached_tokens = (
+                nested_cached_tokens
+                if nested_cached_tokens is not None
+                else direct_cached_tokens
+            )
 
         if all(
             value is None

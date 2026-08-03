@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from tricoder.audit import AuditLogger
 from tricoder.models import (
@@ -213,12 +213,11 @@ def compact_session_messages(
     return [*fixed_messages, notice, *retained, *latest_block]
 
 
+@runtime_checkable
 class AgentObserver(Protocol):
     """接收 Agent 的公开运行事件，不接触隐藏推理或凭据。"""
 
     def on_round_start(self, round_number: int, max_rounds: int) -> None: ...
-
-    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None: ...
 
     def on_action(self, action: ToolAction) -> None: ...
 
@@ -230,6 +229,22 @@ class AgentObserver(Protocol):
     ) -> None: ...
 
     def on_error(self, message: str) -> None: ...
+
+
+@runtime_checkable
+class ProviderUsageObserver(Protocol):
+    """可选接收逐轮归一化 Provider 用量。"""
+
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None: ...
+
+
+def _notify_provider_usage(
+    observer: AgentObserver,
+    round_number: int,
+    usage: TokenUsage,
+) -> None:
+    if isinstance(observer, ProviderUsageObserver):
+        observer.on_provider_usage(round_number, usage)
 
 
 class NullObserver:
@@ -460,9 +475,7 @@ class CodingAgent:
                     if accumulated_usage is None
                     else accumulated_usage.merge(response.usage)
                 )
-                on_provider_usage = getattr(self.observer, "on_provider_usage", None)
-                if callable(on_provider_usage):
-                    on_provider_usage(round_number, response.usage)
+                _notify_provider_usage(self.observer, round_number, response.usage)
                 if not self._audit_usage(round_number, response.usage):
                     return turn_result(
                         self._audit_failure_result(
