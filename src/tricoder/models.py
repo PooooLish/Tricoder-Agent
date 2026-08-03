@@ -40,12 +40,51 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenUsage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.input_tokens,
+            self.output_tokens,
+            self.cached_tokens,
+            self.cache_miss_tokens,
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("Token 用量必须是非负整数或 None")
+
+    def merge(self, other: "TokenUsage") -> "TokenUsage":
+        def add(left: int | None, right: int | None) -> int | None:
+            values = [value for value in (left, right) if value is not None]
+            return sum(values) if values else None
+
+        return TokenUsage(
+            add(self.input_tokens, other.input_tokens),
+            add(self.output_tokens, other.output_tokens),
+            add(self.cached_tokens, other.cached_tokens),
+            add(self.cache_miss_tokens, other.cache_miss_tokens),
+        )
+
+    @property
+    def cache_hit_ratio(self) -> float | None:
+        if self.input_tokens is None or self.input_tokens <= 0:
+            return None
+        if self.cached_tokens is None:
+            return None
+        return self.cached_tokens / self.input_tokens
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderResponse:
     """Provider 适配器归一化后的响应，不保留厂商原始对象。"""
 
     content: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     finish_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +222,7 @@ class RunResult:
     tool_calls: int = 0
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
+    usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)

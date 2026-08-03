@@ -6,7 +6,15 @@ from pathlib import Path
 # 让 ``python -m unittest`` 在未安装包的源码工作树中也能直接发现 ``src``。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tricoder.models import Message, ProviderResponse, ToolCall, ToolDefinition, ToolResult
+from tricoder.models import (
+    Message,
+    ProviderResponse,
+    RunResult,
+    TokenUsage,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 
 
 class StructuredModelTests(unittest.TestCase):
@@ -94,6 +102,28 @@ class StructuredModelTests(unittest.TestCase):
             len("assistant准备读取call_123read_file{'path': 'src/main.py'}"),
             message.character_budget(),
         )
+
+    def test_token_usage_merges_known_values_and_computes_hit_ratio(self) -> None:
+        first = TokenUsage(100, 20, 60, 40)
+        second = TokenUsage(50, None, 25, None)
+
+        total = first.merge(second)
+
+        self.assertEqual(TokenUsage(150, 20, 85, 40), total)
+        self.assertAlmostEqual(85 / 150, total.cache_hit_ratio or 0.0)
+
+    def test_token_usage_rejects_invalid_counts(self) -> None:
+        self.assertIsNone(TokenUsage(cached_tokens=10).cache_hit_ratio)
+        self.assertIsNone(TokenUsage(input_tokens=0, cached_tokens=0).cache_hit_ratio)
+        for value in (-1, True, "10"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    TokenUsage(input_tokens=value)  # type: ignore[arg-type]
+
+    def test_results_accept_optional_usage(self) -> None:
+        usage = TokenUsage(input_tokens=10, output_tokens=2, cached_tokens=8)
+        self.assertEqual(usage, ProviderResponse(content="ok", usage=usage).usage)
+        self.assertEqual(usage, RunResult(True, "ok", 1, usage=usage).usage)
 
 
 if __name__ == "__main__":
