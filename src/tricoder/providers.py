@@ -14,6 +14,7 @@ from tricoder.models import (
     Message,
     ProviderConfig,
     ProviderResponse,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
 )
@@ -47,6 +48,7 @@ class _ProviderProfile:
     """将厂商请求差异封装在 Provider 层内。"""
 
     capabilities: ProviderCapabilities
+    usage_dialect: str
     automatic_tool_choice: bool = False
     disable_thinking: bool = False
 
@@ -59,6 +61,7 @@ _PROVIDER_PROFILES = {
             forced_tool_choice=True,
             streaming=True,
         ),
+        usage_dialect="openai",
         automatic_tool_choice=True,
     ),
     "deepseek": _ProviderProfile(
@@ -67,6 +70,7 @@ _PROVIDER_PROFILES = {
             forced_tool_choice=True,
             streaming=True,
         ),
+        usage_dialect="deepseek",
         automatic_tool_choice=True,
         disable_thinking=True,
     ),
@@ -75,6 +79,7 @@ _PROVIDER_PROFILES = {
             native_tool_calling=True,
             streaming=True,
         ),
+        usage_dialect="openai",
         automatic_tool_choice=True,
     ),
 }
@@ -246,8 +251,7 @@ class OpenAICompatibleProvider:
             function["strict"] = True
         return {"type": "function", "function": function}
 
-    @classmethod
-    def _extract_response(cls, response: dict[str, object]) -> ProviderResponse:
+    def _extract_response(self, response: dict[str, object]) -> ProviderResponse:
         try:
             choices = response["choices"]
             if not isinstance(choices, list) or not choices:
@@ -263,7 +267,7 @@ class OpenAICompatibleProvider:
             if not isinstance(raw_tool_calls, list):
                 raise TypeError
             tool_calls = tuple(
-                cls._parse_tool_call(raw_call) for raw_call in raw_tool_calls
+                self._parse_tool_call(raw_call) for raw_call in raw_tool_calls
             )
             if content is not None and not isinstance(content, str):
                 raise TypeError
@@ -276,11 +280,50 @@ class OpenAICompatibleProvider:
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                usage=self._extract_usage(response),
             )
         except ProviderProtocolError:
             raise
         except (KeyError, TypeError, IndexError, ValueError) as exc:
             raise ProviderProtocolError("模型服务响应格式不正确") from exc
+
+    def _extract_usage(self, response: dict[str, object]) -> TokenUsage | None:
+        raw_usage = response.get("usage")
+        if not isinstance(raw_usage, dict):
+            return None
+
+        input_tokens = _optional_token_count(raw_usage.get("prompt_tokens"))
+        output_tokens = _optional_token_count(raw_usage.get("completion_tokens"))
+        cached_tokens: int | None = None
+        cache_miss_tokens: int | None = None
+        if self._profile.usage_dialect == "deepseek":
+            cached_tokens = _optional_token_count(
+                raw_usage.get("prompt_cache_hit_tokens")
+            )
+            cache_miss_tokens = _optional_token_count(
+                raw_usage.get("prompt_cache_miss_tokens")
+            )
+        else:
+            details = raw_usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                cached_tokens = _optional_token_count(details.get("cached_tokens"))
+
+        if all(
+            value is None
+            for value in (
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cache_miss_tokens,
+            )
+        ):
+            return None
+        return TokenUsage(
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_miss_tokens,
+        )
 
     @staticmethod
     def _parse_tool_call(raw_call: object) -> ToolCall:
@@ -307,6 +350,10 @@ class OpenAICompatibleProvider:
             return ToolCall(id=call_id, name=name, arguments=arguments)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderProtocolError("模型服务工具调用格式不正确") from exc
+
+
+def _optional_token_count(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
 
 
 def _openai_compatible_factory(

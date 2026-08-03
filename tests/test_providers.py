@@ -7,6 +7,7 @@ from tricoder.models import (
     Message,
     ProviderConfig,
     ProviderResponse,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
 )
@@ -112,6 +113,88 @@ WEATHER_TOOL = ToolDefinition(
 
 
 class ProviderTests(unittest.TestCase):
+    def test_normalizes_usage_for_each_provider_dialect(self) -> None:
+        cases = {
+            "openai": (
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 75},
+                },
+                TokenUsage(100, 20, 75, None),
+            ),
+            "deepseek": (
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_cache_hit_tokens": 70,
+                    "prompt_cache_miss_tokens": 30,
+                },
+                TokenUsage(100, 20, 70, 30),
+            ),
+            "glm": (
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 65},
+                },
+                TokenUsage(100, 20, 65, None),
+            ),
+        }
+
+        for provider_name, (usage, expected) in cases.items():
+            with self.subTest(provider=provider_name):
+                provider, _ = make_provider(
+                    provider_name,
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": usage,
+                    },
+                )
+
+                response = provider.complete([Message("user", "hello")], [])
+
+                self.assertEqual(expected, response.usage)
+
+    def test_ignores_malformed_optional_usage_without_rejecting_content(self) -> None:
+        malformed_usages = (
+            {"prompt_tokens": True},
+            {"completion_tokens": "20"},
+            {"prompt_tokens_details": {"cached_tokens": -1}},
+        )
+
+        for usage in malformed_usages:
+            with self.subTest(usage=usage):
+                provider, _ = make_provider(
+                    "openai",
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": usage,
+                    },
+                )
+
+                response = provider.complete([Message("user", "hello")], [])
+
+                self.assertEqual("ok", response.content)
+                self.assertIsNone(response.usage)
+
+    def test_preserves_valid_partial_usage_fields(self) -> None:
+        provider, _ = make_provider(
+            "deepseek",
+            {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "prompt_cache_miss_tokens": 30,
+                    "prompt_cache_hit_tokens": "70",
+                },
+            },
+        )
+
+        response = provider.complete([Message("user", "hello")], [])
+
+        self.assertEqual(TokenUsage(100, None, None, 30), response.usage)
+
     def test_factory_selects_each_registered_provider_profile(self) -> None:
         """防止共享 Factory 忽略厂商名称并退回无能力的通用档案。"""
         expected_capabilities = {
