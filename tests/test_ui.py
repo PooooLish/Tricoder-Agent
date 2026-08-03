@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
-from tricoder.models import AppConfig, ProviderConfig, RunResult, ToolAction, ToolResult
+from tricoder.models import AppConfig, ProviderConfig, RunResult, TokenUsage, ToolAction, ToolResult
 from tricoder.models import SessionRecord
 from tricoder.ui import TerminalUI
 
@@ -29,6 +29,51 @@ def recording_ui(*, answers: list[str] | None = None) -> tuple[TerminalUI, Conso
 
 
 class TerminalUITests(unittest.TestCase):
+    def test_provider_usage_renders_each_round_cache_metrics(self) -> None:
+        """缺少每轮缓存用量展示时，用户无法判断本轮缓存命中情况。"""
+        ui, console = recording_ui()
+
+        ui.on_provider_usage(2, TokenUsage(1_000, 50, 800, 200))
+
+        text = console.export_text()
+        self.assertIn("第 2 轮用量", text)
+        self.assertIn("输入 1,000", text)
+        self.assertIn("缓存 800", text)
+        self.assertIn("80.0%", text)
+        self.assertIn("输出 50", text)
+
+    def test_final_panels_render_cumulative_cache_usage(self) -> None:
+        """最终面板遗漏累计用量时，用户无法查看整次运行的缓存命中率。"""
+        ui, console = recording_ui()
+        result = RunResult(
+            True,
+            "任务完成",
+            2,
+            usage=TokenUsage(1_000, 50, 800, 200),
+        )
+
+        ui.show_run_result(result)
+        ui.show_complete(result, Path("runtime/runs/example.jsonl"))
+
+        text = console.export_text()
+        self.assertGreaterEqual(text.count("累计用量"), 2)
+        self.assertIn("缓存 800 (80.0%)", text)
+
+    def test_usage_rendering_keeps_unknown_counts_and_zero_input_ratio_safe(self) -> None:
+        """未知输入或输出、以及零输入时，展示必须保留未知值且不触发除零。"""
+        ui, console = recording_ui()
+        usage = TokenUsage(None, None, 12, None)
+
+        ui.on_provider_usage(1, usage)
+        ui.show_complete(RunResult(True, "完成", 1, usage=usage), Path("runtime/run.jsonl"))
+        ui.show_run_result(RunResult(True, "完成", 1, usage=TokenUsage(0, 3, 0, 0)))
+
+        text = console.export_text()
+        self.assertIn("输入 -", text)
+        self.assertIn("缓存 12 (-)", text)
+        self.assertIn("输出 -", text)
+        self.assertIn("缓存 0 (-)", text)
+
     def test_shell_methods_render_literal_status_and_validate_choices(self) -> None:
         """Shell UI 要显示 Session 状态，并将无效编号安全地留在本地。"""
         ui, console = recording_ui(answers=["9", "2", "3", "yes", "no"])

@@ -14,13 +14,28 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from tricoder.models import AppConfig, RunResult, SessionRecord, ToolAction, ToolResult
+from tricoder.models import AppConfig, RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 
 _PROVIDER_LABELS = {
     "openai": "OpenAI",
     "deepseek": "DeepSeek",
     "glm": "GLM",
 }
+
+
+def _format_token_usage(usage: TokenUsage) -> str:
+    """格式化可缺失的 token 用量，避免未知数据被误显示为零。"""
+
+    def count(value: int | None) -> str:
+        return "-" if value is None else f"{value:,}"
+
+    ratio = usage.cache_hit_ratio
+    ratio_text = "-" if ratio is None else f"{ratio:.1%}"
+    return (
+        f"输入 {count(usage.input_tokens)} · "
+        f"缓存 {count(usage.cached_tokens)} ({ratio_text}) · "
+        f"输出 {count(usage.output_tokens)}"
+    )
 
 
 def _safe_base_url(value: str) -> str:
@@ -260,6 +275,8 @@ class TerminalUI:
         table.add_row("摘要", Text(result.summary))
         table.add_row("修改文件", str(len(result.modified_files)))
         table.add_row("验证结果", Text(result.verification))
+        if result.usage is not None:
+            table.add_row("累计用量", Text(_format_token_usage(result.usage)))
         color = "green" if result.ok else "red"
         title = "✓ 任务完成" if result.ok else "✗ 任务未完成"
         self.console.print(
@@ -282,6 +299,8 @@ class TerminalUI:
         table.add_row("修改文件", str(len(result.modified_files)))
         table.add_row("验证结果", result.verification)
         table.add_row("模型轮数", str(result.rounds))
+        if result.usage is not None:
+            table.add_row("累计用量", Text(_format_token_usage(result.usage)))
         table.add_row("审计轨迹", Text(str(audit_path)))
         color = "green" if result.ok else "red"
         title = "✓ 任务完成" if result.ok else "✗ 任务未完成"
@@ -334,6 +353,11 @@ class TerminalUI:
             self._status.start()
         else:
             self.console.print(Text(message, style="cyan"))
+
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None:
+        """在每轮模型响应完成后输出本轮缓存与 token 用量。"""
+        self._stop_status()
+        self.console.print(Text(f"第 {round_number} 轮用量 · {_format_token_usage(usage)}", style="cyan"))
 
     def on_action(self, action: ToolAction) -> None:
         self._stop_status()
