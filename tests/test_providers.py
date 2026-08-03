@@ -17,6 +17,7 @@ from tricoder.providers import (
     ProviderError,
     ProviderProtocolError,
     UrllibTransport,
+    _stable_json_bytes,
     create_provider,
 )
 from tricoder.tools import ToolContext, ToolRegistry
@@ -421,7 +422,7 @@ class ProviderTests(unittest.TestCase):
                             "type": "function",
                             "function": {
                                 "name": "read_file",
-                                "arguments": '{"path": "README.md"}',
+                                "arguments": '{"path":"README.md"}',
                             },
                         }
                     ],
@@ -433,6 +434,71 @@ class ProviderTests(unittest.TestCase):
                 },
             ],
             transport.calls[0]["payload"]["messages"],  # type: ignore[index]
+        )
+
+    def test_serializes_tools_in_name_order_regardless_of_input_order(self) -> None:
+        """防止相同工具集因调用方传入顺序不同而产生不同请求前缀。"""
+        alpha_tool = ToolDefinition(
+            name="alpha",
+            description="alphabetically first",
+            parameters={"type": "object", "properties": {}},
+        )
+        provider, transport = make_provider(
+            "openai",
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+        transport.responses.append(
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+        provider.complete([Message("user", "hello")], [WEATHER_TOOL, alpha_tool])
+        provider.complete([Message("user", "hello")], [alpha_tool, WEATHER_TOOL])
+
+        first_tools = transport.calls[0]["payload"]["tools"]  # type: ignore[index]
+        second_tools = transport.calls[1]["payload"]["tools"]  # type: ignore[index]
+        self.assertEqual(first_tools, second_tools)
+        self.assertEqual(
+            ["alpha", "weather"],
+            [tool["function"]["name"] for tool in first_tools],  # type: ignore[index,union-attr]
+        )
+
+    def test_serializes_tool_call_arguments_with_stable_key_order(self) -> None:
+        """防止 ToolCall 参数的插入顺序改变发送给 Provider 的 JSON 字符串。"""
+        first_message = Message(
+            "assistant",
+            None,
+            tool_calls=(ToolCall("call-1", "weather", {"city": "北京", "unit": "c"}),),
+        )
+        second_message = Message(
+            "assistant",
+            None,
+            tool_calls=(ToolCall("call-1", "weather", {"unit": "c", "city": "北京"}),),
+        )
+
+        first_arguments = OpenAICompatibleProvider._serialize_message(first_message)[
+            "tool_calls"
+        ][0]["function"]["arguments"]  # type: ignore[index]
+        second_arguments = OpenAICompatibleProvider._serialize_message(second_message)[
+            "tool_calls"
+        ][0]["function"]["arguments"]  # type: ignore[index]
+
+        self.assertEqual(first_arguments, second_arguments)
+        self.assertEqual('{"city":"北京","unit":"c"}', first_arguments)
+
+    def test_stable_json_bytes_uses_sorted_utf8_compact_encoding(self) -> None:
+        """防止字典插入顺序或 ASCII 转义改变 Provider 的请求字节。"""
+        first_payload = {"模型": "测试", "options": {"b": 2, "a": 1}}
+        second_payload = {"options": {"a": 1, "b": 2}, "模型": "测试"}
+
+        first_bytes = _stable_json_bytes(first_payload)
+        second_bytes = _stable_json_bytes(second_payload)
+
+        self.assertEqual(first_bytes, second_bytes)
+        self.assertEqual(
+            b'{"options":{"a":1,"b":2},"\xe6\xa8\xa1\xe5\x9e\x8b":"\xe6\xb5\x8b\xe8\xaf\x95"}',
+            first_bytes,
         )
 
     def test_parses_native_tool_calls_into_unified_response(self) -> None:
@@ -620,7 +686,7 @@ class ProviderTests(unittest.TestCase):
         payload = transport.calls[0]["payload"]
         serialized_tools = payload["tools"]  # type: ignore[index]
         self.assertEqual(
-            [definition.name for definition in definitions],
+            sorted(definition.name for definition in definitions),
             [
                 tool["function"]["name"]  # type: ignore[index]
                 for tool in serialized_tools  # type: ignore[union-attr]
@@ -671,7 +737,7 @@ class ProviderTests(unittest.TestCase):
                             "type": "function",
                             "function": {
                                 "name": "weather",
-                                "arguments": '{"city": "深圳"}',
+                                "arguments": '{"city":"深圳"}',
                             },
                         }
                     ],

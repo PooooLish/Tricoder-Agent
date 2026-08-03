@@ -94,6 +94,16 @@ class JsonTransport(Protocol):
         """发送 JSON POST 请求并返回解析后的对象。"""
 
 
+def _stable_json_bytes(payload: dict[str, object]) -> bytes:
+    """以固定键顺序和 UTF-8 编码生成可复用的请求字节。"""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 class UrllibTransport:
     """使用 Python 标准库实现的 HTTPS JSON 传输。"""
 
@@ -106,7 +116,7 @@ class UrllibTransport:
     ) -> dict[str, object]:
         request = urllib.request.Request(
             url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=_stable_json_bytes(payload),
             headers=headers,
             method="POST",
         )
@@ -190,7 +200,8 @@ class OpenAICompatibleProvider:
         if self._profile.disable_thinking:
             payload["thinking"] = {"type": "disabled"}
         if tools and self.capabilities.native_tool_calling:
-            payload["tools"] = [self._serialize_tool(tool) for tool in tools]
+            ordered_tools = sorted(tools, key=lambda tool: tool.name)
+            payload["tools"] = [self._serialize_tool(tool) for tool in ordered_tools]
             if self._profile.automatic_tool_choice:
                 payload["tool_choice"] = "auto"
             if self.capabilities.parallel_tool_calls:
@@ -232,6 +243,8 @@ class OpenAICompatibleProvider:
                         "arguments": json.dumps(
                             call.arguments,
                             ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
                         ),
                     },
                 }
