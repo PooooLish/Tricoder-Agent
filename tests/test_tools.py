@@ -321,10 +321,16 @@ class PosixSemanticsBinding:
 
 
 def patch_posix_semantics_binding() -> object:
-    def open_posix_semantics(workspace: Path, parent: Path) -> PosixSemanticsBinding:
-        return PosixSemanticsBinding(
-            tools_module._WindowsDirectoryBinding(workspace, parent)
-        )
+    real_open = tools_module._DirectoryBinding.open
+
+    def open_posix_semantics(workspace: Path, parent: Path) -> object:
+        # Windows 需要测试替身模拟 POSIX 的 rename/unlink 语义；Linux/macOS
+        # 已经具备真实的 POSIX 目录句柄，直接复用生产实现即可。
+        if os.name == "nt":
+            return PosixSemanticsBinding(
+                tools_module._WindowsDirectoryBinding(workspace, parent)
+            )
+        return real_open(workspace, parent)
 
     return patch.object(
         tools_module._DirectoryBinding,
@@ -2186,7 +2192,9 @@ class ToolTests(unittest.TestCase):
                 state["closed"] = True
 
         def fail_second_open(workspace: Path, parent: Path) -> object:
-            if parent == other_parent:
+            # Windows 临时目录可能同时出现短路径和规范路径；按目录身份判断，
+            # 避免同一目录仅因文本表示不同而漏掉故障注入。
+            if parent.samefile(other_parent):
                 raise OSError("SECOND-OPEN-SENTINEL")
             binding = TrackingBinding(real_open(workspace, parent))
             opened.append(binding)
@@ -2376,6 +2384,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(app_before.content, app.read_text(encoding="utf-8"))
         self.assertEqual(other_after, self._file_snapshot(other, "src/other.py"))
 
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 会在覆盖只读目标前主动解锁")
     def test_failure_after_unlocking_read_only_target_restores_exact_after_snapshot(self) -> None:
         target = self.workspace / "src" / "app.py"
         os.chmod(target, 0o600)
