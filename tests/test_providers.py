@@ -819,7 +819,13 @@ class ProviderTests(unittest.TestCase):
             provider.complete([Message("user", "检查工作区")], definitions)
 
         self.assertEqual(
-            {"list_files.path", "search_text.path", "run_command.cwd"},
+            {
+                "list_files.path",
+                "search_text.path",
+                "search_text.use_regex",
+                "glob_files.path",
+                "run_command.cwd",
+            },
             optional_fields,
         )
         payload = transport.calls[0]["payload"]

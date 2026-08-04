@@ -9,7 +9,7 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 
 - **统一 Provider 边界**：OpenAI、DeepSeek、GLM 响应统一归一化为内部 `ProviderResponse` 与 `ToolCall`。
 - **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
-- **可控本地执行**：读取、编辑、创建文件和运行受限命令；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；`--read-only` 禁止 `edit_file`、`create_file`、`apply_patch` 等写入；写操作与命令执行需要人工审批。
+- **可控本地执行**：读取、检索（`search_text` 支持正则、基础 `.gitignore` 常用语义（尾随 `/` 目录规则按任意层级匹配）与二进制/超大文件跳过，正则长度与单行长度受限以防灾难性回溯；`glob_files` 按相对模式定位文件，pattern 长度、`**` 数量与扫描结果规模均受限）、编辑、创建文件和运行受限命令；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；`--read-only` 禁止 `edit_file`、`create_file`、`apply_patch` 等写入；写操作与命令执行需要人工审批。
 - **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态。
 - **本地斜杠命令**：`/session`、`/model`、`/status`、`/clear` 等命令不会发送给 Provider。
 - **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。

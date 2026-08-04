@@ -1,4 +1,4 @@
-import os
+﻿import os
 import stat
 import tempfile
 import unittest
@@ -18,6 +18,9 @@ from tricoder.changes import (
 from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
+from tricoder.tools import binding as binding_module
+from tricoder.tools import write as write_module
+from tricoder.tools.handlers import ToolHandler
 
 
 class CloseFailingBinding:
@@ -35,7 +38,7 @@ class CloseFailingBinding:
 
 
 def patch_binding_close_failure() -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_failing_close(workspace: Path, parent: Path) -> CloseFailingBinding:
         return CloseFailingBinding(real_open(workspace, parent))
@@ -64,7 +67,7 @@ class CleanupFailingBinding:
 
 
 def patch_binding_cleanup_failure(target: Path) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_failing_cleanup(
         workspace: Path,
@@ -101,7 +104,7 @@ class PublishFailingBinding:
 
 
 def patch_binding_publish_failure(*, rollback_fails: bool = False) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_publish_failure(
         workspace: Path,
@@ -145,7 +148,7 @@ class NewFileCompensationProbeBinding(PublishFailingBinding):
 def patch_new_file_compensation_probe(
     state: dict[str, object],
 ) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_probe(workspace: Path, parent: Path) -> NewFileCompensationProbeBinding:
         return NewFileCompensationProbeBinding(real_open(workspace, parent), state)
@@ -183,7 +186,7 @@ class ExternalReplacementBinding:
 def patch_external_replacement_before_compensation(
     state: dict[str, object],
 ) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_external_replace(
         workspace: Path,
@@ -240,7 +243,7 @@ class LateCommitRaceBinding:
 
 
 def patch_late_commit_race(*, stage: str, target: str, content: str) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_late_race(workspace: Path, parent: Path) -> LateCommitRaceBinding:
         return LateCommitRaceBinding(
@@ -282,7 +285,7 @@ class PostChmodReadFailingBinding:
 
 
 def patch_post_chmod_read_failure() -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_read_failure(
         workspace: Path,
@@ -321,7 +324,7 @@ class PosixSemanticsBinding:
 
 
 def patch_posix_semantics_binding() -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_posix_semantics(workspace: Path, parent: Path) -> object:
         # Windows 需要测试替身模拟 POSIX 的 rename/unlink 语义；Linux/macOS
@@ -380,7 +383,7 @@ def patch_replace_after_backup_link(
     external_mode: int,
     probes: list[ReplaceAfterBackupLinkBinding],
 ) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_replacement(
         workspace: Path,
@@ -427,7 +430,7 @@ class ReadFailingAfterSuccessfulReplaceBinding:
 
 
 def patch_read_failure_after_successful_replace() -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_read_failure(
         workspace: Path,
@@ -473,7 +476,7 @@ class UndoCreatePublishFailureBinding:
 
 
 def patch_undo_create_publish_failure(stage: str) -> object:
-    real_open = tools_module._DirectoryBinding.open
+    real_open = binding_module._DirectoryBinding.open
 
     def open_with_publish_failure(
         workspace: Path,
@@ -530,6 +533,7 @@ class ToolTests(unittest.TestCase):
                 "list_files",
                 "read_file",
                 "search_text",
+                "glob_files",
                 "edit_file",
                 "create_file",
                 "apply_patch",
@@ -549,8 +553,19 @@ class ToolTests(unittest.TestCase):
             "list_files": ({"path": {"type": "string"}}, []),
             "read_file": ({"path": {"type": "string"}}, ["path"]),
             "search_text": (
-                {"path": {"type": "string"}, "query": {"type": "string"}},
+                {
+                    "path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "use_regex": {"type": "boolean"},
+                },
                 ["query"],
+            ),
+            "glob_files": (
+                {
+                    "path": {"type": "string"},
+                    "pattern": {"type": "string"},
+                },
+                ["pattern"],
             ),
             "edit_file": (
                 {
@@ -636,6 +651,128 @@ class ToolTests(unittest.TestCase):
         self.assertIn("src", search.output)
         self.assertIn("app.py:2", search.output)
         self.assertEqual([], self.approver.requests)
+
+    def test_glob_files_matches_relative_patterns_and_hides_sensitive_paths(self) -> None:
+        """glob 输出规范相对路径、目录带后缀、`**` 递归，且隐藏敏感路径。"""
+        (self.workspace / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (self.workspace / "src" / "util.py").write_text("y = 2\n", encoding="utf-8")
+        (self.workspace / "src" / "sub").mkdir()
+        (self.workspace / "src" / "sub" / "mod.py").write_text("m = 1\n", encoding="utf-8")
+        (self.workspace / "notes.txt").write_text("z\n", encoding="utf-8")
+        (self.workspace / ".env").write_text("SECRET=1\n", encoding="utf-8")
+
+        all_result = self.registry.execute("glob_files", {"pattern": "**/*"})
+        self.assertTrue(all_result.ok, all_result.output)
+        self.assertIn("src/app.py", all_result.output)
+        self.assertIn("src/util.py", all_result.output)
+        self.assertIn("notes.txt", all_result.output)
+        self.assertNotIn(".env", all_result.output)
+
+        py_result = self.registry.execute("glob_files", {"pattern": "src/*.py"})
+        self.assertTrue(py_result.ok)
+        self.assertIn("src/app.py", py_result.output)
+        self.assertIn("src/util.py", py_result.output)
+        self.assertNotIn("notes.txt", py_result.output)
+
+        dir_result = self.registry.execute("glob_files", {"pattern": "src/*"})
+        self.assertTrue(dir_result.ok)
+        self.assertIn("src/sub/", dir_result.output.splitlines())
+
+    def test_glob_files_rejects_escaping_or_absolute_patterns(self) -> None:
+        """越界或绝对 glob 模式必须被拒绝，不能触碰工作区外路径。"""
+        for pattern in ("../outside/*", "/etc/passwd", "C:\\outside\\*", "..\\x"):
+            with self.subTest(pattern=pattern):
+                result = self.registry.execute("glob_files", {"pattern": pattern})
+                self.assertFalse(result.ok)
+                self.assertNotIn("outside", result.output)
+
+    def test_search_text_supports_regex_and_skips_ignored_binary_large_files(
+        self,
+    ) -> None:
+        """正则搜索可用，二进制与超大文件被跳过，.gitignore 规则被尊重。"""
+        (self.workspace / "README.md").write_text(
+            "alpha v1.2\nbeta\n", encoding="utf-8"
+        )
+        (self.workspace / "ignored_dir").mkdir()
+        (self.workspace / "ignored_dir" / "secret.txt").write_text(
+            "should not appear\n", encoding="utf-8"
+        )
+        (self.workspace / ".gitignore").write_text(
+            "ignored_dir/\n*.log\n", encoding="utf-8"
+        )
+        (self.workspace / "app.log").write_text("noise\n", encoding="utf-8")
+        (self.workspace / "binary.bin").write_bytes(b"\x00\x01\x02target\x00")
+        (self.workspace / "huge.txt").write_text(
+            "big\n" * 50,
+            encoding="utf-8",
+        )
+        self.registry.context.max_search_file_bytes = 200
+
+        regex_result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": r"v\d+\.\d+", "use_regex": True},
+        )
+        self.assertTrue(regex_result.ok, regex_result.output)
+        self.assertIn("README.md:1", regex_result.output)
+
+        ignored_result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "should not appear"},
+        )
+        self.assertTrue(ignored_result.ok)
+        self.assertNotIn("ignored_dir", ignored_result.output)
+
+        log_result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "noise"},
+        )
+        self.assertTrue(log_result.ok)
+        self.assertNotIn("app.log", log_result.output)
+
+        binary_result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "target"},
+        )
+        self.assertTrue(binary_result.ok)
+        self.assertNotIn("binary.bin", binary_result.output)
+
+        large_result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "big"},
+        )
+        self.assertTrue(large_result.ok)
+        self.assertNotIn("huge.txt", large_result.output)
+
+    def test_glob_files_rejects_unbounded_patterns(self) -> None:
+        """过长模式或过多 ** 会放大扫描规模，必须拒绝。"""
+        for pattern in ("x" * 300, "**/**/**/*.py"):
+            with self.subTest(pattern=pattern):
+                result = self.registry.execute("glob_files", {"pattern": pattern})
+                self.assertFalse(result.ok)
+
+    def test_search_text_limits_regex_and_ignores_build_directories(self) -> None:
+        """正则长度受限防灾难性回溯；`build/` 规则忽略任意层级同名目录。"""
+        overlong = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "a" * 300, "use_regex": True},
+        )
+        self.assertFalse(overlong.ok)
+        self.assertIn("过长", overlong.output)
+
+        (self.workspace / "build").mkdir()
+        (self.workspace / "src" / "build").mkdir()
+        (self.workspace / "build" / "root.txt").write_text("trace\n", encoding="utf-8")
+        (self.workspace / "src" / "build" / "nested.txt").write_text(
+            "trace\n", encoding="utf-8"
+        )
+        (self.workspace / ".gitignore").write_text("build/\n", encoding="utf-8")
+
+        result = self.registry.execute(
+            "search_text",
+            {"path": ".", "query": "trace"},
+        )
+        self.assertTrue(result.ok)
+        self.assertNotIn("build/", result.output)
 
     def test_edit_requires_approval_and_writes_exact_replacement(self) -> None:
         """防止模型在用户未确认时写文件，并捕获替换错位。"""
@@ -1141,7 +1278,7 @@ class ToolTests(unittest.TestCase):
                 side_effect=OSError(f"{absolute_sentinel} {temporary_sentinel}"),
             ),
             patch.object(
-                ToolRegistry,
+                ToolHandler,
                 "_snapshot",
                 side_effect=UnicodeError(unicode_sentinel),
             ),
@@ -1424,7 +1561,7 @@ class ToolTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 with patch.object(
-                    tools_module,
+                    write_module,
                     "parse_unified_diff",
                     side_effect=AssertionError("read-only must not parse patch text"),
                 ):
@@ -1452,7 +1589,7 @@ class ToolTests(unittest.TestCase):
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
                 with patch.object(
-                    tools_module,
+                    write_module,
                     "parse_unified_diff",
                     side_effect=AssertionError("invalid arguments must not parse patch text"),
                 ):
@@ -1832,7 +1969,7 @@ class ToolTests(unittest.TestCase):
         """防止不可覆盖发布不可用时降级为可见空文件或覆盖写入。"""
         target = self.workspace / "src" / "no-link.py"
 
-        with patch("tricoder.tools.os.link", side_effect=OSError("hard links unavailable")):
+        with patch("tricoder.tools.binding.os.link", side_effect=OSError("hard links unavailable")):
             result = self.registry.execute(
                 "create_file",
                 {"path": "src/no-link.py", "content": "complete = True\n"},
@@ -1849,8 +1986,8 @@ class ToolTests(unittest.TestCase):
         limited_support = {os.open, os.link, os.unlink, os.stat}
 
         with (
-            patch("tricoder.tools._is_windows", return_value=False, create=True),
-            patch("tricoder.tools.os.supports_dir_fd", limited_support),
+            patch("tricoder.tools.binding._is_windows", return_value=False, create=True),
+            patch("tricoder.tools.binding.os.supports_dir_fd", limited_support),
         ):
             result = self.registry.execute(
                 "create_file",
@@ -1915,7 +2052,7 @@ class ToolTests(unittest.TestCase):
         journal = ChangeJournal()
         journal.begin_task((), "not-run")
         self.registry.context.change_journal = journal
-        real_snapshot = ToolRegistry._snapshot
+        real_snapshot = ToolHandler._snapshot
 
         def fail_published_target_read(
             binding: object,
@@ -1927,8 +2064,8 @@ class ToolTests(unittest.TestCase):
             return real_snapshot(binding, name, relative)  # type: ignore[arg-type]
 
         with patch.object(
-            ToolRegistry,
-            "_snapshot",
+                ToolHandler,
+                "_snapshot",
             side_effect=fail_published_target_read,
         ):
             result = self.registry.execute(
@@ -1961,7 +2098,7 @@ class ToolTests(unittest.TestCase):
         journal = ChangeJournal()
         journal.begin_task((), "not-run")
         self.registry.context.change_journal = journal
-        real_snapshot = ToolRegistry._snapshot
+        real_snapshot = ToolHandler._snapshot
 
         def fail_published_target_read(
             binding: object,
@@ -1973,8 +2110,8 @@ class ToolTests(unittest.TestCase):
             return real_snapshot(binding, name, relative)  # type: ignore[arg-type]
 
         with patch.object(
-            ToolRegistry,
-            "_snapshot",
+                ToolHandler,
+                "_snapshot",
             side_effect=fail_published_target_read,
         ):
             result = self.registry.execute(
@@ -2002,7 +2139,7 @@ class ToolTests(unittest.TestCase):
         journal = ChangeJournal()
         journal.begin_task((), "not-run")
         self.registry.context.change_journal = journal
-        real_snapshot = ToolRegistry._snapshot
+        real_snapshot = ToolHandler._snapshot
 
         def fail_published_target_read(
             binding: object,
@@ -2015,7 +2152,7 @@ class ToolTests(unittest.TestCase):
 
         with patch_binding_cleanup_failure(target):
             with patch.object(
-                ToolRegistry,
+                ToolHandler,
                 "_snapshot",
                 side_effect=fail_published_target_read,
             ):
@@ -2067,7 +2204,7 @@ class ToolTests(unittest.TestCase):
         self.registry.context.change_journal = journal
 
         with patch.object(
-            self.registry,
+            ToolHandler,
             "_record_committed",
             side_effect=RuntimeError("simulated post-commit record failure"),
         ):
@@ -2176,7 +2313,7 @@ class ToolTests(unittest.TestCase):
                 self._file_snapshot(other, "z-other/other.py"),
             ),
         )
-        real_open = tools_module._DirectoryBinding.open
+        real_open = binding_module._DirectoryBinding.open
         state = {"closed": False}
         opened: list[object] = []
 
@@ -2402,14 +2539,14 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(after, self._file_snapshot(target, "src/app.py"))
 
     def test_posix_binding_chmod_uses_nofollow_descriptor_and_fchmod(self) -> None:
-        binding = object.__new__(tools_module._PosixDirectoryBinding)
+        binding = object.__new__(binding_module._PosixDirectoryBinding)
         binding._fd = 71
         with (
-            patch.object(tools_module.os, "O_NOFOLLOW", 0x200000, create=True),
-            patch.object(tools_module.os, "open", return_value=72) as opened,
-            patch.object(tools_module.os, "fchmod", create=True) as fchmod,
-            patch.object(tools_module.os, "close") as closed,
-            patch.object(tools_module.os, "chmod") as path_chmod,
+            patch.object(binding_module.os, "O_NOFOLLOW", 0x200000, create=True),
+            patch.object(binding_module.os, "open", return_value=72) as opened,
+            patch.object(binding_module.os, "fchmod", create=True) as fchmod,
+            patch.object(binding_module.os, "close") as closed,
+            patch.object(binding_module.os, "chmod") as path_chmod,
         ):
             binding.chmod("app.py", 0o640)
 
@@ -2429,42 +2566,42 @@ class ToolTests(unittest.TestCase):
             os.stat,
         }
         with (
-            patch.object(tools_module, "_is_windows", return_value=False),
-            patch.object(tools_module.os, "supports_dir_fd", supported),
-            patch.object(tools_module.os, "fchmod", None, create=True),
-            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+            patch.object(binding_module, "_is_windows", return_value=False),
+            patch.object(binding_module.os, "supports_dir_fd", supported),
+            patch.object(binding_module.os, "fchmod", None, create=True),
+            patch.object(binding_module, "_PosixDirectoryBinding") as constructor,
         ):
             with self.assertRaises(tools_module.PolicyError):
-                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+                binding_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
 
         constructor.assert_not_called()
 
     def test_posix_binding_rejects_zero_nofollow_flag_before_opening(self) -> None:
         supported = {os.rename, os.open, os.link, os.unlink, os.stat}
         with (
-            patch.object(tools_module, "_is_windows", return_value=False),
-            patch.object(tools_module.os, "supports_dir_fd", supported),
-            patch.object(tools_module.os, "fchmod", create=True),
-            patch.object(tools_module.os, "O_NOFOLLOW", 0, create=True),
-            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+            patch.object(binding_module, "_is_windows", return_value=False),
+            patch.object(binding_module.os, "supports_dir_fd", supported),
+            patch.object(binding_module.os, "fchmod", create=True),
+            patch.object(binding_module.os, "O_NOFOLLOW", 0, create=True),
+            patch.object(binding_module, "_PosixDirectoryBinding") as constructor,
         ):
             with self.assertRaises(tools_module.PolicyError):
-                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+                binding_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
 
         constructor.assert_not_called()
 
     def test_posix_binding_rejects_missing_nofollow_flag_before_opening(self) -> None:
         supported = {os.rename, os.open, os.link, os.unlink, os.stat}
         with (
-            patch.object(tools_module, "_is_windows", return_value=False),
-            patch.object(tools_module.os, "supports_dir_fd", supported),
-            patch.object(tools_module.os, "fchmod", create=True),
-            patch.dict(tools_module.os.__dict__, {}, clear=False),
-            patch.object(tools_module, "_PosixDirectoryBinding") as constructor,
+            patch.object(binding_module, "_is_windows", return_value=False),
+            patch.object(binding_module.os, "supports_dir_fd", supported),
+            patch.object(binding_module.os, "fchmod", create=True),
+            patch.dict(binding_module.os.__dict__, {}, clear=False),
+            patch.object(binding_module, "_PosixDirectoryBinding") as constructor,
         ):
-            tools_module.os.__dict__.pop("O_NOFOLLOW", None)
+            binding_module.os.__dict__.pop("O_NOFOLLOW", None)
             with self.assertRaises(tools_module.PolicyError):
-                tools_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
+                binding_module._DirectoryBinding.open(self.workspace, self.workspace / "src")
 
         constructor.assert_not_called()
 
@@ -2476,7 +2613,7 @@ class ToolTests(unittest.TestCase):
 
         with (
             patch_posix_semantics_binding(),
-            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(binding_module, "_is_windows", return_value=False),
         ):
             execution = self.registry.undo_change_set(
                 self._change_set(FileChange("src/app.py", before, after))
@@ -2493,7 +2630,7 @@ class ToolTests(unittest.TestCase):
 
         with (
             patch_posix_semantics_binding(),
-            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(binding_module, "_is_windows", return_value=False),
         ):
             execution = self.registry.undo_change_set(
                 self._change_set(FileChange("src/created.py", None, after))
@@ -2511,7 +2648,7 @@ class ToolTests(unittest.TestCase):
 
         with (
             patch_posix_semantics_binding(),
-            patch.object(tools_module, "_is_windows", return_value=False),
+            patch.object(binding_module, "_is_windows", return_value=False),
         ):
             execution = self.registry.undo_change_set(
                 self._change_set(FileChange("src/app.py", before, after))
