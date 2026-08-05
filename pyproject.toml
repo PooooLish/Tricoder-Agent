@@ -9,6 +9,7 @@ description = "支持多模型与安全审批的轻量 Coding Agent"
 requires-python = ">=3.11"
 dependencies = [
     "rich>=15.0.0,<16",
+    "textual>=8.0.0,<9",
 ]
 
 [project.scripts]

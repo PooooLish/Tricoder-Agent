@@ -144,6 +144,14 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 
 裸 `tricoder` 使用当前目录作为工作区；`tricoder chat` 支持 `run` 的工作区、Provider、模型、密钥文件、审计目录、上下文预算、轮数、超时、只读与颜色选项，但没有任务位置参数。
 
+基于 Textual 的本地 TUI（组件化消息流、模态审批，安全边界与 `chat` 一致）：
+
+```powershell
+python -m tricoder tui --provider deepseek --workspace D:\path\to\project
+```
+
+`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。
+
 ## 交互命令与 Session
 
 斜杠命令始终只在本地处理，不会发送给 Provider：

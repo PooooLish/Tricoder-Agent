@@ -11,7 +11,7 @@ from typing import Callable, Mapping, TextIO
 
 from rich.console import Console
 
-from tricoder.agent import CodingAgent
+from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.config import ConfigError, load_config, provider_key_env
 from tricoder.models import ProviderConfig
@@ -78,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(run)
     chat = subparsers.add_parser("chat", help="进入持续交互会话")
     _add_chat_options(chat)
+    tui = subparsers.add_parser("tui", help="进入 Textual 交互 TUI")
+    _add_chat_options(tui)
     run.add_argument("--max-rounds", type=int, help="最大模型调用轮数")
     run.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     run.add_argument("--timeout", type=float, help="API 与命令超时秒数")
@@ -158,6 +160,13 @@ def main(
             input_fn=input_fn,
             session_store_factory=session_store_factory,
             shell_factory=shell_factory,
+        )
+    if args.command == "tui":
+        return _run_tui(
+            args,
+            environ=env,
+            provider_factory=provider_factory,
+            session_store_factory=session_store_factory,
         )
     try:
         config = load_config(
@@ -259,3 +268,47 @@ def _run_chat(
 
     shell = shell_factory(runtime, ui, input_fn=input_fn)
     return shell.run()
+
+
+def _run_tui(
+    args: argparse.Namespace,
+    *,
+    environ: Mapping[str, str],
+    provider_factory: ProviderFactory,
+    session_store_factory: SessionStoreFactory,
+) -> int:
+    """装配 Textual TUI；SQLite 或配置异常以稳定退出码结束。"""
+
+    # textual 是可选交互依赖，仅在此入口延迟导入，避免普通 CLI 被其影响。
+    from tricoder.tui import TricoderApp
+
+    try:
+        store = session_store_factory(default_sessions_db(environ))
+    except (SessionError, OSError, ValueError):
+        return 2
+
+    def runtime_factory(
+        observer: AgentObserver,
+        approver: Callable[[str, str], bool],
+    ) -> SessionRuntime:
+        return SessionRuntime(
+            store,
+            args.workspace,
+            options=RuntimeOptions(
+                environ=environ,
+                env_file=args.env_file,
+                audit_dir=args.audit_dir,
+                provider=args.provider,
+                model=args.model,
+                base_url=args.base_url,
+                max_rounds=args.max_rounds,
+                max_context_chars=args.max_context_chars,
+                timeout=args.timeout,
+                read_only=args.read_only,
+            ),
+            provider_factory=provider_factory,
+            approver=approver,
+            observer=observer,
+        )
+
+    return TricoderApp(runtime_factory).run()
