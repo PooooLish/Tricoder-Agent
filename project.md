@@ -63,15 +63,19 @@ provider-action protocols, and bound retrieval resources.
 - Completed: policy P0/P1 hardening + regression tests; launcher junction
   escape check + test; protocol delegation + `test_protocols.py`; glob/search
   resource bounds + gitignore basename fix + test fixes; README updates.
-- Verified locally: 403 tricoder tests pass, compileall OK, `test_opencode_v2`
-  3/3 OK. `test_workspace_tools`/`check_workspace` failures are pre-existing
-  and belong to `projects/seven-sins-roguelite-codex-starter`.
+- Completed: Textual TUI (`src/tricoder/tui.py`, `tricoder tui` entry) with
+  modal approval, thread-safe event stream, and pilot tests
+  (`tests/test_tui.py`, 3 tests). Dependency review recorded in
+  `docs/framework/tui-framework.md`.
+- Verified locally: 406 tricoder tests pass, compileall OK.
 
 ## Next Action
 
 - Confirm the full CI matrix (Linux/Windows, Python 3.11/3.12) once pushed.
 - Consider stage-two provider registry consolidation (key_env/base_url/model/
   label/choices in one place) to cut the 5-touchpoint provider onboarding.
+- TUI roadmap: `/session` cross-workspace switching, command-output paging,
+  worker cancellation on exit.
 
 ## Blockers
 
@@ -80,7 +84,7 @@ provider-action protocols, and bound retrieval resources.
 
 ## Verification
 
-- `.venv\Scripts\python -m unittest discover -s tests` → Ran 403, OK (1 skip:
+- `.venv\Scripts\python -m unittest discover -s tests` → Ran 406, OK (1 skip:
   Windows cannot create symlinks).
 - `.venv\Scripts\python -m compileall -q src tests` → OK.
 - `python -B capabilities/tools/test_opencode_v2.py` → 3 OK (includes junction
