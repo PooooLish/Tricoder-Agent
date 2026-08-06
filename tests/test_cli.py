@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tricoder.audit import AuditLogger
+from tricoder.agent import PLANNING_PROMPT
 from tricoder.cli import ConsoleApprover, build_parser, main
 from tricoder.models import (
     Message,
@@ -19,6 +20,20 @@ from tricoder.providers import ProviderError, ProviderProtocolError, create_prov
 from tricoder.sessions import SessionError, SessionStore
 
 
+def _planning_response(
+    messages: list[Message],
+    tools: tuple = (),
+) -> ProviderResponse | None:
+    """识别规划请求并透明返回固定计划，不污染 mock 记录。"""
+    if tools:
+        return None
+    if messages and getattr(messages[-1], "content", None) == PLANNING_PROMPT:
+        return ProviderResponse(
+            content='{"steps": ["第 1 步", "第 2 步", "第 3 步"]}'
+        )
+    return None
+
+
 class FinishingProvider:
     def __init__(self) -> None:
         self.messages: list[Message] = []
@@ -28,6 +43,9 @@ class FinishingProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.messages = list(messages)
         return ProviderResponse(
             tool_calls=(
@@ -53,6 +71,9 @@ class ScriptedProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.histories.append(list(messages))
         response = self.responses.pop(0)
         return ProviderResponse(
@@ -78,6 +99,9 @@ class LegacyFinishingProvider:
         _messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(_messages, tools)
+        if planning is not None:
+            return planning
         self.tool_batches.append(tuple(tools))
         return ProviderResponse(
             content=json.dumps(
@@ -97,9 +121,12 @@ class ProtocolFailingProvider:
 
     def complete(
         self,
-        _messages: list[Message],
+        messages: list[Message],
         _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, _tools)
+        if planning is not None:
+            return planning
         raise ProviderProtocolError("PROVIDER-PROTOCOL-SECRET-SENTINEL")
 
 
@@ -108,9 +135,12 @@ class ProviderFailingProvider:
 
     def complete(
         self,
-        _messages: list[Message],
+        messages: list[Message],
         _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, _tools)
+        if planning is not None:
+            return planning
         raise ProviderError("PROVIDER-ERROR-SECRET-SENTINEL")
 
 
@@ -186,6 +216,7 @@ class CliTests(unittest.TestCase):
                 "--max-context-chars", "100",
                 "--timeout", "2.5",
                 "--read-only",
+                "--no-plan",
                 "--no-color",
             ]
         )
@@ -194,6 +225,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual("glm", args.provider)
         self.assertEqual("glm-test", args.model)
         self.assertTrue(args.read_only)
+        self.assertTrue(args.no_plan)
 
     def test_root_help_does_not_create_interactive_dependencies(self) -> None:
         """防止 --help 意外创建 SQLite、运行时、Shell 或网络 Provider。"""

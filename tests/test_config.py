@@ -509,6 +509,51 @@ class ConfigTests(unittest.TestCase):
                                 environ={"OPENAI_API_KEY": "test-key"},
                             )
 
+    def test_plan_enabled_by_default(self) -> None:
+        """规划阶段默认开启。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai",
+                workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+            self.assertTrue(config.plan_enabled)
+
+    def test_plan_disabled_by_environment(self) -> None:
+        """TRICODER_PLAN=0 关闭规划阶段。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai",
+                workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key", "TRICODER_PLAN": "0"},
+            )
+            self.assertFalse(config.plan_enabled)
+
+    def test_plan_disabled_by_project_toml(self) -> None:
+        """项目 TOML 的 [agent] plan = false 关闭规划阶段。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                "[agent]\nplan = false\n", encoding="utf-8"
+            )
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+            self.assertFalse(config.plan_enabled)
+
+    def test_plan_explicit_argument_overrides_environment(self) -> None:
+        """显式 plan_enabled 参数优先于环境变量。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai",
+                workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key", "TRICODER_PLAN": "0"},
+                plan_enabled=True,
+            )
+            self.assertTrue(config.plan_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

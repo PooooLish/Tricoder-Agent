@@ -9,6 +9,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
+from tricoder.agent import PLANNING_PROMPT
 from tricoder.models import (
     AppConfig,
     Message,
@@ -93,6 +94,14 @@ class ScriptedProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        if (
+            not tools
+            and messages
+            and getattr(messages[-1], "content", None) == PLANNING_PROMPT
+        ):
+            return ProviderResponse(
+                content='{"steps": ["步骤 1", "步骤 2", "步骤 3"]}'
+            )
         self.histories.append(list(messages))
         self.tool_batches.append(tuple(tools))
         decoded = json.loads(self.responses.pop(0))
@@ -302,7 +311,7 @@ class SessionIntegrationTests(unittest.TestCase):
                     memory,
                     SessionContext(persisted_summary=memory.summary),
                     config,
-                    CodingAgent(provider, tools, max_rounds=5),
+                    CodingAgent(provider, tools, max_rounds=5, plan_enabled=False),
                 )
 
             store = SessionStore(database)

@@ -67,7 +67,10 @@ provider-action protocols, and bound retrieval resources.
   modal approval, thread-safe event stream, and pilot tests
   (`tests/test_tui.py`, 3 tests). Dependency review recorded in
   `docs/framework/tui-framework.md`.
-- Verified locally: 406 tricoder tests pass, compileall OK.
+- Completed: Planner-Executor (`agent.py` planning round 0 + plan injection +
+  degrade; `--no-plan`/`TRICODER_PLAN`/`[agent] plan` config; 5 agent + 4 config
+  tests). Design in `docs/framework/planner-executor.md`.
+- Verified locally: 415 tricoder tests pass, compileall OK.
 
 ## Next Action
 
@@ -76,6 +79,8 @@ provider-action protocols, and bound retrieval resources.
   label/choices in one place) to cut the 5-touchpoint provider onboarding.
 - TUI roadmap: `/session` cross-workspace switching, command-output paging,
   worker cancellation on exit.
+- Planner-Executor roadmap: planning with read-only exploration tools;
+  per-task plan persistence for `/diff`/`/undo` context.
 
 ## Blockers
 

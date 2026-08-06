@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
         max_context_chars=None,
         timeout=None,
         read_only=False,
+        no_plan=False,
     )
 
     doctor = subparsers.add_parser("doctor", help="检查本地配置，不发送 API 请求")
@@ -84,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     run.add_argument("--timeout", type=float, help="API 与命令超时秒数")
     run.add_argument("--read-only", action="store_true", help="禁止编辑文件和执行命令")
+    run.add_argument("--no-plan", action="store_true", help="跳过执行前的规划阶段")
     return parser
 
 
@@ -129,6 +131,7 @@ def _add_chat_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     parser.add_argument("--timeout", type=float, help="API 与命令超时秒数")
     parser.add_argument("--read-only", action="store_true", help="禁止编辑文件和执行命令")
+    parser.add_argument("--no-plan", action="store_true", help="跳过执行前的规划阶段")
 
 
 def main(
@@ -181,6 +184,7 @@ def main(
             max_context_chars=getattr(args, "max_context_chars", None),
             timeout=getattr(args, "timeout", None),
             read_only=getattr(args, "read_only", False),
+            plan_enabled=False if getattr(args, "no_plan", False) else None,
         )
     except ConfigError as exc:
         ui.show_error("配置错误", str(exc).replace("tool_protocol", "工具协议"))
@@ -256,6 +260,7 @@ def _run_chat(
                 max_context_chars=args.max_context_chars,
                 timeout=args.timeout,
                 read_only=args.read_only,
+                plan_enabled=False if args.no_plan else None,
             ),
             provider_factory=provider_factory,
             approver=ui.approve,
@@ -305,6 +310,7 @@ def _run_tui(
                 max_context_chars=args.max_context_chars,
                 timeout=args.timeout,
                 read_only=args.read_only,
+                plan_enabled=False if args.no_plan else None,
             ),
             provider_factory=provider_factory,
             approver=approver,

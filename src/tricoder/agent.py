@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
@@ -35,6 +36,14 @@ from tricoder.tools import ToolRegistry
 CONTEXT_COMPACTION_NOTICE = "较早的消息已被压缩，以保留最新上下文。"
 AUDIT_FAILURE_MESSAGE = "无法写入审计日志，运行已安全停止"
 PROVIDER_FAILURE_MESSAGE = "模型请求失败，运行已安全停止"
+PLANNING_PROMPT = """在开始执行前，请先输出一份简短的分步执行计划。
+只输出计划，不要调用工具，不要添加任何额外说明。
+计划格式为 JSON：
+{"steps": ["第 1 步...", "第 2 步...", "第 3 步..."]}
+步骤必须具体、可执行，数量控制在 3 到 8 步。"""
+
+# 规划阶段审计失败时的终止哨兵。
+_PLAN_ABORT = object()
 
 
 def _message_chars(message: Message) -> int:
@@ -255,6 +264,7 @@ class CodingAgent:
         audit: AuditLogger | None = None,
         observer: AgentObserver | None = None,
         tool_protocol: str = "native",
+        plan_enabled: bool = True,
     ) -> None:
         if max_rounds <= 0:
             raise ValueError("max_rounds 必须大于 0")
@@ -266,6 +276,8 @@ class CodingAgent:
             raise ValueError("max_context_chars 必须大于 0")
         if tool_protocol not in {"native", "legacy_json"}:
             raise ValueError("tool_protocol 必须是 native 或 legacy_json")
+        if not isinstance(plan_enabled, bool):
+            raise ValueError("plan_enabled 必须是布尔值")
         self.provider = provider
         self.tools = tools
         self.max_rounds = max_rounds
@@ -273,6 +285,7 @@ class CodingAgent:
         self.audit = audit
         self.observer = observer or NullObserver()
         self.tool_protocol = tool_protocol
+        self.plan_enabled = plan_enabled
         self._protocol: ActionProtocol = _PROTOCOLS[tool_protocol]
 
     def run(self, task: str) -> RunResult:
@@ -350,6 +363,24 @@ class CodingAgent:
                 self.observer.on_error(AUDIT_FAILURE_MESSAGE)
                 return turn_result(
                     RunResult(False, AUDIT_FAILURE_MESSAGE, 0), rollback_task=True
+                )
+
+        if self.plan_enabled:
+            plan_usage = self._planning_round(
+                messages, tool_calls, modified_files, verification
+            )
+            if plan_usage is _PLAN_ABORT:
+                return turn_result(
+                    self._audit_failure_result(
+                        0, tool_calls, modified_files, verification
+                    ),
+                    rollback_task=True,
+                )
+            if plan_usage is not None:
+                accumulated_usage = (
+                    plan_usage
+                    if accumulated_usage is None
+                    else accumulated_usage.merge(plan_usage)
                 )
 
         for round_number in range(1, self.max_rounds + 1):
@@ -554,6 +585,104 @@ class CodingAgent:
                 verification,
             )
         )
+
+    def _planning_round(
+        self,
+        messages: list[Message],
+        tool_calls: int,
+        modified_files: list[str],
+        verification: str,
+    ) -> object:
+        """任务执行前的规划阶段（round 0）：生成并注入分步计划。
+
+        返回该次请求的 TokenUsage 供外层累计；审计失败返回 _PLAN_ABORT；
+        计划失败时降级为无计划执行并返回 None。
+        """
+
+        started = time.perf_counter()
+        try:
+            response = self.provider.complete(
+                [*messages, Message("user", PLANNING_PROMPT)], ()
+            )
+        except ProviderError as exc:
+            self.observer.on_error("规划失败，将直接执行")
+            if not self._log(
+                {
+                    "round": 0,
+                    "status": "plan_failed",
+                    "error_type": type(exc).__name__,
+                    "error_chars": len(str(exc)),
+                    "duration_ms": self._elapsed_ms(started),
+                }
+            ):
+                return _PLAN_ABORT
+            return None
+
+        if response.usage is not None:
+            _notify_provider_usage(self.observer, 0, response.usage)
+            if not self._audit_usage(0, response.usage):
+                return _PLAN_ABORT
+
+        raw = response.content or ""
+        plan = self._parse_plan(raw)
+        if plan is not None:
+            messages.append(Message("system", f"执行计划：\n{plan}"))
+            if not self._log(
+                {
+                    "round": 0,
+                    "status": "plan",
+                    "plan_chars": len(plan),
+                    "plan_steps": plan.count("\n") + 1,
+                    "duration_ms": self._elapsed_ms(started),
+                }
+            ):
+                return _PLAN_ABORT
+        else:
+            if not self._log(
+                {
+                    "round": 0,
+                    "status": "plan_failed",
+                    "error_type": "PlanParseError",
+                    "plan_chars": len(raw),
+                    "duration_ms": self._elapsed_ms(started),
+                }
+            ):
+                return _PLAN_ABORT
+        return response.usage
+
+    @staticmethod
+    def _parse_plan(raw: str) -> str | None:
+        """宽容解析模型计划：JSON steps > Markdown 列表 > 原文降级。"""
+        text = raw.strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            text = text.strip("`").strip()
+            if text.startswith("json"):
+                text = text[4:].strip()
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, dict):
+                steps = decoded.get("steps")
+                if isinstance(steps, list):
+                    clean = [
+                        str(step).strip() for step in steps if str(step).strip()
+                    ]
+                    if clean:
+                        return "\n".join(
+                            f"{index + 1}. {step}"
+                            for index, step in enumerate(clean)
+                        )
+        except (json.JSONDecodeError, TypeError):
+            pass
+        lines = [
+            line.strip().lstrip("-*").strip().lstrip("0123456789. ").strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        if len(lines) >= 2:
+            return "\n".join(f"{index + 1}. {line}" for index, line in enumerate(lines))
+        return text
 
     def _log(self, event: dict[str, Any]) -> bool:
         if self.audit is None:

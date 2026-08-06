@@ -53,6 +53,7 @@ class RuntimeOptions:
     max_context_chars: int | None = None
     timeout: float | None = None
     read_only: bool = False
+    plan_enabled: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,6 +613,11 @@ class SessionRuntime:
             for parameter in agent_parameters.values()
         ):
             agent_kwargs["tool_protocol"] = loaded.tool_protocol
+        if "plan_enabled" in agent_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in agent_parameters.values()
+        ):
+            agent_kwargs["plan_enabled"] = loaded.plan_enabled
         agent = self._agent_factory(provider, tools, **agent_kwargs)
         return ActiveSession(
             record,
@@ -642,6 +648,7 @@ class SessionRuntime:
             max_context_chars=self.options.max_context_chars,
             timeout=self.options.timeout,
             read_only=self.options.read_only,
+            plan_enabled=self.options.plan_enabled,
         )
 
     def _mark_unsaved(self) -> None:

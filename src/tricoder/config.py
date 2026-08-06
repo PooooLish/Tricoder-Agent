@@ -248,6 +248,7 @@ def load_config(
     max_context_chars: int | None = None,
     timeout: float | None = None,
     read_only: bool = False,
+    plan_enabled: bool | None = None,
 ) -> AppConfig:
     """按“命令行 > 环境变量 > 项目配置 > 默认值”加载配置。"""
 
@@ -347,6 +348,15 @@ def load_config(
         if "TRICODER_TOOL_PROTOCOL" in env
         else agent_table.get("tool_protocol", "native")
     )
+    plan_value = (
+        plan_enabled
+        if plan_enabled is not None
+        else env.get("TRICODER_PLAN", agent_table.get("plan", True))
+    )
+    if isinstance(plan_value, str):
+        plan_value = plan_value.strip().lower() not in {"0", "false", "no", "off"}
+    if not isinstance(plan_value, bool):
+        raise ConfigError("plan 必须是布尔值")
 
     if not isinstance(selected_model, str) or not selected_model.strip():
         raise ConfigError("model 不能为空")
@@ -374,4 +384,5 @@ def load_config(
         key_source=key_source,
         audit_dir=resolved_audit_dir,
         tool_protocol=tool_protocol_value,
+        plan_enabled=plan_value,
     )

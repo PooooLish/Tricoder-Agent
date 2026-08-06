@@ -6,6 +6,7 @@ from pathlib import Path
 
 from textual.widgets import Input, RichLog
 
+from tricoder.agent import PLANNING_PROMPT
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime
 from tricoder.sessions import SessionStore
@@ -13,7 +14,7 @@ from tricoder.tui import ApprovalScreen, TricoderApp
 
 
 class FakeProvider:
-    """按序返回预设响应，不访问网络。"""
+    """按序返回预设响应，不访问网络；规划请求透明返回固定计划。"""
 
     def __init__(self, responses: list[ProviderResponse]) -> None:
         self._responses = list(responses)
@@ -24,6 +25,14 @@ class FakeProvider:
         messages: object,
         tools: tuple = (),
     ) -> ProviderResponse:
+        if (
+            not tools
+            and messages
+            and getattr(messages[-1], "content", None) == PLANNING_PROMPT
+        ):
+            return ProviderResponse(
+                content='{"steps": ["步骤 1", "步骤 2", "步骤 3"]}'
+            )
         self.calls += 1
         return self._responses.pop(0)
 

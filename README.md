@@ -101,10 +101,23 @@ max_rounds = 10
 max_context_chars = 80000
 timeout = 30
 tool_protocol = "native"
+plan = true
 
 [providers.glm]
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 ```
+
+## 执行前规划（Planner-Executor）
+
+每个任务在进入工具循环前默认有一次**规划阶段**（round 0，不带工具）：Agent 基于任务
+与会话摘要先输出 3–8 步执行计划（JSON 或 Markdown 列表），计划作为消息注入后续执行，
+让多步任务按计划推进。规划阶段只生成文本、无副作用，不写文件、不执行命令。
+
+- 规划失败（Provider 错误 / 解析失败）时**降级为无计划执行**，不阻塞任务。
+- 计划文本不写入 SQLite 或审计原文（审计只记录步骤数与字符数）。
+- 关闭规划：`--no-plan` 命令行参数，或环境变量 `TRICODER_PLAN=0`，或项目配置
+  `[agent] plan = false`（命令行 > 环境变量 > 项目配置 > 默认开启）。
+- 规划增加一次模型调用与 token 成本，可用上述方式关闭。
 
 ## 使用方式
 

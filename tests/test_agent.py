@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import tempfile
 import unittest
@@ -10,6 +10,7 @@ from tricoder.agent import (
     AgentObserver,
     CONTEXT_COMPACTION_NOTICE,
     LEGACY_SYSTEM_PROMPT,
+    PLANNING_PROMPT,
     CodingAgent,
     compact_messages,
     parse_action,
@@ -89,6 +90,20 @@ def patch_binding_cleanup_failure(target: Path) -> object:
     )
 
 
+def _planning_response(
+    messages: list[Message],
+    tools: tuple = (),
+) -> ProviderResponse | None:
+    """识别规划请求并透明返回固定计划，不消耗响应序列、不记录请求。"""
+    if tools:
+        return None
+    if messages and getattr(messages[-1], "content", None) == PLANNING_PROMPT:
+        return ProviderResponse(
+            content='{"steps": ["第 1 步", "第 2 步", "第 3 步"]}'
+        )
+    return None
+
+
 class ScriptedProvider:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
@@ -100,6 +115,9 @@ class ScriptedProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.histories.append(list(messages))
         self.tool_batches.append(tuple(tools))
         return ProviderResponse(content=self.responses.pop(0))
@@ -121,6 +139,9 @@ class StructuredScriptedProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.histories.append(list(messages))
         self.tool_batches.append(tuple(tools))
         response = self.responses.pop(0)
@@ -182,6 +203,9 @@ class FailingProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.histories.append(list(messages))
         raise ProviderError("模拟 Provider 故障")
 
@@ -198,6 +222,9 @@ class FailingOnSecondRequestProvider:
         messages: list[Message],
         tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
+        planning = _planning_response(messages, tools)
+        if planning is not None:
+            return planning
         self.histories.append(list(messages))
         if len(self.histories) == 2:
             raise ProviderError("模拟第二次请求故障")
@@ -293,7 +320,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("读取示例")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("读取示例")
 
         self.assertTrue(result.ok)
         self.assertEqual(self.tools.definitions, provider.tool_batches[0])
@@ -326,7 +353,8 @@ class NativeToolCallingTests(unittest.TestCase):
         observer = RecordingObserver()
 
         result = CodingAgent(
-            provider, self.tools, max_rounds=2, observer=observer
+            provider, self.tools, max_rounds=2, observer=observer,
+            plan_enabled=False,
         ).run("读取示例")
 
         self.assertTrue(result.ok)
@@ -360,7 +388,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("读取后失败")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("读取后失败")
 
         self.assertFalse(result.ok)
         self.assertEqual(first_usage, result.usage)
@@ -379,7 +407,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("达到轮数上限")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("达到轮数上限")
 
         self.assertFalse(result.ok)
         self.assertEqual(TokenUsage(150, 15, 95, 55), result.usage)
@@ -522,7 +550,8 @@ class NativeToolCallingTests(unittest.TestCase):
         )
 
         result = CodingAgent(
-            provider, self.tools, max_rounds=1, audit=FailingAudit()
+            provider, self.tools, max_rounds=1, audit=FailingAudit(),
+            plan_enabled=False,
         ).run("审计不可写时不执行工具")
 
         self.assertFalse(result.ok)
@@ -541,7 +570,7 @@ class NativeToolCallingTests(unittest.TestCase):
         )
 
         with patch("tricoder.agent.parse_action", side_effect=AssertionError("不应解析")):
-            result = CodingAgent(provider, self.tools, max_rounds=2).run("检查协议")
+            result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("检查协议")
 
         self.assertTrue(result.ok)
         self.assertFalse((self.workspace / "leak.py").exists())
@@ -576,7 +605,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("拒绝并行调用")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("拒绝并行调用")
 
         self.assertTrue(result.ok)
         self.assertFalse((self.workspace / "created.py").exists())
@@ -600,7 +629,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        recovered = CodingAgent(recovering, self.tools, max_rounds=2).run("修正协议")
+        recovered = CodingAgent(recovering, self.tools, max_rounds=2, plan_enabled=False).run("修正协议")
 
         self.assertTrue(recovered.ok)
         feedback = recovering.histories[1][-1]
@@ -608,7 +637,7 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertNotIn(protocol_sentinel, feedback.content or "")
 
         failing = StructuredScriptedProvider([ProviderError("HTTP 401")])
-        failed = CodingAgent(failing, self.tools, max_rounds=2).run_with_context(
+        failed = CodingAgent(failing, self.tools, max_rounds=2, plan_enabled=False).run_with_context(
             "不可恢复",
             SessionContext(),
         )
@@ -630,6 +659,7 @@ class NativeToolCallingTests(unittest.TestCase):
             max_rounds=1,
             observer=observer,
             audit=AuditLogger(audit_path),
+            plan_enabled=False,
         )
 
         result = agent.run("触发普通 Provider 错误")
@@ -690,7 +720,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("处理未知工具")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("处理未知工具")
 
         self.assertTrue(result.ok)
         assistant, tool = provider.histories[1][-2:]
@@ -707,7 +737,7 @@ class NativeToolCallingTests(unittest.TestCase):
                 self.response("call-finish", "finish", {"summary": "首轮完成"}),
             ]
         )
-        first = CodingAgent(first_provider, self.tools, max_rounds=2).run_with_context(
+        first = CodingAgent(first_provider, self.tools, max_rounds=2, plan_enabled=False).run_with_context(
             "读取示例",
             SessionContext(),
         )
@@ -719,6 +749,7 @@ class NativeToolCallingTests(unittest.TestCase):
             second_provider,
             self.tools,
             max_rounds=1,
+            plan_enabled=False,
         ).run_with_context("继续检查", first.context)
 
         self.assertTrue(second.result.ok)
@@ -774,6 +805,7 @@ class NativeToolCallingTests(unittest.TestCase):
                     first_provider,
                     self.tools,
                     max_rounds=3,
+                plan_enabled=False,
                 ).run_with_context("先纠错再完成", SessionContext())
                 second_provider = StructuredScriptedProvider(
                     [
@@ -789,6 +821,7 @@ class NativeToolCallingTests(unittest.TestCase):
                     second_provider,
                     self.tools,
                     max_rounds=1,
+                plan_enabled=False,
                 ).run_with_context("继续任务", first.context)
 
                 reused = second_provider.histories[0]
@@ -919,7 +952,7 @@ class NativeToolCallingTests(unittest.TestCase):
             [self.response("call-finish", "finish", {"summary": "完成"})]
         )
 
-        CodingAgent(provider, self.tools, max_rounds=1).run_with_context(
+        CodingAgent(provider, self.tools, max_rounds=1, plan_enabled=False).run_with_context(
             "原生任务",
             context,
         )
@@ -950,7 +983,7 @@ class NativeToolCallingTests(unittest.TestCase):
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2).run("修改后结束")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("修改后结束")
 
         self.assertFalse(result.ok)
         self.assertEqual("待验证", result.verification)
@@ -1036,6 +1069,7 @@ class LegacyJsonModeTests(unittest.TestCase):
             self.tools,
             max_rounds=1,
             tool_protocol="legacy_json",
+        plan_enabled=False,
         ).run("兼容旧版")
 
         self.assertTrue(result.ok)
@@ -1056,6 +1090,7 @@ class LegacyJsonModeTests(unittest.TestCase):
             self.tools,
             max_rounds=2,
             tool_protocol="legacy_json",
+        plan_enabled=False,
         ).run("修正旧版格式")
 
         self.assertTrue(result.ok)
@@ -1095,6 +1130,7 @@ class LegacyJsonModeTests(unittest.TestCase):
             self.tools,
             max_rounds=1,
             tool_protocol="legacy_json",
+        plan_enabled=False,
         ).run_with_context("旧版任务", context)
 
         request = provider.histories[0]
@@ -1136,7 +1172,7 @@ class AgentTests(unittest.TestCase):
     def test_audit_failure_after_tool_keeps_reusable_complete_turn(self) -> None:
         """防止审计失败让已执行工具只留下孤立 assistant 动作。"""
         provider = ScriptedProvider([action("read_file", {"path": "sample.py"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit(), plan_enabled=False)
 
         failed = agent.run_with_context("读取模块", SessionContext())
 
@@ -1146,7 +1182,7 @@ class AgentTests(unittest.TestCase):
             [message.kind for message in failed.context.messages],
         )
         resumed_provider = ScriptedProvider([action("finish", {"summary": "继续完成"})])
-        resumed = LegacyCodingAgent(resumed_provider, self.tools, max_rounds=2).run_with_context(
+        resumed = LegacyCodingAgent(resumed_provider, self.tools, max_rounds=2, plan_enabled=False).run_with_context(
             "继续任务", failed.context
         )
         self.assertTrue(resumed.result.ok)
@@ -1157,7 +1193,7 @@ class AgentTests(unittest.TestCase):
     def test_audit_failure_after_finish_keeps_complete_turn(self) -> None:
         """防止 finish 的审计失败遗漏其对应 tool-result。"""
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit())
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, audit=FailingAudit(), plan_enabled=False)
 
         failed = agent.run_with_context("结束任务", SessionContext())
 
@@ -1178,7 +1214,7 @@ class AgentTests(unittest.TestCase):
             ),
             persisted_summary="恢复摘要",
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=1)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=1, plan_enabled=False)
 
         completed = agent.run_with_context("当前任务", context)
 
@@ -1198,7 +1234,7 @@ class AgentTests(unittest.TestCase):
         """防止首次 Provider 失败把未完成的当前任务写入下轮历史。"""
         provider = FailingProvider()
         context = SessionContext(messages=(Message("user", "旧任务", kind="task"),))
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         failed = agent.run_with_context("当前任务", context)
 
@@ -1214,7 +1250,7 @@ class AgentTests(unittest.TestCase):
                 {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
             )
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         failed = agent.run_with_context("修改模块", SessionContext())
 
@@ -1253,7 +1289,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "completed"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
 
         result = agent.run("canonicalize modified files")
 
@@ -1318,7 +1354,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, max_context_chars=2_000)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, max_context_chars=2_000, plan_enabled=False)
 
         failed = agent.run_with_context("修改模块", SessionContext())
 
@@ -1346,7 +1382,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "继续完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         first = agent.run_with_context("检查模块", SessionContext())
         second = agent.run_with_context("继续补测试", first.context)
@@ -1364,7 +1400,7 @@ class AgentTests(unittest.TestCase):
     def test_persisted_summary_is_sent_without_raw_tool_history(self) -> None:
         """防止恢复会话时把未持久化的工具历史伪造进摘要。"""
         provider = ScriptedProvider([action("finish", {"summary": "继续检查"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
         context = SessionContext(persisted_summary="此前修改 src/app.py，验证通过")
 
         agent.run_with_context("继续检查", context)
@@ -1387,7 +1423,7 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=3_000)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=3_000, plan_enabled=False)
 
         agent.run_with_context("当前任务", context)
 
@@ -1413,7 +1449,7 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         agent.run_with_context("当前任务", context)
 
@@ -1430,7 +1466,7 @@ class AgentTests(unittest.TestCase):
             )
         )
         provider = ScriptedProvider([action("finish", {"summary": "完成"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         agent.run_with_context("当前任务", context)
 
@@ -1459,7 +1495,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已验证"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         first = agent.run_with_context("修改模块", SessionContext())
         second = agent.run_with_context("验证修改", first.context)
@@ -1480,7 +1516,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "兼容完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         previous = agent.run_with_context(
             "旧会话", SessionContext(modified_files=("sample.py",), verification="待验证")
@@ -1616,6 +1652,7 @@ class AgentTests(unittest.TestCase):
             self.tools,
             max_rounds=1,
             audit=AuditLogger(audit_path),
+            plan_enabled=False,
         )
 
         result = agent.run("触发安全错误")
@@ -1642,6 +1679,7 @@ class AgentTests(unittest.TestCase):
             self.tools,
             max_rounds=2,
             audit=AuditLogger(audit_path),
+            plan_enabled=False,
         )
 
         agent.run("触发未知工具")
@@ -1675,6 +1713,7 @@ class AgentTests(unittest.TestCase):
             self.tools,
             max_rounds=2,
             audit=AuditLogger(audit_path),
+            plan_enabled=False,
         )
 
         try:
@@ -1765,7 +1804,7 @@ class AgentTests(unittest.TestCase):
     def test_finish_without_file_modification_succeeds(self) -> None:
         """防止无文件修改的只读任务被错误地要求运行验证命令。"""
         provider = ScriptedProvider([action("finish", {"summary": "已完成检查"})])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         result = agent.run("检查工作区")
 
@@ -1783,7 +1822,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         result = agent.run("修改示例")
 
@@ -1803,7 +1842,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
 
         result = agent.run("修改示例")
 
@@ -1823,7 +1862,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修改并验证"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
 
         result = agent.run("修改示例")
 
@@ -1846,7 +1885,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "再次修改"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
 
         result = agent.run("连续修改示例")
 
@@ -1866,7 +1905,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "创建完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
         target = self.workspace / "committed.py"
 
         with patch_binding_cleanup_failure(target):
@@ -1896,7 +1935,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "编辑完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
 
         with patch_binding_close_failure():
             result = agent.run("先验证再编辑文件")
@@ -1924,7 +1963,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "创建完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
         target = self.workspace / "close-warning.py"
 
         with patch_binding_close_failure():
@@ -1952,7 +1991,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "保留已验证修改"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
 
         result = agent.run("验证后尝试失败编辑")
 
@@ -1977,7 +2016,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "保留已验证修改"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
 
         result = agent.run("验证后尝试失败创建")
 
@@ -1994,7 +2033,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "已修正格式"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         result = agent.run("检查格式")
 
@@ -2011,7 +2050,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "改用安全方案"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
 
         result = agent.run("安全完成")
 
@@ -2021,7 +2060,7 @@ class AgentTests(unittest.TestCase):
     def test_stops_after_max_rounds(self) -> None:
         """防止异常模型造成无限调用和失控费用。"""
         provider = ScriptedProvider(["bad", "bad", "bad"])
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         result = agent.run("不会结束的任务")
 
@@ -2046,7 +2085,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         observer = RecordingObserver()
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, observer=observer)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, observer=observer, plan_enabled=False)
 
         result = agent.run("读取后结束")
 
@@ -2290,7 +2329,115 @@ class AgentTests(unittest.TestCase):
         for value in (0, -1):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "max_context_chars"):
-                    LegacyCodingAgent(provider, self.tools, max_context_chars=value)
+                    LegacyCodingAgent(provider, self.tools, max_context_chars=value, plan_enabled=False)
+
+    def test_planning_injects_plan_before_tool_loop(self) -> None:
+        """规划请求不带工具；生成的计划作为 system 消息注入后续循环。"""
+        finish = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c-finish", "finish", {"summary": "完成"}),),
+            finish_reason="tool_calls",
+        )
+        provider = StructuredScriptedProvider([finish])
+        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        result = agent.run("带计划任务")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(1, len(provider.histories))
+        self.assertTrue(
+            any(
+                message.role == "system" and "执行计划" in (message.content or "")
+                for message in provider.histories[0]
+            )
+        )
+
+    def test_planning_failure_degrades_to_execution(self) -> None:
+        """规划阶段 Provider 故障时降级为无计划执行，不阻塞任务。"""
+
+        class PlanThenFinishProvider:
+            def __init__(self) -> None:
+                self.histories: list[list[Message]] = []
+
+            def complete(
+                self,
+                messages: list[Message],
+                tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+            ) -> ProviderResponse:
+                self.histories.append(list(messages))
+                if not tools:
+                    raise ProviderError("规划阶段故障")
+                return ProviderResponse(
+                    content=None,
+                    tool_calls=(
+                        ToolCall("c-finish", "finish", {"summary": "降级完成"}),
+                    ),
+                    finish_reason="tool_calls",
+                )
+
+        provider = PlanThenFinishProvider()
+        agent = CodingAgent(provider, self.tools, max_rounds=2)
+        result = agent.run("规划失败任务")
+
+        self.assertTrue(result.ok)
+        self.assertIn("降级完成", result.summary)
+        self.assertEqual(2, len(provider.histories))
+        self.assertEqual((), provider.histories[0][0].tool_calls)
+
+    def test_planning_disabled_skips_planning_request(self) -> None:
+        """plan_enabled=False 时直接进入工具循环，不发送规划请求。"""
+        finish = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c-finish", "finish", {"summary": "ok"}),),
+            finish_reason="tool_calls",
+        )
+        provider = StructuredScriptedProvider([finish])
+        agent = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
+        result = agent.run("无计划任务")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(1, len(provider.histories))
+        self.assertTrue(provider.tool_batches[0])
+        self.assertNotIn(
+            "执行计划",
+            "".join(str(message.content or "") for message in provider.histories[0]),
+        )
+
+    def test_plan_parsing_accepts_json_markdown_and_falls_back(self) -> None:
+        """计划解析宽容处理 JSON steps、Markdown 列表与原文降级。"""
+        self.assertEqual(
+            "1. 读文件\n2. 修改",
+            CodingAgent._parse_plan('{"steps": ["读文件", "修改"]}'),
+        )
+        self.assertEqual(
+            "1. 读文件\n2. 修改",
+            CodingAgent._parse_plan("- 读文件\n- 修改"),
+        )
+        self.assertEqual("原文", CodingAgent._parse_plan("原文"))
+        self.assertIsNone(CodingAgent._parse_plan("   "))
+        self.assertIsNone(CodingAgent._parse_plan(""))
+
+    def test_plan_audit_records_metadata_only(self) -> None:
+        """规划审计只记录步骤数与字符数，不落计划原文。"""
+        audit_path = self.workspace / "runtime" / "plan.jsonl"
+        finish = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c-finish", "finish", {"summary": "done"}),),
+            finish_reason="tool_calls",
+        )
+        provider = StructuredScriptedProvider([finish])
+        agent = CodingAgent(
+            provider, self.tools, max_rounds=2, audit=AuditLogger(audit_path)
+        )
+        result = agent.run("计划审计任务")
+
+        self.assertTrue(result.ok)
+        trail = audit_path.read_text(encoding="utf-8")
+        plan_events = [
+            json.loads(line) for line in trail.splitlines() if '"plan"' in line
+        ]
+        self.assertEqual(1, len(plan_events))
+        self.assertGreater(plan_events[0]["plan_steps"], 0)
+        self.assertNotIn("第 1 步", trail)
 
 
 if __name__ == "__main__":

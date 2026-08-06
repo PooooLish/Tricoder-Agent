@@ -165,6 +165,7 @@ class AppConfig:
     audit_dir: Path | None = None
     max_context_chars: int = 80_000
     tool_protocol: str = "native"
+    plan_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
