@@ -170,9 +170,22 @@ class InteractiveShell:
             self._undo_latest()
         elif command.name == "session":
             self._handle_session(command)
+        elif command.name == "permission":
+            self._permission(command.argument)
         elif command.name == "exit":
             return self._exit()
         return None
+
+    def _permission(self, argument: str | None) -> None:
+        if argument is None:
+            self.ui.show_notice(f"当前权限级别：{self.runtime.permission_level}")
+            return
+        try:
+            level = self.runtime.set_permission(argument)
+        except SessionRuntimeError as exc:
+            self.ui.show_error("权限操作失败", str(exc))
+            return
+        self.ui.show_notice(f"权限级别已切换：{level}")
 
     def _handle_session(self, command: ParsedCommand) -> None:
         if command.subcommand is None:

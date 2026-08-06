@@ -39,13 +39,17 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
         needs_confirmation=True,
     ),
     "session": CommandSpec("列出、新建、查看或重命名会话"),
+    "permission": CommandSpec(
+        "查看权限级别，或切换 strict / relaxed（relaxed 自动放行只读/测试命令）",
+        takes_argument=True,
+    ),
     "exit": CommandSpec("保存安全记忆并退出"),
 }
 
 _SESSION_SUBCOMMANDS = {"new", "current", "rename"}
-# 简单命令集合由注册表派生；session 是唯一带子命令的命令。
+# 简单命令集合由注册表派生；session/permission 是带参数命令。
 _SIMPLE_COMMANDS = frozenset(
-    name for name, spec in _COMMAND_SPECS.items() if name != "session"
+    name for name, spec in _COMMAND_SPECS.items() if name not in {"session", "permission"}
 )
 
 
@@ -83,6 +87,12 @@ def parse_command(text: str) -> ParsedCommand:
         if remainder:
             raise CommandError(f"命令 /{name} 不接受参数。")
         return ParsedCommand(name, None, None)
+
+    if name == "permission":
+        argument = remainder.strip().lower() or None
+        if argument is not None and argument not in {"strict", "relaxed"}:
+            raise CommandError("permission 只能是 strict 或 relaxed")
+        return ParsedCommand("permission", None, argument)
 
     if name != "session":
         raise CommandError(f"未知命令：/{name}。请输入 /help 查看可用命令。")

@@ -92,6 +92,24 @@ class CommandParserTests(unittest.TestCase):
         self.assertFalse(is_slash_command("请解释 /status"))
         self.assertFalse(is_slash_command(""))
 
+    def test_permission_command_accepts_optional_level(self) -> None:
+        """/permission 无参查看、带参切换，非法值拒绝。"""
+        self.assertEqual(
+            ParsedCommand("permission", None, None), parse_command("/permission")
+        )
+        self.assertEqual(
+            ParsedCommand("permission", None, "relaxed"),
+            parse_command("/permission relaxed"),
+        )
+        self.assertEqual(
+            ParsedCommand("permission", None, "strict"),
+            parse_command("/Permission STRICT"),
+        )
+        for text in ("/permission admin", "/permission  bypass"):
+            with self.subTest(text=text):
+                with self.assertRaises(CommandError):
+                    parse_command(text)
+
     def test_command_registry_covers_parsed_commands(self) -> None:
         """注册表必须包含全部可解析命令，且解析器只接受已注册命令。"""
         specs = list_commands()

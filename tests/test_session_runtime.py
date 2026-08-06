@@ -1196,6 +1196,25 @@ class SessionRuntimeTests(unittest.TestCase):
         )
         self.assertEqual("passed", persisted.verification)
 
+    def test_permission_level_defaults_strict_and_validates(self) -> None:
+        """权限级别默认 strict，非法值被拒绝。"""
+        self.assertEqual("strict", self.runtime.permission_level)
+        with self.assertRaises(SessionRuntimeError):
+            self.runtime.set_permission("admin")
+        self.assertEqual("strict", self.runtime.set_permission(None))
+
+    def test_permission_relaxed_auto_allows_read_only_commands_only(self) -> None:
+        """relaxed 只自动放行只读/测试命令，文件写入仍人工审批。"""
+        self.runtime.set_permission("relaxed")
+        self.assertEqual("relaxed", self.runtime.permission_level)
+        self.assertTrue(self.runtime._effective_approver("run_command", "detail"))
+        self.assertFalse(self.runtime._effective_approver("edit_file", "detail"))
+        self.assertFalse(self.runtime._effective_approver("create_file", "detail"))
+        self.assertFalse(self.runtime._effective_approver("apply_patch", "detail"))
+        # strict 下命令也交回人工审批（base approver 为 False）
+        self.runtime.set_permission("strict")
+        self.assertFalse(self.runtime._effective_approver("run_command", "detail"))
+
 
 if __name__ == "__main__":
     unittest.main()

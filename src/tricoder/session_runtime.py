@@ -144,6 +144,7 @@ class SessionRuntime:
         self._agent_factory = agent_factory
         self._audit_factory = audit_factory
         self._approver = approver or (lambda _action, _detail: False)
+        self._permission_level = "strict"
         self._observer = observer
         self._unsaved_memory = False
         self._warning = ""
@@ -492,6 +493,28 @@ class SessionRuntime:
         """供退出流程再尝试一次保存，失败由调用方返回非零退出码。"""
         return self.persist_current()
 
+    @property
+    def permission_level(self) -> str:
+        """当前权限级别：strict（默认）或 relaxed。"""
+        return self._permission_level
+
+    def set_permission(self, level: str | None) -> str:
+        """查看或切换权限级别；relaxed 自动放行只读/测试命令。"""
+        if level is None:
+            return self._permission_level
+        normalized = level.strip().lower()
+        if normalized not in {"strict", "relaxed"}:
+            raise SessionRuntimeError("permission 只能是 strict 或 relaxed")
+        self._permission_level = normalized
+        return normalized
+
+    def _effective_approver(self, action: str, detail: str) -> bool:
+        """relaxed 下只读/测试命令（已被 CommandPolicy 白名单约束）自动放行；
+        文件写入与 strict 模式始终交回人工审批。"""
+        if self._permission_level == "relaxed" and action == "run_command":
+            return True
+        return self._approver(action, detail)
+
     def status(self) -> RuntimeStatus:
         """返回不含任务原文、工具输出或凭据的状态快照。"""
         return RuntimeStatus(self.current.record, self._unsaved_memory, self._warning)
@@ -591,7 +614,7 @@ class SessionRuntime:
             ToolContext(
                 workspace_policy=workspace_policy,
                 command_policy=self._command_policy_factory(),
-                approver=self._approver,
+                approver=self._effective_approver,
                 read_only=loaded.read_only,
                 timeout=loaded.timeout,
                 change_journal=active_journal,
