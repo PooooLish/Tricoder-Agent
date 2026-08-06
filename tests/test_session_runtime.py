@@ -1226,6 +1226,14 @@ class SessionRuntimeTests(unittest.TestCase):
         with self.assertRaises(SessionRuntimeError):
             self.runtime.set_permission("admin")
 
+    def test_permission_persists_to_session_memory(self) -> None:
+        """权限级别随会话记忆持久化并可恢复。"""
+        self.assertEqual("strict", self.runtime.permission_level)
+        self.runtime.set_permission("relaxed")
+        self.assertEqual("relaxed", self.runtime.permission_level)
+        persisted = self.store.load_memory(self.runtime.current.record.id)
+        self.assertEqual("relaxed", persisted.permission_level)
+
 
 if __name__ == "__main__":
     unittest.main()

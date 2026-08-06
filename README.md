@@ -181,7 +181,7 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/session new <名称>` | 用当前工作区、Provider 和模型创建并切换到新 Session。 |
 | `/session current` | 显示当前 Session 的详细信息。 |
 | `/session rename <名称>` | 重命名当前 Session。 |
-| `/permission` | 查看当前权限级别（strict / relaxed / fullaccess）。 |
+| `/permission` | 查看当前权限级别（strict / relaxed / fullaccess），级别随会话记忆持久化，重启或切换会话自动恢复。 |
 | `/permission relaxed` | 切换为 relaxed：只读/测试命令（`CommandPolicy` 白名单内）自动放行，文件写入仍人工审批。 |
 | `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；命令仍受 `CommandPolicy` 白名单、`--read-only` 与敏感路径等硬边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
 | `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |

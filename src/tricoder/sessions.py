@@ -142,13 +142,27 @@ class SessionStore:
                         last_task_summary TEXT NOT NULL DEFAULT '',
                         modified_files_json TEXT NOT NULL DEFAULT '[]',
                         verification TEXT NOT NULL DEFAULT '未运行',
+                        permission TEXT NOT NULL DEFAULT 'strict',
                         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                     );
                     """
                 )
+                self._ensure_permission_column(connection)
                 connection.commit()
         except (OSError, sqlite3.Error) as error:
             raise SessionError("会话数据库初始化失败") from error
+
+    @staticmethod
+    def _ensure_permission_column(connection: sqlite3.Connection) -> None:
+        """为旧库补齐 permission 列；已存在则跳过。"""
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(session_memory)")
+        }
+        if "permission" not in columns:
+            connection.execute(
+                "ALTER TABLE session_memory "
+                "ADD COLUMN permission TEXT NOT NULL DEFAULT 'strict'"
+            )
 
     def create(self, name: str, workspace: Path, provider: str, model: str) -> SessionRecord:
         """创建会话及其独立的空记忆记录。"""
@@ -304,7 +318,8 @@ class SessionStore:
         """读取独立会话记忆，并拒绝损坏或类型错误的 JSON。"""
         row = self._fetchone(
             """
-            SELECT summary, requirements_summary, last_task_summary, modified_files_json, verification
+            SELECT summary, requirements_summary, last_task_summary,
+                   modified_files_json, verification, permission
             FROM session_memory WHERE session_id = ?
             """,
             (session_id,),
@@ -323,6 +338,7 @@ class SessionStore:
             last_task_summary=_require_text(row, "last_task_summary"),
             modified_files=tuple(files),
             verification=_require_text(row, "verification"),
+            permission_level=_require_text(row, "permission"),
         )
 
     def save_memory(self, session_id: str, memory: SessionMemory) -> None:
@@ -337,7 +353,7 @@ class SessionStore:
                     """
                     UPDATE session_memory
                     SET summary = ?, requirements_summary = ?, last_task_summary = ?,
-                        modified_files_json = ?, verification = ?
+                        modified_files_json = ?, verification = ?, permission = ?
                     WHERE session_id = ?
                     """,
                     (
@@ -346,6 +362,7 @@ class SessionStore:
                         memory.last_task_summary,
                         files_json,
                         memory.verification,
+                        memory.permission_level,
                         session_id,
                     ),
                 )

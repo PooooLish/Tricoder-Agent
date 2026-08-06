@@ -211,6 +211,7 @@ class SessionMemory:
     last_task_summary: str = ""
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
+    permission_level: str = "strict"
 
 
 @dataclass(frozen=True, slots=True)

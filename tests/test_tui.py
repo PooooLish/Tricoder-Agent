@@ -263,6 +263,11 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.press("enter")
             await pilot.pause()
+            for _ in range(10):
+                await pilot.pause()
+            self.assertEqual("relaxed", app.runtime.permission_level)
+            content = app.query_one("#sidebar-content", Static).content
+            self.assertIn("relaxed", content)
 
         self.assertEqual("relaxed", app.runtime.permission_level)
 

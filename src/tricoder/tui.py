@@ -573,7 +573,7 @@ class TricoderApp(App[None]):
                 self.log_line(f"[red]权限操作失败：{exc}[/red]")
                 return
             self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
-        self._refresh_sidebar_impl()
+            self._refresh_sidebar_impl()
 
         self.push_screen(
             OptionListScreen("选择权限级别", options, current), respond

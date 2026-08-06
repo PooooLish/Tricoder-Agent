@@ -101,7 +101,10 @@ provider-action protocols, and bound retrieval resources.
 - Completed: git boundary protection — git read-only commands are refused when
   the workspace is a subdirectory of a git repo (git would read the repo root
   history/sources outside the workspace). (1 new test.)
-- Verified locally: 432 tricoder tests pass, compileall OK. (Full-suite runs
+- Completed: permission is persisted per session (`SessionMemory.permission_level`
+  in SQLite with schema migration); sidebar refresh bug fixed (mis-indented call
+  in the permission selector callback). (2 new tests.)
+- Verified locally: 435 tricoder tests pass, compileall OK. (Full-suite runs
   show rare Windows file-timing flakes in pre-existing file-op tests; each
   passes in isolation.)
 

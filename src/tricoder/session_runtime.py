@@ -150,7 +150,6 @@ class SessionRuntime:
         self._agent_factory = agent_factory
         self._audit_factory = audit_factory
         self._approver = approver or (lambda _action, _detail: False)
-        self._permission_level = "strict"
         self._observer = observer
         self._unsaved_memory = False
         self._warning = ""
@@ -264,6 +263,7 @@ class SessionRuntime:
         memory = SessionMemory(
             modified_files=original.memory.modified_files,
             verification=original.memory.verification,
+            permission_level=original.memory.permission_level,
         )
         self.current = replace(
             original,
@@ -346,6 +346,7 @@ class SessionRuntime:
             last_task_summary=persisted_summary,
             modified_files=tuple(result.modified_files),
             verification=verification,
+            permission_level=original.memory.permission_level,
         )
         self.current = replace(original, memory=memory, context=turn.context)
         self._cache_current()
@@ -501,34 +502,39 @@ class SessionRuntime:
 
     @property
     def permission_level(self) -> str:
-        """当前权限级别：strict（默认）、relaxed 或 fullaccess。"""
-        return self._permission_level
+        """当前会话的权限级别：strict（默认）、relaxed 或 fullaccess。"""
+        return self.current.memory.permission_level
 
     def set_permission(self, level: str | None) -> str:
-        """查看或切换权限级别。
+        """查看或切换当前会话的权限级别并持久化。
 
         relaxed 自动放行只读/测试命令；fullaccess 放行全部非危险工具。
         """
         if level is None:
-            return self._permission_level
+            return self.permission_level
         normalized = level.strip().lower()
         if normalized not in {"strict", "relaxed", "fullaccess"}:
             raise SessionRuntimeError("permission 只能是 strict、relaxed 或 fullaccess")
-        self._permission_level = normalized
+        current = self.current
+        memory = replace(current.memory, permission_level=normalized)
+        self.current = replace(current, memory=memory)
+        self._cache_current()
+        self._memory_dirty = memory != self._persisted_memory
+        self.persist_current()
         return normalized
 
     def _effective_approver(self, action: str, detail: str) -> bool:
-        """按权限级别决定审批策略。
+        """按当前会话权限级别决定审批策略。
 
         - relaxed：只读/测试命令（已被 CommandPolicy 白名单约束）自动放行；
         - fullaccess：放行全部非危险工具（命令仍受 CommandPolicy 白名单、
           read_only/敏感路径等硬边界不放松）；
         - strict：全部交回人工审批。
         """
-        if self._permission_level == "relaxed" and action == "run_command":
+        if self.current.memory.permission_level == "relaxed" and action == "run_command":
             return True
         if (
-            self._permission_level == "fullaccess"
+            self.current.memory.permission_level == "fullaccess"
             and action not in _DANGEROUS_TOOLS
         ):
             return True

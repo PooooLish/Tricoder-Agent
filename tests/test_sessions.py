@@ -89,6 +89,17 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(created.model, restored.model)
         self.assertEqual(SessionMemory(), self.store.load_memory(created.id))
 
+    def test_memory_roundtrips_permission_level(self) -> None:
+        """权限级别随会话记忆持久化并可恢复；默认 strict。"""
+        created = self.store.create("perm", self.workspace, "deepseek", "model-a")
+        self.assertEqual("strict", self.store.load_memory(created.id).permission_level)
+        self.store.save_memory(
+            created.id, SessionMemory(permission_level="fullaccess")
+        )
+        self.assertEqual(
+            "fullaccess", self.store.load_memory(created.id).permission_level
+        )
+
     def test_invalid_memory_file_list_rolls_back_existing_memory(self) -> None:
         """防止非字符串 JSON 项写入后破坏已有的会话记忆。"""
         created = self.store.create("stable", self.workspace, "deepseek", "model-a")
