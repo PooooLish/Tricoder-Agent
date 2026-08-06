@@ -8,17 +8,17 @@ Agent 循环在后台线程运行，UI 事件通过 Textual 线程安全机制�
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from textual import on
 from textual.app import App, ComposeResult
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
 
 from tricoder.agent import AgentObserver
 from tricoder.commands import CommandError, is_slash_command, list_commands, parse_command
-from tricoder.models import RunResult, TokenUsage, ToolAction, ToolResult
+from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 from tricoder.session_runtime import SessionRuntime, SessionRuntimeError
 
 
@@ -59,6 +59,44 @@ class ApprovalScreen(ModalScreen[bool]):
 
     def action_reject(self) -> None:
         self.dismiss(False)
+
+
+class OptionListScreen(ModalScreen[str]):
+    """通用方向键选择列表；Enter 确认、Esc 取消，返回选项值或 None。"""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        title: str,
+        options: Sequence[str],
+        current: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._options = list(options)
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"[bold cyan]{self._title}[/bold cyan]")
+        items = [ListItem(Label(str(option))) for option in self._options]
+        yield ListView(*items, id="options")
+        yield Static("[dim]↑/↓ 选择 · Enter 确认 · Esc 取消[/dim]", classes="approval-hint")
+
+    def on_mount(self) -> None:
+        list_view = self.query_one("#options", ListView)
+        if self._current is not None and self._current in self._options:
+            list_view.index = self._options.index(self._current)
+        list_view.focus()
+
+    @on(ListView.Selected)
+    def _selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        list_view = self.query_one("#options", ListView)
+        self.dismiss(self._options[list_view.index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class TuiObserver(AgentObserver):
@@ -268,8 +306,12 @@ class TricoderApp(App[None]):
                 self._show_diff()
             elif command.name == "undo":
                 self._undo()
+            elif command.name == "model":
+                self._choose_model()
             elif command.name == "session":
                 self._handle_session(command.subcommand, command.argument)
+            elif command.name == "permission":
+                self._permission(command.argument)
             elif command.name == "exit":
                 self.action_quit()
         except SessionRuntimeError as exc:
@@ -295,6 +337,7 @@ class TricoderApp(App[None]):
             f"[cyan]模式[/cyan] {'只读' if config.read_only else '可编辑 · 人工审批'} · "
             f"[cyan]验证[/cyan] {memory.verification}"
         )
+        self.log_line(f"[cyan]权限[/cyan] {self.runtime.permission_level}")
 
     def _clear_current(self) -> None:
         if not self._confirm("清除当前会话的上下文和摘要？"):
@@ -353,11 +396,66 @@ class TricoderApp(App[None]):
         else:
             self.log_line_safe("[red]撤销未完成，文件未被修改。[/red]")
 
+    def _permission(self, argument: str | None) -> None:
+        if argument is None:
+            self._choose_permission()
+            return
+        try:
+            level = self.runtime.set_permission(argument)
+        except SessionRuntimeError as exc:
+            self.log_line(f"[red]权限操作失败：{exc}[/red]")
+            return
+        self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+
+    def _choose_permission(self) -> None:
+        options = ("strict", "relaxed")
+        current = self.runtime.permission_level
+
+        def respond(value: str | None) -> None:
+            if value is None or value == current:
+                return
+            try:
+                level = self.runtime.set_permission(value)
+            except SessionRuntimeError as exc:
+                self.log_line(f"[red]权限操作失败：{exc}[/red]")
+                return
+            self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+
+        self.push_screen(
+            OptionListScreen("选择权限级别", options, current), respond
+        )
+
+    def _choose_model(self) -> None:
+        providers = ("openai", "deepseek", "glm")
+        current = self.runtime.current.record.provider
+
+        def respond(value: str | None) -> None:
+            if value is None or value == current:
+                return
+            self.run_worker(
+                lambda: self._change_model_worker(value),
+                thread=True, exclusive=True, name="model-switch",
+            )
+
+        self.push_screen(
+            OptionListScreen("选择 Provider", providers, current), respond
+        )
+
+    def _change_model_worker(self, provider: str) -> None:
+        if self.runtime is None:
+            return
+        try:
+            self.runtime.change_model(provider)
+        except SessionRuntimeError as exc:
+            self.log_line_safe(f"[red]模型切换失败：{exc}[/red]")
+            return
+        self.log_line_safe(f"[yellow]已切换到 Provider：{provider}[/yellow]")
+
     def _handle_session(self, subcommand: str | None, argument: str | None) -> None:
         if self.runtime is None:
             return
         if subcommand is None:
-            self.log_line("[dim]跨工作区会话列表与切换暂未在 TUI 提供，请使用交互 CLI。[/dim]")
+            self._choose_session()
         elif subcommand == "current":
             self._show_status()
         elif subcommand == "new":
@@ -365,12 +463,65 @@ class TricoderApp(App[None]):
                 lambda: self._session_new_worker(argument or "default"),
                 thread=True, exclusive=True, name="session-new",
             )
+        elif subcommand == "rename":
+            if not argument:
+                self.log_line("[dim]用法：/session rename <名称>[/dim]")
+                return
+            try:
+                self.runtime.rename_current(argument)
+            except SessionRuntimeError as exc:
+                self.log_line(f"[red]重命名失败：{exc}[/red]")
+                return
+            self.log_line(f"[yellow]当前会话已重命名为：{argument}[/yellow]")
 
     def _session_new_worker(self, name: str) -> None:
         if self.runtime is None:
             return
         self.runtime.create(name)
         self.log_line_safe(f"[yellow]已创建并切换到新会话：{name}[/yellow]")
+
+    def _choose_session(self) -> None:
+        sessions = self.runtime.store.list_all()
+        if not sessions:
+            self.log_line("[dim]没有可切换的会话。[/dim]")
+            return
+        current_id = self.runtime.current.record.id
+        options = [
+            f"{record.name}  ({record.provider} · {record.model})"
+            for record in sessions
+        ]
+        current_name = next(
+            (record.name for record in sessions if record.id == current_id), None
+        )
+
+        def respond(value: str | None) -> None:
+            if value is None:
+                return
+            index = options.index(value)
+            record = sessions[index]
+            if record.id == current_id:
+                return
+            self.run_worker(
+                lambda: self._switch_worker(record),
+                thread=True, exclusive=True, name="session-switch",
+            )
+
+        self.push_screen(
+            OptionListScreen("选择会话", options, current_name), respond
+        )
+
+    def _switch_worker(self, record: SessionRecord) -> None:
+        try:
+            self.runtime.switch(
+                record.id,
+                confirm=lambda workspace: self._confirm(
+                    f"目标工作区为 {workspace}。确认切换？"
+                ),
+            )
+        except SessionRuntimeError as exc:
+            self.log_line_safe(f"[red]会话切换失败：{exc}[/red]")
+            return
+        self.log_line_safe(f"[yellow]已切换到会话：{record.name}[/yellow]")
 
     # ---- 退出 ----
 

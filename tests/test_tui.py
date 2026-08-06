@@ -10,7 +10,7 @@ from tricoder.agent import PLANNING_PROMPT
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime
 from tricoder.sessions import SessionStore
-from tricoder.tui import ApprovalScreen, TricoderApp
+from tricoder.tui import ApprovalScreen, OptionListScreen, TricoderApp
 
 
 class FakeProvider:
@@ -148,6 +148,41 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             "def answer():\n    return 41\n",
             (self.workspace / "src" / "app.py").read_text(encoding="utf-8"),
         )
+
+    async def _wait_option_list(self, pilot) -> None:
+        app = self.app
+        assert app is not None
+        for _ in range(300):
+            await pilot.pause()
+            if isinstance(app.screen, OptionListScreen):
+                return
+        self.fail("选择列表未出现")
+
+    async def test_permission_command_selects_with_arrow_keys(self) -> None:
+        """/permission 无参时弹方向键选择列表，选择 relaxed 后生效。"""
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "/permission")
+            await self._wait_option_list(pilot)
+            self.assertEqual(["strict", "relaxed"], app.screen._options)
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertEqual("relaxed", app.runtime.permission_level)
+
+    async def test_permission_stays_strict_on_escape(self) -> None:
+        """/permission 选择列表按 Esc 取消不改变级别。"""
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "/permission")
+            await self._wait_option_list(pilot)
+            await pilot.press("escape")
+            await pilot.pause()
+
+        self.assertEqual("strict", app.runtime.permission_level)
 
 
 if __name__ == "__main__":
