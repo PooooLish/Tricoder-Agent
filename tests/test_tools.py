@@ -770,6 +770,34 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(clean.ok)
         self.assertIn("没有未提交变更", clean.output)
 
+    def test_git_diff_rejects_when_repo_root_outside_workspace(self) -> None:
+        """git 在仓库子目录工作区执行会越界读取仓库根，必须拒绝。"""
+        if shutil.which("git") is None:
+            self.skipTest("当前环境没有 git")
+        outer = Path(tempfile.mkdtemp(prefix="repo-outside-"))
+        try:
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "config", "user.email", "test@example.com"],
+                ["git", "config", "user.name", "test"],
+            ):
+                subprocess.run(command, cwd=outer, check=True)
+            inner = outer / "sub"
+            inner.mkdir()
+            registry = ToolRegistry(
+                ToolContext(
+                    WorkspacePolicy(inner),
+                    CommandPolicy(),
+                    approver=lambda _action, _detail: True,
+                    timeout=5,
+                )
+            )
+            result = registry.execute("git_diff", {})
+            self.assertFalse(result.ok)
+            self.assertIn("工作区", result.output)
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
     def test_glob_files_rejects_unbounded_patterns(self) -> None:
         """过长模式或过多 ** 会放大扫描规模，必须拒绝。"""
         for pattern in ("x" * 300, "**/**/**/*.py"):

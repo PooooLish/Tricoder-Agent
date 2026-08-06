@@ -176,6 +176,33 @@ class CommandPolicyTests(unittest.TestCase):
                 with self.assertRaises(PolicyError):
                     self.policy.validate(command)
 
+    def test_accepts_workspace_script_execution(self) -> None:
+        """python 运行工作区内相对 .py 脚本放行；审批级别控制自动执行。"""
+        commands = (
+            "python test/smoke_demo.py",
+            "python test/smoke_demo.py -q",
+            "python src/main.py --debug out.txt",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(self.policy.validate(command))
+
+    def test_rejects_unsafe_script_execution(self) -> None:
+        """脚本执行禁止绝对路径、越界、非 .py、裸选项或敏感路径段。"""
+        commands = (
+            "python C:\\outside\\script.py",
+            "python ..\\outside.py",
+            "python script",
+            "python --version",
+            "python .env/evil.py",
+            "python .git/hooks/pre-commit.py",
+            "python secrets/leak.py",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(PolicyError):
+                    self.policy.validate(command)
+
     def test_rejects_git_compact_and_pager_options(self) -> None:
         """git 紧凑全局选项、pager 与 textconv 可切换目录或执行外部程序。"""
         commands = (

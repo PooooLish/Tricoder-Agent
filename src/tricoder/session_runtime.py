@@ -39,6 +39,12 @@ class SessionRuntimeError(RuntimeError):
     """会话装配、切换或内存持久化无法安全完成。"""
 
 
+# fullaccess 级别下仍要求人工审批的“明确危险”工具。
+# 当前工具集无删除/重命名能力；未来新增 delete_file、rename_file 等
+# 破坏性工具时应加入此集合，fullaccess 下它们仍需审批。
+_DANGEROUS_TOOLS: frozenset[str] = frozenset()
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeOptions:
     """保留启动参数，确保切换和模型变更沿用同一安全边界。"""
@@ -495,23 +501,36 @@ class SessionRuntime:
 
     @property
     def permission_level(self) -> str:
-        """当前权限级别：strict（默认）或 relaxed。"""
+        """当前权限级别：strict（默认）、relaxed 或 fullaccess。"""
         return self._permission_level
 
     def set_permission(self, level: str | None) -> str:
-        """查看或切换权限级别；relaxed 自动放行只读/测试命令。"""
+        """查看或切换权限级别。
+
+        relaxed 自动放行只读/测试命令；fullaccess 放行全部非危险工具。
+        """
         if level is None:
             return self._permission_level
         normalized = level.strip().lower()
-        if normalized not in {"strict", "relaxed"}:
-            raise SessionRuntimeError("permission 只能是 strict 或 relaxed")
+        if normalized not in {"strict", "relaxed", "fullaccess"}:
+            raise SessionRuntimeError("permission 只能是 strict、relaxed 或 fullaccess")
         self._permission_level = normalized
         return normalized
 
     def _effective_approver(self, action: str, detail: str) -> bool:
-        """relaxed 下只读/测试命令（已被 CommandPolicy 白名单约束）自动放行；
-        文件写入与 strict 模式始终交回人工审批。"""
+        """按权限级别决定审批策略。
+
+        - relaxed：只读/测试命令（已被 CommandPolicy 白名单约束）自动放行；
+        - fullaccess：放行全部非危险工具（命令仍受 CommandPolicy 白名单、
+          read_only/敏感路径等硬边界不放松）；
+        - strict：全部交回人工审批。
+        """
         if self._permission_level == "relaxed" and action == "run_command":
+            return True
+        if (
+            self._permission_level == "fullaccess"
+            and action not in _DANGEROUS_TOOLS
+        ):
             return True
         return self._approver(action, detail)
 

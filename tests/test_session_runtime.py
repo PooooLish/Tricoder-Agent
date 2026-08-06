@@ -1215,6 +1215,17 @@ class SessionRuntimeTests(unittest.TestCase):
         self.runtime.set_permission("strict")
         self.assertFalse(self.runtime._effective_approver("run_command", "detail"))
 
+    def test_permission_fullaccess_allows_all_but_dangerous_tools(self) -> None:
+        """fullaccess 放行全部现有工具；危险工具集合（当前为空）中的动作仍审批。"""
+        self.runtime.set_permission("fullaccess")
+        self.assertEqual("fullaccess", self.runtime.permission_level)
+        for action in ("edit_file", "create_file", "apply_patch", "run_command"):
+            with self.subTest(action=action):
+                self.assertTrue(self.runtime._effective_approver(action, "detail"))
+        # 非法值仍拒绝
+        with self.assertRaises(SessionRuntimeError):
+            self.runtime.set_permission("admin")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,11 @@ class CommandPolicy:
         "--show-error-codes", "--pretty", "--no-error-summary",
     }
     _ABSOLUTE_PATH_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
+    _SENSITIVE_PARTS = {
+        ".git", ".ssh", ".aws", ".config", ".local", ".env", ".env.local",
+        "credentials", "secrets", "id_rsa", "id_ed25519",
+    }
+    _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 
     def validate(self, command: str) -> list[str]:
         """返回可交给 `subprocess` 的参数数组，否则抛出策略错误。
@@ -186,7 +191,8 @@ class CommandPolicy:
 
     def _validate_python(self, args: list[str]) -> list[str]:
         if len(args) < 3 or args[1] != "-m":
-            raise PolicyError("Python 仅允许通过 -m 运行测试或静态检查模块")
+            # 脚本执行：python <工作区内相对 .py 脚本> [参数...]
+            return self._validate_python_script(args)
         module = args[2].lower()
         if module not in self._PYTHON_MODULES:
             raise PolicyError(f"Python 模块不在允许列表中：{args[2]}")
@@ -196,6 +202,25 @@ class CommandPolicy:
             self._validate_ruff_args(args[3:])
         elif module == "mypy":
             self._validate_tool_params(args[3:], self._MYPY_ALLOWED_OPTIONS, "mypy")
+        return args
+
+    def _validate_python_script(self, args: list[str]) -> list[str]:
+        """允许运行工作区内相对路径的 .py 脚本。
+
+        脚本与后续位置参数必须是工作区内相对路径（无绝对、无 ``..``、
+        无敏感路径段）；该能力在审批层由权限级别控制（fullaccess 自动放行）。
+        """
+        if len(args) < 2 or args[1].startswith("-"):
+            raise PolicyError("Python 脚本必须以工作区内相对路径开始")
+        if not args[1].endswith(".py"):
+            raise PolicyError("Python 仅允许运行 .py 脚本")
+        for segment in re.split(r"[\\/]+", args[1]):
+            lowered = segment.lower()
+            if lowered in self._SENSITIVE_PARTS or (
+                Path(lowered).suffix in self._SENSITIVE_SUFFIXES
+            ):
+                raise PolicyError(f"Python 脚本路径包含敏感段：{segment}")
+        self._require_relative_paths(args[1:], "python")
         return args
 
     def _validate_ruff_args(self, params: list[str]) -> None:

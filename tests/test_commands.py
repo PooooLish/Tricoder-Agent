@@ -105,6 +105,10 @@ class CommandParserTests(unittest.TestCase):
             ParsedCommand("permission", None, "strict"),
             parse_command("/Permission STRICT"),
         )
+        self.assertEqual(
+            ParsedCommand("permission", None, "fullaccess"),
+            parse_command("/permission fullaccess"),
+        )
         for text in ("/permission admin", "/permission  bypass"):
             with self.subTest(text=text):
                 with self.assertRaises(CommandError):

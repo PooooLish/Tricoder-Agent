@@ -40,7 +40,7 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "session": CommandSpec("列出、新建、查看或重命名会话"),
     "permission": CommandSpec(
-        "查看权限级别，或切换 strict / relaxed（relaxed 自动放行只读/测试命令）",
+        "查看权限级别，或切换 strict / relaxed / fullaccess（fullaccess 放行全部非危险工具）",
         takes_argument=True,
     ),
     "exit": CommandSpec("保存安全记忆并退出"),
@@ -90,8 +90,8 @@ def parse_command(text: str) -> ParsedCommand:
 
     if name == "permission":
         argument = remainder.strip().lower() or None
-        if argument is not None and argument not in {"strict", "relaxed"}:
-            raise CommandError("permission 只能是 strict 或 relaxed")
+        if argument is not None and argument not in {"strict", "relaxed", "fullaccess"}:
+            raise CommandError("permission 只能是 strict、relaxed 或 fullaccess")
         return ParsedCommand("permission", None, argument)
 
     if name != "session":
