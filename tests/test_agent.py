@@ -579,8 +579,8 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertIn("工具调用", feedback.content or "")
         self.assertNotIn("leak.py", feedback.content or "")
 
-    def test_multiple_tool_calls_execute_none_and_request_one_call(self) -> None:
-        """并行调用不得产生部分执行或文件副作用。"""
+    def test_multiple_tool_calls_execute_in_order(self) -> None:
+        """一轮内多个工具调用被顺序执行并逐条回填结果。"""
         provider = StructuredScriptedProvider(
             [
                 ProviderResponse(
@@ -599,23 +599,31 @@ class NativeToolCallingTests(unittest.TestCase):
                                 "new_text": "value = 2",
                             },
                         ),
+                        ToolCall(
+                            "call-check",
+                            "run_command",
+                            {"command": "python -m compileall -q sample.py created.py"},
+                        ),
                     )
                 ),
-                self.response("call-finish", "finish", {"summary": "已选择单个调用"}),
+                self.response("call-finish", "finish", {"summary": "多调用完成"}),
             ]
         )
 
-        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("拒绝并行调用")
+        result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("顺序执行多个调用")
 
         self.assertTrue(result.ok)
-        self.assertFalse((self.workspace / "created.py").exists())
+        self.assertTrue((self.workspace / "created.py").exists())
         self.assertEqual(
-            "value = 1\n",
+            "value = 2\n",
             (self.workspace / "sample.py").read_text(encoding="utf-8"),
         )
-        feedback = provider.histories[1][-1]
-        self.assertEqual("user", feedback.role)
-        self.assertIn("一个", feedback.content or "")
+        first_round = provider.histories[1]
+        self.assertEqual("assistant", first_round[-4].role)
+        self.assertEqual(3, len(first_round[-4].tool_calls))
+        self.assertEqual("tool", first_round[-3].role)
+        self.assertEqual("tool", first_round[-2].role)
+        self.assertEqual("tool", first_round[-1].role)
 
     def test_protocol_error_can_recover_but_provider_error_stops_and_rolls_back(
         self,
@@ -775,13 +783,7 @@ class NativeToolCallingTests(unittest.TestCase):
         """旧任务归一化只淘汰纠错消息，不得连带丢失之后的成功回合。"""
         corrections = {
             "plain_text": ProviderResponse(content="普通文本"),
-            "multiple_calls": ProviderResponse(
-                tool_calls=(
-                    ToolCall("call-one", "read_file", {"path": "sample.py"}),
-                    ToolCall("call-two", "finish", {"summary": "错误并行"}),
-                )
-            ),
-            "protocol_error": ProviderProtocolError("协议哨兵"),
+            "protocol_error": ProviderProtocolError("协议内比"),
         }
 
         for name, correction in corrections.items():
@@ -1258,6 +1260,41 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(2, len(provider.histories))
         self.assertEqual(
             ["task", "generic", "tool_result"],
+            [message.kind for message in failed.context.messages],
+        )
+        self.assertEqual(("sample.py",), failed.context.modified_files)
+        self.assertEqual("待验证", failed.context.verification)
+
+    def test_provider_failure_after_multi_tool_round_preserves_context(self) -> None:
+        """多工具回合在后续 Provider 失败回滚时仍应被保留，不得整块丢弃。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall("call-read", "read_file", {"path": "sample.py"}),
+                        ToolCall(
+                            "call-edit",
+                            "edit_file",
+                            {
+                                "path": "sample.py",
+                                "old_text": "value = 1",
+                                "new_text": "value = 2",
+                            },
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                ),
+                ProviderError("第二次请求故障"),
+            ]
+        )
+        agent = CodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
+
+        failed = agent.run_with_context("多工具回合", SessionContext())
+
+        self.assertFalse(failed.result.ok)
+        self.assertEqual(2, len(provider.histories))
+        self.assertEqual(
+            ["task", "generic", "tool_result", "tool_result"],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)

@@ -68,7 +68,7 @@ flowchart LR
 
 ## 原生工具协议
 
-三家 Provider 都支持原生 structured tool calling。TriCoder 默认使用 `native`：向 Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响应归一化为 `ProviderResponse`，Agent 每轮只接受一个结构化工具调用，并用对应的 `tool_call_id` 回填工具结果。
+三家 Provider 都支持原生 structured tool calling。TriCoder 默认使用 `native`：向 Chat Completions 请求发送工具定义，由 Provider 适配器把厂商响应归一化为 `ProviderResponse`，Agent 一轮内可接受多个结构化工具调用并按顺序逐个执行（每个动作独立审批与审计），用对应的 `tool_call_id` 回填工具结果。
 
 | Provider | 原生工具调用 | 当前适配说明 |
 | --- | --- | --- |

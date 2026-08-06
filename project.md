@@ -73,7 +73,11 @@ provider-action protocols, and bound retrieval resources.
 - Completed: command registry (`commands.py` `COMMAND_SPECS`, `/help` generated
   from it in both UIs) and `git_diff` tool demonstrating the tool extension
   point (registered in `tools/__init__.py`, 2 new tests).
-- Verified locally: 417 tricoder tests pass, compileall OK.
+- Completed: multi-tool-call rounds (native protocol accepts N calls per round,
+  executed sequentially with independent approval/audit) and default
+  max_rounds raised 12 → 30. Compaction now groups variable-length tool rounds.
+  (2 updated + 2 new tests.)
+- Verified locally: 419 tricoder tests pass, compileall OK.
 
 ## Next Action
 
@@ -84,6 +88,8 @@ provider-action protocols, and bound retrieval resources.
   worker cancellation on exit.
 - Planner-Executor roadmap: planning with read-only exploration tools;
   per-task plan persistence for `/diff`/`/undo` context.
+- Round-budget roadmap: remaining-rounds prompt injection; stagnation
+  detection; per-plan round budget.
 
 ## Blockers
 

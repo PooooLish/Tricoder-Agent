@@ -157,7 +157,7 @@ class AppConfig:
 
     workspace: Path
     provider: ProviderConfig
-    max_rounds: int = 12
+    max_rounds: int = 30
     timeout: float = 30.0
     read_only: bool = False
     env_file: Path | None = None

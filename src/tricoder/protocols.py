@@ -43,7 +43,6 @@ SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + NATIVE_TOOL_PROMPT
 LEGACY_SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + LEGACY_JSON_PROMPT
 
 NATIVE_TEXT_FEEDBACK = "本轮没有工具调用。请下一轮只选择一个可用工具调用。"
-NATIVE_MULTIPLE_CALLS_FEEDBACK = "本轮包含多个工具调用，未执行任何一个。请下一轮只选择一个。"
 PROTOCOL_FEEDBACK = "模型响应未满足当前协议。请下一轮按系统规则重新提交一个动作。"
 
 
@@ -71,13 +70,17 @@ def parse_action(raw: str) -> ToolAction:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedAction:
-    """模型响应解析结果：assistant 消息、可执行动作或修正反馈。"""
+    """模型响应解析结果：assistant 消息、可执行动作或修正反馈。
+
+    ``actions`` 与 ``tool_call_ids`` 一一对应；原生协议可一次携带多个动作，
+    legacy 协议每次至多一个。
+    """
 
     assistant_messages: tuple[Message, ...]
-    action: ToolAction | None = None
+    actions: tuple[ToolAction, ...] = ()
+    tool_call_ids: tuple[str | None, ...] = ()
     feedback: Message | None = None
     audit_error_type: str | None = None
-    tool_call_id: str | None = None
 
 
 class ActionProtocol(Protocol):
@@ -127,27 +130,27 @@ class NativeToolProtocol:
     tools_enabled = True
 
     def resolve_action(self, response: ProviderResponse) -> ResolvedAction:
-        if len(response.tool_calls) != 1:
+        if not response.tool_calls:
             pending: list[Message] = []
-            if not response.tool_calls and response.content:
+            if response.content:
                 pending.append(Message("assistant", response.content))
-                feedback = NATIVE_TEXT_FEEDBACK
-            elif response.tool_calls:
-                feedback = NATIVE_MULTIPLE_CALLS_FEEDBACK
-            else:
-                feedback = NATIVE_TEXT_FEEDBACK
             return ResolvedAction(
                 assistant_messages=tuple(pending),
-                feedback=Message("user", feedback, kind="protocol_feedback"),
+                feedback=Message("user", NATIVE_TEXT_FEEDBACK, kind="protocol_feedback"),
                 audit_error_type="ToolCallCountError",
             )
-        call = response.tool_calls[0]
+        # 一次接受多个工具调用；由 Agent 顺序执行并逐条回填。
+        actions = tuple(
+            ToolAction(call.name, call.arguments, "")
+            for call in response.tool_calls
+        )
+        ids = tuple(call.id for call in response.tool_calls)
         return ResolvedAction(
             assistant_messages=(
-                Message("assistant", response.content, tool_calls=(call,)),
+                Message("assistant", response.content, tool_calls=response.tool_calls),
             ),
-            action=ToolAction(tool=call.name, arguments=call.arguments, reason=""),
-            tool_call_id=call.id,
+            actions=actions,
+            tool_call_ids=ids,
         )
 
     def tool_result_message(
@@ -203,7 +206,8 @@ class LegacyJsonProtocol:
             )
         return ResolvedAction(
             assistant_messages=(assistant_message,),
-            action=action,
+            actions=(action,),
+            tool_call_ids=(None,),
         )
 
     def tool_result_message(

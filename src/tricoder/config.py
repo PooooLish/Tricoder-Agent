@@ -328,7 +328,7 @@ def load_config(
     rounds_value = (
         max_rounds
         if max_rounds is not None
-        else env.get("TRICODER_MAX_ROUNDS", agent_table.get("max_rounds", 12))
+        else env.get("TRICODER_MAX_ROUNDS", agent_table.get("max_rounds", 30))
     )
     context_chars_value = (
         max_context_chars

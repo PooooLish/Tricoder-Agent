@@ -3,7 +3,7 @@
 import unittest
 
 from tricoder.agent import _is_complete_tool_round
-from tricoder.models import Message, ToolCall
+from tricoder.models import Message, ProviderResponse, ToolCall
 from tricoder.protocols import LegacyJsonProtocol, NativeToolProtocol
 
 
@@ -65,6 +65,29 @@ class ProtocolCompleteRoundTests(unittest.TestCase):
         """legacy 宽松判定仍要求 assistant 不带原生工具调用。"""
         assistant = Message("assistant", None, tool_calls=(ToolCall("a", "read_file", {}),))
         self.assertFalse(self.legacy.complete_round_loose(assistant, _tool_result("user")))
+
+    def test_native_resolve_action_returns_multiple_actions(self) -> None:
+        """原生协议一次可解析多个工具调用，动作与 id 一一对应。"""
+        response = ProviderResponse(
+            content=None,
+            tool_calls=(
+                ToolCall("call-a", "read_file", {"path": "x.py"}),
+                ToolCall("call-b", "search_text", {"path": ".", "query": "foo"}),
+            ),
+            finish_reason="tool_calls",
+        )
+        resolved = NativeToolProtocol().resolve_action(response)
+        self.assertEqual(2, len(resolved.actions))
+        self.assertEqual(("call-a", "call-b"), resolved.tool_call_ids)
+        self.assertEqual(1, len(resolved.assistant_messages))
+        self.assertEqual(2, len(resolved.assistant_messages[0].tool_calls))
+
+    def test_native_resolve_action_empty_calls_gives_feedback(self) -> None:
+        """原生协议无工具调用时返回修正反馈而非动作。"""
+        response = ProviderResponse(content="继续", finish_reason="stop")
+        resolved = NativeToolProtocol().resolve_action(response)
+        self.assertEqual((), resolved.actions)
+        self.assertIsNotNone(resolved.feedback)
 
     def test_is_complete_tool_round_none_uses_loose_any(self) -> None:
         """None 协议用宽松判定匹配任一协议，兼容旧 user 消息。"""

@@ -22,7 +22,6 @@ from tricoder.protocols import (
     COMMON_SYSTEM_PROMPT,
     LEGACY_JSON_PROMPT,
     LEGACY_SYSTEM_PROMPT,
-    NATIVE_MULTIPLE_CALLS_FEEDBACK,
     NATIVE_TEXT_FEEDBACK,
     PROTOCOL_FEEDBACK,
     SYSTEM_PROMPT,
@@ -73,6 +72,49 @@ def _is_complete_tool_round(
     return _PROTOCOLS[tool_protocol].complete_round(assistant, tool_result)
 
 
+def _complete_round_tail(
+    messages: list[Message],
+    index: int,
+    tool_protocol: str | None = None,
+) -> int | None:
+    """若 ``messages[index:]`` 以完整工具回合开头，返回回合结束后的下标；否则 None。
+
+    native：一个 assistant 携带 N 个 ``tool_calls``，后跟 N 个按 id 匹配的
+    ``tool`` 结果；legacy：assistant（无 tool_calls）+ 一个 user 结果。
+    ``tool_protocol`` 为 None 时按宽松语义判定（legacy 不检查 kind）。
+    """
+
+    assistant = messages[index]
+    if assistant.role != "assistant":
+        return None
+    if assistant.tool_calls:
+        if tool_protocol not in {None, "native"}:
+            return None
+        cursor = index + 1
+        for call in assistant.tool_calls:
+            if cursor >= len(messages):
+                return None
+            result = messages[cursor]
+            if (
+                result.role != "tool"
+                or result.kind != "tool_result"
+                or result.tool_call_id != call.id
+            ):
+                return None
+            cursor += 1
+        return cursor
+    if tool_protocol not in {None, "legacy_json"}:
+        return None
+    if index + 1 >= len(messages):
+        return None
+    result = messages[index + 1]
+    if result.role != "user":
+        return None
+    if tool_protocol == "legacy_json" and result.kind != "tool_result":
+        return None
+    return index + 2
+
+
 def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
     """按完整工具交互回合压缩，并始终保留前两条固定消息。"""
 
@@ -83,19 +125,18 @@ def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
     fixed_messages = copied_messages[:2]
     later_messages = copied_messages[2:]
 
-    rounds: list[tuple[Message, Message]] = []
+    rounds: list[list[Message]] = []
     index = 0
-    while index + 1 < len(later_messages):
-        assistant = later_messages[index]
-        tool_result = later_messages[index + 1]
-        if _is_complete_tool_round(assistant, tool_result):
-            rounds.append((assistant, tool_result))
-            index += 2
+    while index < len(later_messages):
+        end = _complete_round_tail(later_messages, index)
+        if end is not None:
+            rounds.append(later_messages[index:end])
+            index = end
         else:
             # 非法或孤立消息不构成可保留回合；继续寻找下一组合法边界。
             index += 1
 
-    complete_round_history = len(rounds) * 2 == len(later_messages)
+    complete_round_history = sum(len(round) for round in rounds) == len(later_messages)
     if (
         complete_round_history
         and sum(_message_chars(message) for message in copied_messages) <= max_chars
@@ -109,18 +150,20 @@ def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
         _message_chars(message) for message in [*fixed_messages, notice]
     )
 
-    retained_reversed: list[tuple[Message, Message]] = []
-    for interaction in reversed(rounds):
-        interaction_chars = sum(_message_chars(message) for message in interaction)
+    retained_reversed: list[list[Message]] = []
+    for round_messages in reversed(rounds):
+        interaction_chars = sum(
+            _message_chars(message) for message in round_messages
+        )
         if interaction_chars > remaining_chars:
             break
-        retained_reversed.append(interaction)
+        retained_reversed.append(round_messages)
         remaining_chars -= interaction_chars
 
     retained = [
         message
-        for interaction in reversed(retained_reversed)
-        for message in interaction
+        for round_messages in reversed(retained_reversed)
+        for message in round_messages
     ]
     return [*fixed_messages, notice, *retained]
 
@@ -136,12 +179,11 @@ def _normalize_history_task_block(
 
     retained: list[Message] = []
     index = 1
-    while index + 1 < len(block):
-        assistant = block[index]
-        tool_result = block[index + 1]
-        if _is_complete_tool_round(assistant, tool_result, tool_protocol):
-            retained.extend((assistant, tool_result))
-            index += 2
+    while index < len(block):
+        end = _complete_round_tail(block, index, tool_protocol)
+        if end is not None:
+            retained.extend(block[index:end])
+            index = end
         else:
             index += 1
     return [block[0], *retained] if retained else []
@@ -259,7 +301,7 @@ class CodingAgent:
         provider: ModelProvider,
         tools: ToolRegistry,
         *,
-        max_rounds: int = 12,
+        max_rounds: int = 30,
         max_context_chars: int = 80_000,
         audit: AuditLogger | None = None,
         observer: AgentObserver | None = None,
@@ -329,11 +371,7 @@ class CodingAgent:
                 if message.kind == "task"
             )
             return any(
-                _is_complete_tool_round(
-                    messages[index],
-                    messages[index + 1],
-                    self.tool_protocol,
-                )
+                _complete_round_tail(messages, index, self.tool_protocol) is not None
                 for index in range(current_task_index, len(messages) - 1)
             )
 
@@ -471,7 +509,7 @@ class CodingAgent:
 
             resolved = self._protocol.resolve_action(response)
             messages.extend(resolved.assistant_messages)
-            if resolved.action is None:
+            if not resolved.actions:
                 feedback = resolved.feedback or Message(
                     "user", PROTOCOL_FEEDBACK, kind="protocol_feedback"
                 )
@@ -497,82 +535,84 @@ class CodingAgent:
                     )
                 continue
 
-            action = resolved.action
-            if not action.reason:
-                definition = self.tools.describe(action.tool)
-                action = replace(
-                    action,
-                    reason=(
-                        definition.description
-                        if definition is not None
-                        else "请求执行未注册的工具。"
-                    ),
-                )
-            tool_call_id = resolved.tool_call_id
-
-            self.observer.on_action(action)
-            tool_calls += 1
-            result = self.tools.execute(action.tool, action.arguments)
-            # 只消费工具在文件安全边界内确认的规范路径，不回读模型原始参数。
-            changed_paths = tuple(
-                dict.fromkeys(
-                    ([result.relative_path] if result.relative_path is not None else [])
-                    + list(result.modified_paths)
-                )
-            ) if result.ok else ()
-            for changed_path in changed_paths:
-                if changed_path not in modified_files:
-                    modified_files.append(changed_path)
-            if changed_paths:
-                # 成功写入会使此前命令验证立即失效，必须重新验证。
-                verification = "待验证"
-            if action.tool == "run_command":
-                verification = "通过" if result.ok else "失败"
-            duration_ms = self._elapsed_ms(started)
-            self.observer.on_tool_result(action, result, duration_ms)
-            messages.append(
-                self._protocol.tool_result_message(action, result, tool_call_id)
-            )
-            if not self._log(
-                {
-                    "round": round_number,
-                    "status": "ok" if result.ok else "tool_error",
-                    "tool": (
-                        action.tool
-                        if self.tools.contains(action.tool)
-                        else "unknown"
-                    ),
-                    "reason_chars": len(action.reason),
-                    "arguments": self._audit_arguments(action, result),
-                    "output_chars": len(result.output),
-                    "duration_ms": duration_ms,
-                }
+            # 一次可执行多个动作：逐个顺序执行、独立审批与审计，最后统一回填。
+            for action, tool_call_id in zip(
+                resolved.actions, resolved.tool_call_ids
             ):
-                return turn_result(
-                    self._audit_failure_result(
-                        round_number,
-                        tool_calls,
-                        modified_files,
-                        verification,
+                if not action.reason:
+                    definition = self.tools.describe(action.tool)
+                    action = replace(
+                        action,
+                        reason=(
+                            definition.description
+                            if definition is not None
+                            else "请求执行未注册的工具。"
+                        ),
                     )
-                )
-            if action.tool == "finish":
-                completed = result.ok and (not modified_files or verification == "通过")
-                summary = result.output
-                if result.ok and modified_files and verification == "待验证":
-                    summary = f"{summary}；文件修改后尚未运行验证命令"
-                elif result.ok and modified_files and verification == "失败":
-                    summary = f"{summary}；文件修改后的验证失败"
-                return turn_result(
-                    RunResult(
-                        completed,
-                        summary,
-                        round_number,
-                        tool_calls,
-                        tuple(modified_files),
-                        verification,
+                self.observer.on_action(action)
+                tool_calls += 1
+                action_started = time.perf_counter()
+                result = self.tools.execute(action.tool, action.arguments)
+                # 只消费工具在文件安全边界内确认的规范路径，不回读模型原始参数。
+                changed_paths = tuple(
+                    dict.fromkeys(
+                        ([result.relative_path] if result.relative_path is not None else [])
+                        + list(result.modified_paths)
                     )
+                ) if result.ok else ()
+                for changed_path in changed_paths:
+                    if changed_path not in modified_files:
+                        modified_files.append(changed_path)
+                if changed_paths:
+                    # 成功写入会使此前命令验证立即失效，必须重新验证。
+                    verification = "待验证"
+                if action.tool == "run_command":
+                    verification = "通过" if result.ok else "失败"
+                duration_ms = self._elapsed_ms(action_started)
+                self.observer.on_tool_result(action, result, duration_ms)
+                messages.append(
+                    self._protocol.tool_result_message(action, result, tool_call_id)
                 )
+                if not self._log(
+                    {
+                        "round": round_number,
+                        "status": "ok" if result.ok else "tool_error",
+                        "tool": (
+                            action.tool
+                            if self.tools.contains(action.tool)
+                            else "unknown"
+                        ),
+                        "reason_chars": len(action.reason),
+                        "arguments": self._audit_arguments(action, result),
+                        "output_chars": len(result.output),
+                        "duration_ms": duration_ms,
+                    }
+                ):
+                    return turn_result(
+                        self._audit_failure_result(
+                            round_number,
+                            tool_calls,
+                            modified_files,
+                            verification,
+                        )
+                    )
+                if action.tool == "finish":
+                    completed = result.ok and (not modified_files or verification == "通过")
+                    summary = result.output
+                    if result.ok and modified_files and verification == "待验证":
+                        summary = f"{summary}；文件修改后尚未运行验证命令"
+                    elif result.ok and modified_files and verification == "失败":
+                        summary = f"{summary}；文件修改后的验证失败"
+                    return turn_result(
+                        RunResult(
+                            completed,
+                            summary,
+                            round_number,
+                            tool_calls,
+                            tuple(modified_files),
+                            verification,
+                        )
+                    )
         summary = f"达到最大轮数 {self.max_rounds}，任务已安全停止"
         self.observer.on_error(summary)
         return turn_result(
