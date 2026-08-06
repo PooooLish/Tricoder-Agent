@@ -23,7 +23,7 @@ from tricoder.tools.binding import (
     _is_windows,
     _stat_identity,
 )
-from tricoder.tools.command import FinishTool, RunCommandTool
+from tricoder.tools.command import FinishTool, GitDiffTool, RunCommandTool
 from tricoder.tools.filesystem import ListFilesTool, ReadFileTool
 from tricoder.tools.gitignore import _GitIgnoreMatcher
 from tricoder.tools.handlers import Approver, ToolHandler
@@ -40,6 +40,7 @@ _HANDLER_CLASSES = (
     CreateFileTool,
     ApplyPatchTool,
     RunCommandTool,
+    GitDiffTool,
     FinishTool,
 )
 

@@ -1,6 +1,13 @@
 import unittest
 
-from tricoder.commands import CommandError, ParsedCommand, is_slash_command, parse_command
+from tricoder.commands import (
+    CommandError,
+    ParsedCommand,
+    command_spec,
+    is_slash_command,
+    list_commands,
+    parse_command,
+)
 
 
 class CommandParserTests(unittest.TestCase):
@@ -84,6 +91,20 @@ class CommandParserTests(unittest.TestCase):
         self.assertTrue(is_slash_command("  /status"))
         self.assertFalse(is_slash_command("请解释 /status"))
         self.assertFalse(is_slash_command(""))
+
+    def test_command_registry_covers_parsed_commands(self) -> None:
+        """注册表必须包含全部可解析命令，且解析器只接受已注册命令。"""
+        specs = list_commands()
+        self.assertIn("help", specs)
+        self.assertIn("session", specs)
+        for name in ("help", "status", "model", "clear", "diff", "undo", "exit"):
+            self.assertEqual(name, parse_command(f"/{name}").name)
+        self.assertIsNotNone(command_spec("undo"))
+        self.assertIsNone(command_spec("not-a-command"))
+        # 破坏性命令在注册表中标记需要确认
+        self.assertTrue(specs["clear"].needs_confirmation)
+        self.assertTrue(specs["undo"].needs_confirmation)
+        self.assertFalse(specs["status"].needs_confirmation)
 
 
 if __name__ == "__main__":

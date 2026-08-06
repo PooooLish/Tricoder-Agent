@@ -6,6 +6,7 @@ import subprocess
 from typing import Any
 
 from tricoder.models import ToolResult
+from tricoder.policy import PolicyError
 
 from tricoder.tools.handlers import ToolHandler
 
@@ -53,6 +54,38 @@ class RunCommandTool(ToolHandler):
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
+        return ToolResult(completed.returncode == 0, self._bounded(output))
+
+
+class GitDiffTool(ToolHandler):
+    """只读展示工作区未提交变更的 diff 统计，无需审批（策略已限只读）。"""
+
+    name = "git_diff"
+    description = "显示工作区未提交变更的只读 diff 统计。"
+    parameters = ToolHandler._schema({})
+
+    def run(self, arguments: dict[str, Any]) -> ToolResult:
+        try:
+            args = self.context.command_policy.validate("git --no-pager diff --stat")
+        except PolicyError as exc:
+            return ToolResult(False, str(exc))
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=self.context.workspace_policy.workspace,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.context.timeout,
+                shell=False,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(False, f"git diff 超过 {self.context.timeout:g} 秒")
+        output = (completed.stdout or completed.stderr).strip()
+        if not output:
+            output = "工作区没有未提交变更"
         return ToolResult(completed.returncode == 0, self._bounded(output))
 
 

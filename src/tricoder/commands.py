@@ -1,10 +1,6 @@
-"""本地斜杠命令的纯解析逻辑。"""
+"""本地斜杠命令的纯解析逻辑与命令注册表。"""
 
 from dataclasses import dataclass
-
-
-_SIMPLE_COMMANDS = {"help", "status", "model", "clear", "diff", "undo", "exit"}
-_SESSION_SUBCOMMANDS = {"new", "current", "rename"}
 
 
 class CommandError(ValueError):
@@ -18,6 +14,49 @@ class ParsedCommand:
     name: str
     subcommand: str | None
     argument: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommandSpec:
+    """一条本地斜杠命令的元数据；新增命令只需在此注册。"""
+
+    description: str
+    needs_confirmation: bool = False
+    takes_argument: bool = False
+
+
+_COMMAND_SPECS: dict[str, CommandSpec] = {
+    "help": CommandSpec("显示命令、参数和示例"),
+    "status": CommandSpec("显示当前 Session、工作区、Provider、模型、只读、验证及上下文状态"),
+    "model": CommandSpec("显示 OpenAI、DeepSeek、GLM 的模型并按序号切换"),
+    "clear": CommandSpec(
+        "仅在输入 y 或 yes 后清除当前 Session 的运行时上下文和持久化摘要",
+        needs_confirmation=True,
+    ),
+    "diff": CommandSpec("本地展示当前 Session 最近一次非空任务的正向 unified diff"),
+    "undo": CommandSpec(
+        "先预览反向 diff，仅在输入 y 或 yes 后撤销最近任务",
+        needs_confirmation=True,
+    ),
+    "session": CommandSpec("列出、新建、查看或重命名会话"),
+    "exit": CommandSpec("保存安全记忆并退出"),
+}
+
+_SESSION_SUBCOMMANDS = {"new", "current", "rename"}
+# 简单命令集合由注册表派生；session 是唯一带子命令的命令。
+_SIMPLE_COMMANDS = frozenset(
+    name for name, spec in _COMMAND_SPECS.items() if name != "session"
+)
+
+
+def list_commands() -> dict[str, CommandSpec]:
+    """返回命令注册表的只读快照，供 UI 生成帮助与校验。"""
+    return dict(_COMMAND_SPECS)
+
+
+def command_spec(name: str) -> CommandSpec | None:
+    """按规范化名称返回命令元数据。"""
+    return _COMMAND_SPECS.get(name)
 
 
 def is_slash_command(text: str) -> bool:

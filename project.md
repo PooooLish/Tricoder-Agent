@@ -70,7 +70,10 @@ provider-action protocols, and bound retrieval resources.
 - Completed: Planner-Executor (`agent.py` planning round 0 + plan injection +
   degrade; `--no-plan`/`TRICODER_PLAN`/`[agent] plan` config; 5 agent + 4 config
   tests). Design in `docs/framework/planner-executor.md`.
-- Verified locally: 415 tricoder tests pass, compileall OK.
+- Completed: command registry (`commands.py` `COMMAND_SPECS`, `/help` generated
+  from it in both UIs) and `git_diff` tool demonstrating the tool extension
+  point (registered in `tools/__init__.py`, 2 new tests).
+- Verified locally: 417 tricoder tests pass, compileall OK.
 
 ## Next Action
 

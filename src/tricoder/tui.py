@@ -17,7 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from tricoder.agent import AgentObserver
-from tricoder.commands import CommandError, is_slash_command, parse_command
+from tricoder.commands import CommandError, is_slash_command, list_commands, parse_command
 from tricoder.models import RunResult, TokenUsage, ToolAction, ToolResult
 from tricoder.session_runtime import SessionRuntime, SessionRuntimeError
 
@@ -276,19 +276,9 @@ class TricoderApp(App[None]):
             self.log_line(f"[red]会话操作失败：{exc}[/red]")
 
     def _show_help(self) -> None:
-        for line in (
-            "/help         显示本帮助",
-            "/status       显示当前会话状态",
-            "/model        切换 Provider",
-            "/clear        确认后清除会话上下文和摘要",
-            "/diff         显示最近任务变更",
-            "/undo         预览并确认撤销最近任务",
-            "/session      列出并选择会话",
-            "/session new <名称>  创建并切换到新会话",
-            "/session current     显示当前会话详情",
-            "/exit         保存记忆后退出",
-        ):
-            self.log_line(f"[dim]{line}[/dim]")
+        for name, spec in list_commands().items():
+            self.log_line(f"[dim]/{name:<12}{spec.description}[/dim]")
+        self.log_line("[dim]/session new <名称>     创建并切换到新会话[/dim]")
 
     def _show_status(self) -> None:
         if self.runtime is None:

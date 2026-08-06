@@ -1,5 +1,7 @@
 ﻿import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -538,6 +540,7 @@ class ToolTests(unittest.TestCase):
                 "create_file",
                 "apply_patch",
                 "run_command",
+                "git_diff",
                 "finish",
             ),
             tuple(definition.name for definition in definitions),
@@ -584,6 +587,7 @@ class ToolTests(unittest.TestCase):
                 {"command": {"type": "string"}, "cwd": {"type": "string"}},
                 ["command"],
             ),
+            "git_diff": ({}, []),
             "finish": ({"summary": {"type": "string"}}, ["summary"]),
         }
 
@@ -742,6 +746,29 @@ class ToolTests(unittest.TestCase):
         )
         self.assertTrue(large_result.ok)
         self.assertNotIn("huge.txt", large_result.output)
+
+    def test_git_diff_reports_uncommitted_changes(self) -> None:
+        """git_diff 只读显示未提交变更统计；无 git 时跳过。"""
+        if shutil.which("git") is None:
+            self.skipTest("当前环境没有 git")
+        for command in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "test@example.com"],
+            ["git", "config", "user.name", "test"],
+        ):
+            subprocess.run(command, cwd=self.workspace, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.workspace, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.workspace, check=True)
+        (self.workspace / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+
+        result = self.registry.execute("git_diff", {})
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("app.py", result.output)
+
+        subprocess.run(["git", "checkout", "-q", "--", "src/app.py"], cwd=self.workspace, check=True)
+        clean = self.registry.execute("git_diff", {})
+        self.assertTrue(clean.ok)
+        self.assertIn("没有未提交变更", clean.output)
 
     def test_glob_files_rejects_unbounded_patterns(self) -> None:
         """过长模式或过多 ** 会放大扫描规模，必须拒绝。"""

@@ -14,6 +14,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from tricoder.commands import list_commands
 from tricoder.models import AppConfig, RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 
 _PROVIDER_LABELS = {
@@ -124,24 +125,18 @@ class TerminalUI:
         self.console.print(Panel(details, title="[bold cyan]TriCoder 交互会话[/bold cyan]", border_style="cyan", box=box.ROUNDED))
 
     def show_help(self) -> None:
-        """输出首版全部本地命令及其参数。"""
+        """从命令注册表输出本地命令帮助，新增命令自动出现在这里。"""
         table = Table(title="本地命令", box=box.ROUNDED, header_style="bold cyan")
         table.add_column("命令", style="bold")
         table.add_column("说明")
-        for command, description in (
-            ("/help", "显示本帮助"),
-            ("/status", "显示当前会话状态"),
-            ("/model", "选择 OpenAI、DeepSeek 或 GLM"),
-            ("/clear", "确认后清除当前会话上下文和摘要"),
-            ("/diff", "显示当前会话最近任务的文件变更"),
-            ("/undo", "预览并确认撤销当前会话最近任务的文件修改"),
-            ("/session", "列出会话并按编号选择"),
-            ("/session new <名称>", "创建并切换到新会话"),
-            ("/session current", "显示当前会话详情"),
-            ("/session rename <名称>", "重命名当前会话"),
-            ("/exit", "保存安全记忆后退出"),
+        for name, spec in list_commands().items():
+            table.add_row(f"/{name}", spec.description)
+        for subcommand, description in (
+            ("new <名称>", "创建并切换到新会话"),
+            ("current", "显示当前会话详情"),
+            ("rename <名称>", "重命名当前会话"),
         ):
-            table.add_row(command, description)
+            table.add_row(f"/session {subcommand}", description)
         self.console.print(table)
 
     def show_status(self, status: object, active: object) -> None:

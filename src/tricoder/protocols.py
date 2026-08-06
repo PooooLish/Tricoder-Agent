@@ -35,6 +35,7 @@ LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Mark
 - edit_file: {"path":"相对文件","old_text":"精确旧文本","new_text":"新文本"}
 - create_file: {"path":"相对文件","content":"新文件完整内容"}
 - run_command: {"command":"测试或静态检查命令","cwd":"可选相对目录"}
+- git_diff: {}
 - finish: {"summary":"完成情况、验证结果和剩余风险"}
 """
 
