@@ -163,7 +163,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 ```
 
-`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。TUI 中 `/permission`、`/session`、`/model` 不带参数时会弹出方向键选择列表（↑/↓ 选择 · Enter 确认 · Esc 取消）。
+`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。TUI 中 `/permission`、`/session`、`/model` 不带参数时会弹出方向键选择列表（↑/↓ 选择 · Enter 确认 · Esc 取消）。每轮工具调用折叠为一个可展开块（标题含工具摘要），避免长任务刷屏。
 
 ## 交互命令与 Session
 
@@ -181,8 +181,9 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/session new <名称>` | 用当前工作区、Provider 和模型创建并切换到新 Session。 |
 | `/session current` | 显示当前 Session 的详细信息。 |
 | `/session rename <名称>` | 重命名当前 Session。 |
-| `/permission` | 查看当前权限级别（strict / relaxed）。 |
+| `/permission` | 查看当前权限级别（strict / relaxed / fullaccess）。 |
 | `/permission relaxed` | 切换为 relaxed：只读/测试命令（`CommandPolicy` 白名单内）自动放行，文件写入仍人工审批。 |
+| `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；命令仍受 `CommandPolicy` 白名单、`--read-only` 与敏感路径等硬边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
 | `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |
 | `/exit` | 保存安全记忆并退出。 |
 
@@ -214,9 +215,13 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 ## 运行边界
 
 - 文件写入和命令执行都需要在终端明确输入 `y` 或 `yes` 审批；`--read-only` 会禁止这两类操作。
-- `/permission relaxed` 是显式降级：策略白名单内的只读/测试命令不再人工确认，但 `edit_file`、`create_file`、`apply_patch` 等文件写入仍始终审批；默认 `strict` 模式两类操作都审批。
+- `/permission relaxed` 与 `/permission fullaccess` 是显式降级：relaxed 放行白名单内只读/测试命令，fullaccess 放行全部非危险工具；两者都**不放松**命令白名单、`--read-only`、敏感路径等硬边界，默认 `strict` 模式下所有操作都审批。
 - Agent 只能访问指定工作区内的非敏感文件，越界或敏感路径会被拒绝。
-- 允许的命令限于测试、静态检查和只读 Git 查询；审批不是操作系统或容器沙箱的替代品。
+- git 只读命令仅在工作区本身就是仓库根时可用；工作区是仓库子目录时 git 会向上读取
+  仓库根的历史与源码，此类执行会被拒绝。
+- 允许的命令限于测试、静态检查、只读 Git 查询，以及工作区内相对 `.py` 脚本执行
+  （`python <脚本>`；脚本必须相对、无 `..`、无绝对路径；自动执行与否由权限级别控制，
+  `fullaccess` 放行，`strict`/`relaxed` 仍需人工审批）。审批不是操作系统或容器沙箱的替代品。
 - 发送任务会将相关代码片段交给所选 Provider；只应在获准发送的项目中使用。
 
 ## 审计、上下文与退出码

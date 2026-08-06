@@ -84,7 +84,24 @@ provider-action protocols, and bound retrieval resources.
 - Completed: TUI arrow-key selection (`OptionListScreen` modal); `/permission`,
   `/session`, `/model` without args open a selectable list (↑/↓ + Enter/Esc).
   (2 new pilot tests.)
-- Verified locally: 425 tricoder tests pass, compileall OK. (Full-suite runs
+- Completed: TUI collapsible round blocks (each tool round folded into a
+  `Collapsible` with a tool-summary title; task/result lines stay visible).
+  (1 new pilot test.)
+- Completed: `/permission fullaccess` level — auto-allows all non-dangerous
+  tools while keeping CommandPolicy/read-only/sensitive-path hard boundaries;
+  extensible `_DANGEROUS_TOOLS` set for future delete/rename tools.
+  (1 new test.)
+- Completed: workspace script execution — `python <relative .py script>`
+  allowed by CommandPolicy (relative, no `..`, no absolute, `.py` only);
+  auto-execution gated by permission level (fullaccess auto, else approved).
+  (2 new tests.)
+- Completed: TUI sidebar (double-column layout, live session/state panel,
+  thread-safe refresh) + collapsible rounds; fixed sidebar refresh on UI-thread
+  command handlers.
+- Completed: git boundary protection — git read-only commands are refused when
+  the workspace is a subdirectory of a git repo (git would read the repo root
+  history/sources outside the workspace). (1 new test.)
+- Verified locally: 432 tricoder tests pass, compileall OK. (Full-suite runs
   show rare Windows file-timing flakes in pre-existing file-op tests; each
   passes in isolation.)
 
