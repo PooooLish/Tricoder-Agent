@@ -77,7 +77,16 @@ provider-action protocols, and bound retrieval resources.
   executed sequentially with independent approval/audit) and default
   max_rounds raised 12 → 30. Compaction now groups variable-length tool rounds.
   (2 updated + 2 new tests.)
-- Verified locally: 419 tricoder tests pass, compileall OK.
+- Completed: `/permission` command (strict/relaxed levels; relaxed auto-allows
+  policy-whitelisted read-only/test commands while file writes stay approved).
+  Registered in `commands.py`, enforced via `SessionRuntime._effective_approver`,
+  wired into shell + TUI. (3 new tests.)
+- Completed: TUI arrow-key selection (`OptionListScreen` modal); `/permission`,
+  `/session`, `/model` without args open a selectable list (↑/↓ + Enter/Esc).
+  (2 new pilot tests.)
+- Verified locally: 425 tricoder tests pass, compileall OK. (Full-suite runs
+  show rare Windows file-timing flakes in pre-existing file-op tests; each
+  passes in isolation.)
 
 ## Next Action
 

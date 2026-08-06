@@ -163,7 +163,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 ```
 
-`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。
+`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。TUI 中 `/permission`、`/session`、`/model` 不带参数时会弹出方向键选择列表（↑/↓ 选择 · Enter 确认 · Esc 取消）。
 
 ## 交互命令与 Session
 
@@ -181,6 +181,9 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/session new <名称>` | 用当前工作区、Provider 和模型创建并切换到新 Session。 |
 | `/session current` | 显示当前 Session 的详细信息。 |
 | `/session rename <名称>` | 重命名当前 Session。 |
+| `/permission` | 查看当前权限级别（strict / relaxed）。 |
+| `/permission relaxed` | 切换为 relaxed：只读/测试命令（`CommandPolicy` 白名单内）自动放行，文件写入仍人工审批。 |
+| `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |
 | `/exit` | 保存安全记忆并退出。 |
 
 `/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先构建并验证目标配置、策略、工具和 Agent；任何一步失败都会保留原 Session 和原工作区。
@@ -211,6 +214,7 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 ## 运行边界
 
 - 文件写入和命令执行都需要在终端明确输入 `y` 或 `yes` 审批；`--read-only` 会禁止这两类操作。
+- `/permission relaxed` 是显式降级：策略白名单内的只读/测试命令不再人工确认，但 `edit_file`、`create_file`、`apply_patch` 等文件写入仍始终审批；默认 `strict` 模式两类操作都审批。
 - Agent 只能访问指定工作区内的非敏感文件，越界或敏感路径会被拒绝。
 - 允许的命令限于测试、静态检查和只读 Git 查询；审批不是操作系统或容器沙箱的替代品。
 - 发送任务会将相关代码片段交给所选 Provider；只应在获准发送的项目中使用。
