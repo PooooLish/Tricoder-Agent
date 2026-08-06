@@ -20,8 +20,8 @@ COMMON_SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Codin
 """
 
 NATIVE_TOOL_PROMPT = """使用 Provider 提供的原生工具调用完成任务。
-每轮必须且只能选择一个工具；不要用普通文本或并行工具调用代替。
-工具参数只包含当前工具定义允许的字段。
+每轮可一次提交多个工具调用，Agent 会按顺序逐个执行并回填结果。
+不要用普通文本代替工具调用；工具参数只包含当前工具定义允许的字段。
 """
 
 LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Markdown 代码块，也不能添加对象之外的文字：
@@ -42,7 +42,7 @@ LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Mark
 SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + NATIVE_TOOL_PROMPT
 LEGACY_SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + LEGACY_JSON_PROMPT
 
-NATIVE_TEXT_FEEDBACK = "本轮没有工具调用。请下一轮只选择一个可用工具调用。"
+NATIVE_TEXT_FEEDBACK = "本轮没有工具调用。请下一轮提交一个或多个工具调用。"
 PROTOCOL_FEEDBACK = "模型响应未满足当前协议。请下一轮按系统规则重新提交一个动作。"
 
 

@@ -13,8 +13,19 @@ from typing import Any
 
 from textual import on
 from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import (
+    Collapsible,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+)
 
 from tricoder.agent import AgentObserver
 from tricoder.commands import CommandError, is_slash_command, list_commands, parse_command
@@ -106,10 +117,10 @@ class TuiObserver(AgentObserver):
         self._app = app
 
     def on_round_start(self, round_number: int, max_rounds: int) -> None:
-        self._app.log_line_safe(f"[dim]第 {round_number}/{max_rounds} 轮：请求模型…[/dim]")
+        self._app.begin_round(round_number, max_rounds)
 
     def on_action(self, action: ToolAction) -> None:
-        self._app.log_line_safe(f"[bold cyan]● {action.tool}[/bold cyan]  {action.reason}")
+        self._app.round_line(f"[bold cyan]● {action.tool}[/bold cyan]  {action.reason}")
 
     def on_tool_result(
         self,
@@ -119,17 +130,18 @@ class TuiObserver(AgentObserver):
     ) -> None:
         icon = "✓" if result.ok else "✗"
         color = "green" if result.ok else "red"
-        self._app.log_line_safe(
+        self._app.round_line(
             f"  [{color}]{icon}[/{color}] {len(result.output):,} 字符 · {duration_ms} ms"
         )
+        self._app.round_summary(f"{action.tool} {icon} · {duration_ms} ms")
 
     def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None:
-        self._app.log_line_safe(
-            f"[cyan]第 {round_number} 轮用量 · {_format_token_usage(usage)}[/cyan]"
+        self._app.round_line(
+            f"[cyan]用量 · {_format_token_usage(usage)}[/cyan]"
         )
 
     def on_error(self, message: str) -> None:
-        self._app.log_line_safe(f"[red]✗ {message}[/red]")
+        self._app.round_line(f"[red]✗ {message}[/red]")
 
 
 class TricoderApp(App[None]):
@@ -147,14 +159,43 @@ class TricoderApp(App[None]):
     Screen {
         layout: vertical;
     }
-    #log {
+    #main {
         height: 1fr;
+    }
+    #log {
+        width: 1fr;
         border: round $primary;
         padding: 0 1;
     }
-    #prompt {
+    #log Collapsible {
+        margin: 0 0 1 0;
+    }
+    .log-line {
+        margin: 0 0 1 0;
+    }
+    #sidebar {
+        width: 30;
+        border: round $primary;
+        padding: 1;
+        background: $panel;
+    }
+    #sidebar-content {
+        color: $text;
+        height: 1fr;
+    }
+    #prompt-bar {
         dock: bottom;
-        height: 3;
+        height: auto;
+        align: center middle;
+        padding: 0 0 1 0;
+    }
+    #prompt {
+        width: 100%;
+        max-width: 110;
+        height: 4;
+    }
+    #prompt:focus {
+        border: round $accent;
     }
     ApprovalScreen {
         align: center middle;
@@ -162,6 +203,7 @@ class TricoderApp(App[None]):
         border: round $warning;
         padding: 1 2;
         width: 80%;
+        max-width: 110;
         height: auto;
     }
     .approval-detail {
@@ -182,11 +224,21 @@ class TricoderApp(App[None]):
         self.runtime: SessionRuntime | None = None
         self.last_result: RunResult | None = None
         self._lines: list[str] = []
+        self._round_widgets: list[Collapsible] = []
+        self._current_round_log: RichLog | None = None
+        self._current_round_summary: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        yield RichLog(id="log", wrap=True, highlight=True, markup=True)
-        yield Input(id="prompt", placeholder="输入任务，或 /help 查看本地命令")
+        yield Horizontal(
+            VerticalScroll(id="log"),
+            Vertical(Static("", id="sidebar-content"), id="sidebar", classes="sidebar"),
+            id="main",
+        )
+        yield Horizontal(
+            Input(id="prompt", placeholder="输入任务，或 /help 查看本地命令"),
+            id="prompt-bar",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -202,6 +254,7 @@ class TricoderApp(App[None]):
             f"{record.provider} · {record.model}"
         )
         self.log_line(f"[dim]工作区：{record.workspace}[/dim]")
+        self._refresh_sidebar_impl()
         self.query_one(Input).focus()
 
     # ---- 线程安全日志 ----
@@ -219,7 +272,96 @@ class TricoderApp(App[None]):
 
     def _log_line_impl(self, text: str) -> None:
         self._lines.append(text)
-        self.query_one("#log", RichLog).write(text)
+        self.query_one("#log", VerticalScroll).mount(
+            Static(text, classes="log-line")
+        )
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+
+    def refresh_sidebar(self) -> None:
+        """后台线程调用；刷新侧边状态栏。"""
+        try:
+            self.call_from_thread(self._refresh_sidebar_impl)
+        except Exception:
+            pass
+
+    def _refresh_sidebar_impl(self) -> None:
+        if self.runtime is None:
+            return
+        record = self.runtime.current.record
+        config = self.runtime.current.config
+        memory = self.runtime.current.memory
+        workspace = str(record.workspace)
+        if len(workspace) > 26:
+            workspace = "…" + workspace[-25:]
+        content = (
+            "[b]会话[/b]\n"
+            f"{record.name}\n\n"
+            "[b]Provider[/b]\n"
+            f"{record.provider}\n\n"
+            "[b]模型[/b]\n"
+            f"{record.model}\n\n"
+            "[b]工作区[/b]\n"
+            f"{workspace}\n\n"
+            "[b]模式[/b]\n"
+            f"{'只读' if config.read_only else '可编辑'}\n\n"
+            "[b]权限[/b]\n"
+            f"{self.runtime.permission_level}\n\n"
+            "[b]验证[/b]\n"
+            f"{memory.verification}\n\n"
+            "[b]修改文件[/b]\n"
+            f"{len(memory.modified_files)}"
+        )
+        self.query_one("#sidebar-content", Static).update(content)
+
+    def begin_round(self, round_number: int, max_rounds: int) -> None:
+        """后台线程调用；为新一轮创建可折叠块。"""
+        try:
+            self.call_from_thread(self._begin_round_impl, round_number, max_rounds)
+        except Exception:
+            pass
+
+    def _begin_round_impl(self, round_number: int, max_rounds: int) -> None:
+        container = self.query_one("#log", VerticalScroll)
+        for widget in self._round_widgets:
+            if not widget.collapsed:
+                widget.collapsed = True
+        content = RichLog(highlight=True, markup=True, wrap=True)
+        collapsible = Collapsible(
+            content, title=f"第 {round_number}/{max_rounds} 轮", collapsed=True
+        )
+        container.mount(collapsible)
+        container.scroll_end(animate=False)
+        self._round_widgets.append(collapsible)
+        self._current_round_log = content
+        self._current_round_summary = [f"第 {round_number}/{max_rounds} 轮"]
+
+    def round_line(self, text: str) -> None:
+        """后台线程调用；写入当前轮内容。"""
+        try:
+            self.call_from_thread(self._round_line_impl, text)
+        except Exception:
+            pass
+
+    def _round_line_impl(self, text: str) -> None:
+        if self._current_round_log is not None:
+            self._current_round_log.write(text)
+        else:
+            # 尚无轮次（规划/审计准备阶段）时回退到总日志，避免错误被吞。
+            self._log_line_impl(text)
+
+    def round_summary(self, summary: str) -> None:
+        """后台线程调用；更新当前轮标题摘要。"""
+        try:
+            self.call_from_thread(self._round_summary_impl, summary)
+        except Exception:
+            pass
+
+    def _round_summary_impl(self, summary: str) -> None:
+        self._current_round_summary.append(summary)
+        if not self._round_widgets:
+            return
+        title = " · ".join(self._current_round_summary[-3:])
+        self._round_widgets[-1].title = title
 
     # ---- 任务与命令 ----
 
@@ -247,7 +389,9 @@ class TricoderApp(App[None]):
             self.log_line_safe(f"[red]任务运行失败：{exc}[/red]")
             return
         except Exception as exc:  # 兜底：任何未预期异常都不能杀死 TUI
-            self.log_line_safe(f"[red]任务异常：{type(exc).__name__}[/red]")
+            self.log_line_safe(
+                f"[red]任务异常：{type(exc).__name__}: {exc}[/red]"
+            )
             return
         self._log_result(result)
 
@@ -264,6 +408,7 @@ class TricoderApp(App[None]):
             lines.append(f"[dim]累计用量 · {_format_token_usage(result.usage)}[/dim]")
         for line in lines:
             self.log_line_safe(line)
+        self.refresh_sidebar()
 
     # ---- 审批 ----
 
@@ -340,12 +485,18 @@ class TricoderApp(App[None]):
         self.log_line(f"[cyan]权限[/cyan] {self.runtime.permission_level}")
 
     def _clear_current(self) -> None:
-        if not self._confirm("清除当前会话的上下文和摘要？"):
-            self.log_line("[dim]已取消清除[/dim]")
-            return
+        # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。
         self.run_worker(
-            self._clear_worker, thread=True, exclusive=True, name="session-clear"
+            self._clear_confirm_worker, thread=True, exclusive=True, name="session-clear"
         )
+
+    def _clear_confirm_worker(self) -> None:
+        if not self._confirm("清除当前会话的上下文和摘要？"):
+            self.log_line_safe("[dim]已取消清除[/dim]")
+            return
+        if self.runtime is not None:
+            self.runtime.clear_current()
+            self.log_line_safe("[yellow]当前会话记忆已清除[/yellow]")
 
     def _clear_worker(self) -> None:
         if self.runtime is not None:
@@ -374,12 +525,13 @@ class TricoderApp(App[None]):
         self.log_line("[bold]撤销预览：[/bold]")
         for line in preview.diff.splitlines():
             self.log_line(line)
-        if not self._confirm("撤销最近一条任务的全部文件修改？"):
-            self.log_line("[dim]已取消撤销[/dim]")
-            return
+        # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。
         self.run_worker(self._undo_worker, thread=True, exclusive=True, name="session-undo")
 
     def _undo_worker(self) -> None:
+        if not self._confirm("撤销最近一条任务的全部文件修改？"):
+            self.log_line_safe("[dim]已取消撤销[/dim]")
+            return
         if self.runtime is None:
             return
         execution = self.runtime.undo_latest()
@@ -406,9 +558,10 @@ class TricoderApp(App[None]):
             self.log_line(f"[red]权限操作失败：{exc}[/red]")
             return
         self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+        self._refresh_sidebar_impl()
 
     def _choose_permission(self) -> None:
-        options = ("strict", "relaxed")
+        options = ("strict", "relaxed", "fullaccess")
         current = self.runtime.permission_level
 
         def respond(value: str | None) -> None:
@@ -420,6 +573,7 @@ class TricoderApp(App[None]):
                 self.log_line(f"[red]权限操作失败：{exc}[/red]")
                 return
             self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+        self._refresh_sidebar_impl()
 
         self.push_screen(
             OptionListScreen("选择权限级别", options, current), respond
@@ -450,6 +604,7 @@ class TricoderApp(App[None]):
             self.log_line_safe(f"[red]模型切换失败：{exc}[/red]")
             return
         self.log_line_safe(f"[yellow]已切换到 Provider：{provider}[/yellow]")
+        self.refresh_sidebar()
 
     def _handle_session(self, subcommand: str | None, argument: str | None) -> None:
         if self.runtime is None:
@@ -479,6 +634,7 @@ class TricoderApp(App[None]):
             return
         self.runtime.create(name)
         self.log_line_safe(f"[yellow]已创建并切换到新会话：{name}[/yellow]")
+        self.refresh_sidebar()
 
     def _choose_session(self) -> None:
         sessions = self.runtime.store.list_all()
@@ -522,6 +678,7 @@ class TricoderApp(App[None]):
             self.log_line_safe(f"[red]会话切换失败：{exc}[/red]")
             return
         self.log_line_safe(f"[yellow]已切换到会话：{record.name}[/yellow]")
+        self.refresh_sidebar()
 
     # ---- 退出 ----
 

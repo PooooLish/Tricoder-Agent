@@ -4,10 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from textual.widgets import Input, RichLog
+from textual.containers import VerticalScroll
+from textual.widgets import Collapsible, Input, Static
 
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
+from tricoder.providers import ProviderError
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime
 from tricoder.sessions import SessionStore
 from tricoder.tui import ApprovalScreen, OptionListScreen, TricoderApp
@@ -106,7 +108,26 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause()
             self.assertIsNotNone(app.query_one(Input))
-            self.assertIsNotNone(app.query_one("#log", RichLog))
+            self.assertIsNotNone(app.query_one("#log", VerticalScroll))
+
+    async def test_task_rounds_are_collapsible(self) -> None:
+        """每轮工具调用被折叠进 Collapsible 块，避免逐行刷屏。"""
+        finish = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c1", "finish", {"summary": "ok done"}),),
+            finish_reason="tool_calls",
+        )
+        app = self._make_app([finish])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "跑一个任务")
+            result = await self._wait_result(pilot)
+
+            self.assertTrue(result.ok)
+            collapsibles = list(app.query(Collapsible))
+            self.assertEqual(1, len(collapsibles))
+            self.assertIn("第 1/30 轮", str(collapsibles[0].title))
+            self.assertTrue(collapsibles[0].collapsed)
 
     async def test_run_task_returns_finish_summary(self) -> None:
         response = ProviderResponse(
@@ -149,6 +170,77 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             (self.workspace / "src" / "app.py").read_text(encoding="utf-8"),
         )
 
+    async def test_sidebar_shows_session_state(self) -> None:
+        """侧边状态栏显示会话、权限等运行时状态。"""
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.pause()
+            content = app.query_one("#sidebar-content", Static).content
+
+        self.assertIn("会话", content)
+        self.assertIn("权限", content)
+        self.assertIn("strict", content)
+
+    async def test_clear_confirmation_does_not_deadlock(self) -> None:
+        """/clear 的确认在 worker 线程执行，UI 线程不阻塞死锁。"""
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "/clear")
+            for _ in range(300):
+                await pilot.pause()
+                if isinstance(app.screen, ApprovalScreen):
+                    break
+            else:
+                self.fail("/clear 确认未出现（UI 线程可能死锁）")
+            await pilot.press("escape")
+            await pilot.pause()
+
+        self.assertEqual("strict", app.runtime.permission_level)
+
+    async def test_planning_failure_error_is_visible_outside_rounds(self) -> None:
+        """规划阶段错误在尚无轮次时仍显示在总日志，不被折叠块吞掉。"""
+
+        class FailingPlanProvider:
+            def complete(self, messages: object, tools: tuple = ()) -> ProviderResponse:
+                if (
+                    not tools
+                    and getattr(messages[-1], "content", None) == PLANNING_PROMPT
+                ):
+                    raise ProviderError("PLAN-FAIL-MARKER")
+                return ProviderResponse(
+                    content=None,
+                    tool_calls=(ToolCall("c1", "finish", {"summary": "done"}),),
+                    finish_reason="tool_calls",
+                )
+
+        provider = FailingPlanProvider()
+        factory = lambda _config, _timeout: provider  # type: ignore[misc]
+
+        def runtime_factory(observer, approver) -> SessionRuntime:
+            return SessionRuntime(
+                self.store,
+                self.workspace,
+                options=RuntimeOptions(environ={"OPENAI_API_KEY": "test-key"}),
+                provider_factory=factory,
+                approver=approver,
+                observer=observer,
+            )
+
+        self.app = TricoderApp(runtime_factory)
+        app = self.app
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "跑一个任务")
+            result = await self._wait_result(pilot)
+            for _ in range(10):
+                await pilot.pause()
+
+        self.assertTrue(result.ok)
+        self.assertTrue(any("规划失败" in line for line in app._lines))
+
     async def _wait_option_list(self, pilot) -> None:
         app = self.app
         assert app is not None
@@ -165,7 +257,9 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._submit(pilot, "/permission")
             await self._wait_option_list(pilot)
-            self.assertEqual(["strict", "relaxed"], app.screen._options)
+            self.assertEqual(
+                ["strict", "relaxed", "fullaccess"], app.screen._options
+            )
             await pilot.press("down")
             await pilot.press("enter")
             await pilot.pause()
