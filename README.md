@@ -249,6 +249,30 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 只有在适配器确实验证了原生工具调用时才声明 `native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新 Provider 绕过结构化响应适配的默认实现。
 
+## Eval
+
+`tricoder eval` 用版本控制内的 fixture、隔离工作副本和 Agent 结束后才注入的隐藏
+verifier，评测本地 Coding Agent 的确定性完成条件。默认会真实调用 OpenAI Provider；
+可显式选择 Provider 或只运行一个 case，以控制费用：
+
+```powershell
+python -m tricoder eval evals/smoke --no-color
+python -m tricoder eval evals/smoke --provider deepseek --no-color
+python -m tricoder eval evals/smoke --provider glm --case fix-subtract --no-color
+```
+
+先校验评测定义且不读取 Key、不构建 Provider 或创建运行状态时，使用离线 dry-run：
+
+```powershell
+python -m tricoder eval evals/smoke --dry-run --no-color
+```
+
+真实运行的隔离工作副本、结构化结果和 Markdown 报告位于
+`runtime/evals/<run-id>/`。Eval 使用的 `fullaccess` 仅代表 TriCoder 自动批准策略
+允许的工具，**不是操作系统沙盒**；命令白名单、工作区边界和敏感环境变量过滤仍然
+生效。内置 smoke suite 的自动测试只验证离线框架与 fixture 合约，不代表已完成三家
+真实 Provider 的质量验证；真实运行会使用本机配置并可能产生费用。
+
 ## 测试
 
 ### 无密钥自动化测试

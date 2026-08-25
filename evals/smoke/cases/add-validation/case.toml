@@ -1,0 +1,12 @@
+id = "add-validation"
+title = "增加用户名校验"
+task = "为 usernames.py 中 normalize_username 增加输入校验：非字符串抛 TypeError，空白字符串抛 ValueError，并返回合法用户名的小写去空白结果。运行测试。"
+allowed_changes = ["usernames.py", "tests/**"]
+required_changes = ["usernames.py"]
+max_rounds = 8
+max_context_chars = 40000
+
+[[verification]]
+name = "hidden-tests"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 30

@@ -155,6 +155,19 @@ provider-action protocols, and bound retrieval resources.
 - None for tricoder-cli. Workspace check failures in another project are out of
   scope.
 
+## Eval
+
+- 架构：`evals/smoke/` 是只读、版本控制内的评测定义；每次真实运行只在
+  `runtime/evals/<run-id>/` 创建隔离工作副本、结构化结果和报告。
+- 隐藏 verifier 决策：Agent 返回并完成修改快照后，框架才把 verifier 注入保留目录
+  `.tricoder_eval_verifier/`，执行确定性标准库测试后立即清理；fixture 不包含 Key、
+  网络访问或真实 Provider 调用。
+- 本轮离线验证：smoke suite 加载、三个 case 的 no-op Agent 均未预先通过，以及
+  `tricoder eval evals/smoke --dry-run --no-color`。完整命令证据记录在当前 Eval 任务
+  报告中。
+- 下一步：真实 OpenAI、DeepSeek、GLM Eval 仅由用户显式手动执行；自动测试不运行
+  真实 Provider，也不将离线结果表述为 Provider 质量结论。
+
 ## Verification
 
 - `.venv\Scripts\python -m unittest discover -s tests` → Ran 459, OK (2 skips:

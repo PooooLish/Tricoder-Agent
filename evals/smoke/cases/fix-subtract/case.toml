@@ -1,0 +1,12 @@
+id = "fix-subtract"
+title = "修复减法函数"
+task = "修复 calculator.py 中 subtract 的错误，并运行测试。"
+allowed_changes = ["calculator.py", "tests/**"]
+required_changes = ["calculator.py"]
+max_rounds = 8
+max_context_chars = 40000
+
+[[verification]]
+name = "hidden-tests"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 30

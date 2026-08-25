@@ -1,0 +1,12 @@
+id = "cross-file-feature"
+title = "实现跨文件折扣功能"
+task = "新增 discounts.py 的 percentage_discount(amount, percent)，并让 pricing.py 的 final_price(amount, percent=0) 使用它。amount 或 percent 为负、percent 大于 100 时应抛 ValueError；运行测试。"
+allowed_changes = ["pricing.py", "discounts.py", "tests/**"]
+required_changes = ["pricing.py", "discounts.py"]
+max_rounds = 10
+max_context_chars = 40000
+
+[[verification]]
+name = "hidden-tests"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 30
