@@ -28,7 +28,8 @@ evals/<suite>/
 └── cases/
     └── <case-id>/
         ├── case.toml
-        └── workspace/
+        ├── workspace/       # Agent 可见、可修改
+        └── verifier/        # Agent 结束后才注入的隐藏验证文件
 
 src/tricoder/evals/
 ├── __init__.py
@@ -43,8 +44,9 @@ runtime/evals/<run-id>/
 └── report.md
 ```
 
-评测定义和 fixture 是版本控制内的只读输入。所有 Agent 修改、验证过程和生成报告
-都位于 `runtime/evals/`，不得改动原 fixture。
+评测定义、workspace fixture 和 verifier 是版本控制内的只读输入。所有 Agent 修改、
+验证过程和生成报告都位于 `runtime/evals/`，不得改动原 fixture。Agent 运行期间只能
+看到 workspace 副本，不能读取 verifier。
 
 ## 任务定义
 
@@ -67,8 +69,9 @@ timeout = 30
 ```
 
 `suite.toml` 声明稳定的 suite ID、标题和 case 顺序。loader 必须在任何 Provider
-调用之前完成全套校验，包括：ID 唯一性、目录边界、字段类型、正数限制、fixture
-存在性、相对 glob，以及验证命令能否通过 `CommandPolicy`。
+调用之前完成全套校验，包括：ID 唯一性、目录边界、字段类型、正数限制、
+workspace/verifier 存在性、相对 glob，以及验证命令的语法能否通过
+`CommandPolicy`。最终工作区绑定校验在隐藏 verifier 注入后、执行验证前再次完成。
 
 ## 执行流程
 
@@ -81,9 +84,12 @@ timeout = 30
 6. Eval 工作副本采用无人值守 fullaccess 审批；工具仍受只读开关、命令白名单、
    敏感路径和工作区边界限制。
 7. Agent 返回后重新建立文件快照，计算规范化相对修改路径。
-8. 在相同工作副本中执行 case 的最终验证命令。
-9. 计算确定性判定，记录结构化结果，并继续运行后续 case。
-10. 原子生成 `result.json` 与 `report.md`。
+8. 将只读输入中的 verifier 复制到工作副本的保留目录
+   `.tricoder_eval_verifier/`；该目录在 Agent 运行期间不存在。
+9. 使用包含 workspace 边界的 `CommandPolicy` 重新校验并执行最终验证命令。
+10. 删除保留目录；其文件不计入 Agent 修改路径。
+11. 计算确定性判定，记录结构化结果，并继续运行后续 case。
+12. 原子生成 `result.json` 与 `report.md`。
 
 单个任务的失败或异常不终止 suite；无法加载 suite、无法创建输出目录或 Provider
 配置无效属于运行级错误，在执行任何 case 前终止。
@@ -128,6 +134,10 @@ tricoder eval evals/smoke --dry-run
 
 - Eval 的 fullaccess 是 TriCoder 审批级别，不是操作系统沙盒，公开文档必须明确。
 - 工作副本必须解析在本次 run 目录内，复制和报告写入不能接受越界路径。
+- `workspace/` 和 `verifier/` 必须是不同的普通目录；复制前逐项拒绝符号链接、
+  junction/reparse point 和敏感路径。任务路径模式不得匹配保留 verifier 目录。
+- `.tricoder_eval_verifier/` 只能由框架在 Agent 返回后创建，验证结束后清理；该目录
+  永远不进入修改路径评分。
 - 验证命令使用 `CommandPolicy` 解析后的 argv，不通过 shell 执行。
 - 子进程沿用现有敏感环境变量过滤、超时、输出上限和 Git 仓库边界。
 - 报告不得保存 API Key、环境变量、Provider 异常原文、源码或补丁正文。
@@ -141,14 +151,17 @@ tricoder eval evals/smoke --dry-run
 2. `add-validation`：实现参数校验并满足已有测试。
 3. `cross-file-feature`：修改实现并补充测试，验证跨文件能力。
 
-fixture 只包含合成代码和测试，不包含真实项目数据、密钥或私有信息。
+workspace fixture、公开测试和隐藏 verifier 只包含合成代码，不包含真实项目数据、
+密钥或私有信息。最终通过条件以隐藏 verifier 为准，防止 Agent 删除或弱化公开
+测试后伪造成功。
 
 ## 测试策略
 
-- loader 单元测试覆盖合法输入、重复 ID、越界目录、非法 glob、缺失 fixture、危险
-  验证命令和 case 过滤。
-- runner 测试通过注入式假 Agent runner 验证副本隔离、路径快照、评分、单 case
-  错误继续执行、Token 聚合和稳定退出语义。
+- loader 单元测试覆盖合法输入、重复 ID、越界目录、非法 glob、缺失 workspace/
+  verifier、危险验证命令、保留目录冲突和 case 过滤。
+- runner 测试通过注入式假 Agent runner 验证副本隔离、Agent 看不到 verifier、
+  verifier 延迟注入与清理、路径快照、评分、单 case 错误继续执行、Token 聚合和
+  稳定退出语义。
 - report 测试验证 JSON schema、Markdown 摘要、未知 Token 和敏感自由文本不落盘。
 - CLI 测试验证默认真实模式、Provider 选择、`--case`、`--dry-run` 以及退出码。
 - 全量自动测试不调用网络；真实 Provider Eval 只由用户显式运行命令触发。
