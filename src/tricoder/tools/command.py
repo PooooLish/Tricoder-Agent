@@ -2,49 +2,18 @@
 
 from __future__ import annotations
 
-import os
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from tricoder.models import ToolResult
 from tricoder.policy import PolicyError
+from tricoder.subprocess_env import filtered_subprocess_env
 
 from tricoder.tools.handlers import ToolHandler
 
 
-# 子进程环境过滤：剔除名称可能承载凭据的变量（API Key/token/password/secret 等）。
-# 这是“最小、可解释”的过滤：保留其余环境，只剔除可疑命名，避免把 Provider
-# 密钥、token、密码或授权头泄漏给被执行的测试/脚本/子进程。
-_SENSITIVE_ENV_RE = re.compile(
-    r"(?i)(api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|"
-    r"token|password|passwd|secret|credential|authorization)"
-)
-_PRESERVED_ENV = frozenset(
-    {
-        "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "WINDIR", "TEMP", "TMP",
-        "TMPDIR", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA",
-        "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "COMSPEC",
-        "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "LC_ALL", "LANG",
-        "PYTHONUTF8", "PYTHONIOENCODING", "TERM", "COLORTERM",
-    }
-)
-
-
-def _filtered_env() -> dict[str, str]:
-    """返回剔除敏感凭据变量后的子进程环境。
-
-    策略：默认保留完整环境，但剔除名称匹配敏感模式的变量（大小写不敏感）；
-    同时显式保留已知必要的系统/构建变量。这是最小黑名单过滤，不伪装成沙盒。
-    """
-    env = os.environ.copy()
-    for name in list(env):
-        if name in _PRESERVED_ENV:
-            continue
-        if _SENSITIVE_ENV_RE.search(name):
-            del env[name]
-    return env
+_filtered_env = filtered_subprocess_env
 
 
 def _git_toplevel(workspace: Path) -> Path | None:
