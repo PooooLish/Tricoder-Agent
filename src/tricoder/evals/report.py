@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
+import stat
 import tempfile
 from typing import Final
 
@@ -26,6 +28,11 @@ _FAILURE_CODES: Final = frozenset(
         "verification_error",
     }
 )
+_VERIFICATION_ERROR_CODES: Final = frozenset(
+    {"verification_policy_rejected", "verification_timeout", "verification_error"}
+)
+_IDENTIFIER_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}")
+_TIMESTAMP_PATTERN: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+")
 
 
 def report_as_dict(report: EvalRunReport) -> dict[str, object]:
@@ -35,11 +42,11 @@ def report_as_dict(report: EvalRunReport) -> dict[str, object]:
     passed_cases = sum(case.status == "passed" for case in report.cases)
     return {
         "schema_version": _SCHEMA_VERSION,
-        "run_id": report.run_id,
-        "suite_id": report.suite_id,
-        "provider": report.provider,
-        "model": report.model,
-        "started_at": report.started_at,
+        "run_id": _safe_identifier(report.run_id),
+        "suite_id": _safe_identifier(report.suite_id),
+        "provider": _safe_identifier(report.provider),
+        "model": _safe_identifier(report.model),
+        "started_at": _safe_timestamp(report.started_at),
         "duration_ms": report.duration_ms,
         "pass_rate": passed_cases / total_cases if total_cases else 0.0,
         "usage": _usage_as_dict(report.usage),
@@ -57,16 +64,13 @@ def render_markdown(report: EvalRunReport) -> str:
         "| --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for case in report.cases:
-        verifications = "; ".join(
-            f"{_markdown_cell(result.name)}: {'passed' if result.passed else 'failed'}"
-            for result in case.verifications
-        ) or "-"
+        verifications = _verification_summary(case.verifications)
         failure_codes = ", ".join(_safe_failure_codes(case.failure_codes)) or "-"
         lines.append(
             "| "
             + " | ".join(
                 (
-                    _markdown_cell(case.case_id),
+                    _safe_identifier(case.case_id),
                     _safe_status(case.status),
                     str(case.duration_ms),
                     str(case.rounds),
@@ -84,10 +88,7 @@ def render_markdown(report: EvalRunReport) -> str:
 def write_reports(report: EvalRunReport, run_dir: Path) -> tuple[Path, Path]:
     """Atomically write fixed report files within an absolute run directory."""
 
-    if not run_dir.is_absolute():
-        raise ValueError("run_dir must be an absolute path")
-    directory = run_dir.resolve()
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = _safe_run_directory(run_dir)
     json_path = _output_path(directory, "result.json")
     markdown_path = _output_path(directory, "report.md")
     _atomic_write(json_path, json.dumps(report_as_dict(report), ensure_ascii=False, indent=2) + "\n")
@@ -97,7 +98,7 @@ def write_reports(report: EvalRunReport, run_dir: Path) -> tuple[Path, Path]:
 
 def _case_as_dict(case: EvalCaseResult) -> dict[str, object]:
     return {
-        "case_id": case.case_id,
+        "case_id": _safe_identifier(case.case_id),
         "status": _safe_status(case.status),
         "failure_codes": list(_safe_failure_codes(case.failure_codes)),
         "duration_ms": case.duration_ms,
@@ -112,10 +113,9 @@ def _case_as_dict(case: EvalCaseResult) -> dict[str, object]:
 
 def _verification_as_dict(result: VerificationResult) -> dict[str, object]:
     return {
-        "name": result.name,
         "exit_code": result.exit_code,
         "passed": result.passed,
-        "error_code": result.error_code,
+        "error_code": _safe_verification_error_code(result.error_code),
     }
 
 
@@ -143,15 +143,71 @@ def _safe_status(status: str) -> str:
     return status if status in {"passed", "failed", "error"} else "error"
 
 
-def _markdown_cell(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
+def _safe_identifier(value: str) -> str:
+    return value if _IDENTIFIER_PATTERN.fullmatch(value) else "invalid"
+
+
+def _safe_timestamp(value: str) -> str:
+    return value if _TIMESTAMP_PATTERN.fullmatch(value) else "unknown"
+
+
+def _safe_verification_error_code(value: str | None) -> str | None:
+    if value is None or value in _VERIFICATION_ERROR_CODES:
+        return value
+    return "verification_error"
+
+
+def _verification_summary(results: tuple[VerificationResult, ...]) -> str:
+    if not results:
+        return "-"
+    return "passed" if all(result.passed for result in results) else "failed"
 
 
 def _output_path(directory: Path, filename: str) -> Path:
-    path = (directory / filename).resolve()
-    if not path.is_relative_to(directory):
-        raise ValueError("report output escapes run directory")
+    path = directory / filename
+    if path.exists() and _is_link_or_reparse_point(path):
+        raise ValueError("report output cannot be a link or reparse point")
     return path
+
+
+def _safe_run_directory(run_dir: Path) -> Path:
+    if not run_dir.is_absolute():
+        raise ValueError("run_dir must be an absolute path")
+    root = Path.cwd().resolve() / "runtime" / "evals"
+    try:
+        relative = run_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("run_dir must be inside runtime/evals") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("run_dir must be a child of runtime/evals")
+    _ensure_safe_directory(root.parent)
+    _ensure_safe_directory(root)
+    directory = root
+    for part in relative.parts:
+        directory /= part
+        _ensure_safe_directory(directory)
+    return directory
+
+
+def _ensure_safe_directory(path: Path) -> None:
+    if path.exists() or os.path.lexists(path):
+        if _is_link_or_reparse_point(path) or not path.is_dir():
+            raise ValueError("report directory must be a normal directory")
+        return
+    path.mkdir()
+    if _is_link_or_reparse_point(path) or not path.is_dir():
+        raise ValueError("report directory must be a normal directory")
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, OSError):
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -160,8 +216,8 @@ def _atomic_write(path: Path, content: str) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
         ) as temporary:
-            temporary.write(content)
             temporary_path = Path(temporary.name)
+            temporary.write(content)
         os.replace(temporary_path, path)
     finally:
         if temporary_path is not None and temporary_path.exists():
