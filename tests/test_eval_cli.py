@@ -132,6 +132,37 @@ class EvalCliTests(unittest.TestCase):
         self.assertIn("case-one", output.getvalue())
         self.assertNotIn("TASK-SECRET-SENTINEL", output.getvalue())
 
+    def test_eval_command_boundary_redacts_unexpected_exception(self) -> None:
+        """An unexpected service exception must not escape or expose its text."""
+        output = io.StringIO()
+
+        with patch(
+            "tricoder.cli.run_eval_command",
+            side_effect=RuntimeError("COMMAND-SECRET-SENTINEL"),
+        ):
+            exit_code = main(
+                ["eval", str(self.suite_dir), "--dry-run", "--no-color"],
+                environ={},
+                output=output,
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual("eval_error=runtime\n", output.getvalue())
+        self.assertNotIn("COMMAND-SECRET-SENTINEL", output.getvalue())
+
+    def test_eval_command_boundary_does_not_swallow_keyboard_interrupt(self) -> None:
+        """Catching BaseException would make an interrupted eval unresponsive."""
+        with patch(
+            "tricoder.cli.run_eval_command",
+            side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                main(
+                    ["eval", str(self.suite_dir), "--dry-run", "--no-color"],
+                    environ={},
+                    output=io.StringIO(),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -182,12 +182,16 @@ def main(
     ui = TerminalUI(console=console, input_fn=input_fn)
     env = os.environ if environ is None else environ
     if args.command == "eval":
-        return run_eval_command(
-            args,
-            environ=env,
-            provider_factory=provider_factory,
-            output=output,
-        )
+        try:
+            return run_eval_command(
+                args,
+                environ=env,
+                provider_factory=provider_factory,
+                output=output,
+            )
+        except Exception:
+            output.write("eval_error=runtime\n")
+            return 2
     if args.command is None or args.command == "chat":
         return _run_chat(
             args,

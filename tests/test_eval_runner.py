@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from tricoder.evals.models import EvalCase, EvalSuite, VerificationSpec
+from tricoder.evals.output import EvalOutputError
 from tricoder.evals.runner import run_suite
 from tricoder.evals.workspace import RESERVED_VERIFIER_DIR
 from tricoder.models import RunResult, TokenUsage
@@ -19,7 +21,10 @@ class EvalRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.run_dir = self.root / "runtime" / "run-001"
+        self.original_cwd = Path.cwd()
+        os.chdir(self.root)
+        self.run_dir = self.root / "runtime" / "evals" / "run-001"
+        self.run_dir.mkdir(parents=True)
         self.case = self._make_case("case-one")
         self.suite = EvalSuite(
             id="smoke",
@@ -29,6 +34,7 @@ class EvalRunnerTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        os.chdir(self.original_cwd)
         self.temporary.cleanup()
 
     def _make_case(
@@ -115,6 +121,26 @@ class EvalRunnerTests(unittest.TestCase):
                 / RESERVED_VERIFIER_DIR
             ).exists()
         )
+
+    def test_run_suite_rejects_nonempty_run_dir_before_creating_state(self) -> None:
+        """Reusing a prior run directory must not create audit/workspace children."""
+        marker = self.run_dir / "keep.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        executor_calls: list[str] = []
+
+        with self.assertRaises(EvalOutputError):
+            run_suite(
+                self.suite,
+                self.run_dir,
+                "openai",
+                "test-model",
+                lambda *_args: executor_calls.append("called"),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual([], executor_calls)
+        self.assertEqual("preserve", marker.read_text(encoding="utf-8"))
+        self.assertFalse((self.run_dir / "workspaces").exists())
+        self.assertFalse((self.run_dir / "audit").exists())
 
     def test_agent_failure_has_fixed_failure_code(self) -> None:
         def executor(

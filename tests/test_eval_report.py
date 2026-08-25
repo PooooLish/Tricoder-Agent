@@ -165,7 +165,7 @@ class EvalReportTests(unittest.TestCase):
         self.assertEqual("verification_error", payload["cases"][0]["verifications"][0]["error_code"])
 
     def test_write_reports_rejects_linked_run_directory_component(self) -> None:
-        with patch("tricoder.evals.report._is_link_or_reparse_point", return_value=True):
+        with patch("tricoder.evals.output._is_link_or_reparse_point", return_value=True):
             with self.assertRaises(ValueError):
                 write_reports(self._report_with_unknown_usage_and_failure(), self.run_dir)
 

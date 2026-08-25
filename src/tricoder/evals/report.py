@@ -6,12 +6,12 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import tempfile
 from typing import Final
 
 from tricoder.models import TokenUsage
 
+from .output import _is_link_or_reparse_point, validate_run_directory
 from .runner import EvalCaseResult, EvalRunReport, VerificationResult
 
 
@@ -88,7 +88,12 @@ def render_markdown(report: EvalRunReport) -> str:
 def write_reports(report: EvalRunReport, run_dir: Path) -> tuple[Path, Path]:
     """Atomically write fixed report files within an absolute run directory."""
 
-    directory = _safe_run_directory(run_dir)
+    directory = validate_run_directory(
+        Path.cwd(),
+        run_dir,
+        require_empty=False,
+        create=True,
+    )
     json_path = _output_path(directory, "result.json")
     markdown_path = _output_path(directory, "report.md")
     _atomic_write(json_path, json.dumps(report_as_dict(report), ensure_ascii=False, indent=2) + "\n")
@@ -168,46 +173,6 @@ def _output_path(directory: Path, filename: str) -> Path:
     if path.exists() and _is_link_or_reparse_point(path):
         raise ValueError("report output cannot be a link or reparse point")
     return path
-
-
-def _safe_run_directory(run_dir: Path) -> Path:
-    if not run_dir.is_absolute():
-        raise ValueError("run_dir must be an absolute path")
-    root = Path.cwd().resolve() / "runtime" / "evals"
-    try:
-        relative = run_dir.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("run_dir must be inside runtime/evals") from exc
-    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
-        raise ValueError("run_dir must be a child of runtime/evals")
-    _ensure_safe_directory(root.parent)
-    _ensure_safe_directory(root)
-    directory = root
-    for part in relative.parts:
-        directory /= part
-        _ensure_safe_directory(directory)
-    return directory
-
-
-def _ensure_safe_directory(path: Path) -> None:
-    if path.exists() or os.path.lexists(path):
-        if _is_link_or_reparse_point(path) or not path.is_dir():
-            raise ValueError("report directory must be a normal directory")
-        return
-    path.mkdir()
-    if _is_link_or_reparse_point(path) or not path.is_dir():
-        raise ValueError("report directory must be a normal directory")
-
-
-def _is_link_or_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        attributes = path.lstat().st_file_attributes
-    except (AttributeError, OSError):
-        return False
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return bool(reparse_flag and attributes & reparse_flag)
 
 
 def _atomic_write(path: Path, content: str) -> None:

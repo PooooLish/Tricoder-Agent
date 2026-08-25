@@ -16,6 +16,7 @@ from tricoder.subprocess_env import filtered_subprocess_env
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase, EvalSuite, VerificationSpec
+from .output import validate_run_directory
 from .workspace import (
     WorkspaceSafetyError,
     capture_snapshot,
@@ -79,10 +80,15 @@ def run_suite(
 
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = validate_run_directory(
+        Path.cwd(),
+        run_dir,
+        require_empty=True,
+    )
     workspaces_root = run_dir / "workspaces"
     audit_root = run_dir / "audit"
-    audit_root.mkdir(parents=True, exist_ok=True)
+    workspaces_root.mkdir()
+    audit_root.mkdir()
 
     cases = tuple(
         _run_case(case, workspaces_root, audit_root, agent_executor)

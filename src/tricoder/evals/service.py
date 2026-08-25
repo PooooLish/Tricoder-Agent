@@ -11,14 +11,15 @@ from typing import TextIO
 
 from tricoder.agent import CodingAgent
 from tricoder.audit import AuditLogger
-from tricoder.config import ConfigError, load_config
+from tricoder.config import load_config
 from tricoder.models import ProviderConfig, RunResult
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider
 from tricoder.tools import ToolContext, ToolRegistry
 
-from .loader import EvalDefinitionError, load_suite
+from .loader import load_suite
 from .models import EvalCase
+from .output import reserve_run_directory
 from .report import write_reports
 from .runner import run_suite
 
@@ -37,7 +38,7 @@ def run_eval_command(
 
     try:
         suite = load_suite(args.suite, case_id=args.case)
-    except (EvalDefinitionError, OSError, UnicodeError, ValueError):
+    except Exception:
         output.write("eval_error=definition\n")
         return 2
 
@@ -47,8 +48,8 @@ def run_eval_command(
             output.write(f"case={case.id} status=validated\n")
         return 0
 
-    project_root = Path.cwd().resolve()
     try:
+        project_root = Path.cwd()
         base_config = load_config(
             provider=args.provider,
             workspace=project_root,
@@ -57,13 +58,11 @@ def run_eval_command(
             model=args.model,
             base_url=args.base_url,
         )
-    except ConfigError:
+    except Exception:
         output.write("eval_error=configuration\n")
         return 2
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%S.%fz")
-    run_dir = project_root / "runtime" / "evals" / run_id
-
     def execute_case(
         case: EvalCase,
         workspace: Path,
@@ -100,6 +99,7 @@ def run_eval_command(
         return agent.run(case.task)
 
     try:
+        run_dir = reserve_run_directory(project_root, run_id)
         report = run_suite(
             suite,
             run_dir,

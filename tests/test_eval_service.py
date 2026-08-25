@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tricoder.evals.service import run_eval_command
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall, ToolDefinition
@@ -143,7 +144,9 @@ class EvalServiceTests(unittest.TestCase):
         exit_code = run_eval_command(
             self._args(),
             environ={},
-            provider_factory=lambda *_args: provider_calls.append("called"),  # type: ignore[arg-type]
+            provider_factory=lambda *_args: provider_calls.append(  # type: ignore[arg-type]
+                "called"
+            ),
             output=output,
         )
 
@@ -222,6 +225,128 @@ class EvalServiceTests(unittest.TestCase):
         self.assertNotIn("PROVIDER-SECRET-SENTINEL", output.getvalue())
         self.assertNotIn("PROVIDER-SECRET-SENTINEL", result_text)
         self.assertNotIn("PROVIDER-SECRET-SENTINEL", report_text)
+
+    def test_output_parent_is_rejected_before_provider_or_eval_state(self) -> None:
+        """A linked runtime parent must be rejected before runner state is created."""
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        provider_calls: list[str] = []
+        output = io.StringIO()
+
+        with patch(
+            "tricoder.evals.output._is_link_or_reparse_point",
+            side_effect=lambda path: path == runtime,
+        ):
+            exit_code = run_eval_command(
+                self._args(case="case-one"),
+                environ=self._environment(),
+                provider_factory=lambda *_args: provider_calls.append(  # type: ignore[arg-type]
+                    "called"
+                ),
+                output=output,
+            )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual([], provider_calls)
+        self.assertFalse((runtime / "evals").exists())
+
+    def test_fixed_timestamp_collision_creates_a_new_exclusive_run(self) -> None:
+        """Two runs with the same clock value must not share state or reports."""
+        fixed_run_id = "20260825t010203.000000z"
+        existing = self.root / "runtime" / "evals" / fixed_run_id
+        existing.mkdir(parents=True)
+        marker = existing / "keep.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        output = io.StringIO()
+
+        with patch("tricoder.evals.service.datetime") as clock:
+            clock.now.return_value.strftime.return_value = fixed_run_id
+            exit_code = run_eval_command(
+                self._args(case="case-one"),
+                environ=self._environment(),
+                provider_factory=lambda _config, _timeout: FinishingWithoutChangesProvider(),
+                output=output,
+            )
+
+        run_root = self.root / "runtime" / "evals"
+        self.assertEqual(1, exit_code)
+        self.assertEqual(
+            (fixed_run_id, f"{fixed_run_id}-01"),
+            tuple(sorted(path.name for path in run_root.iterdir())),
+        )
+        self.assertEqual((marker,), tuple(existing.iterdir()))
+        self.assertIn(f"run_id={fixed_run_id}-01", output.getvalue())
+
+    def test_definition_cwd_and_config_exceptions_are_fixed_and_redacted(self) -> None:
+        """Unexpected boundary failures must return 2 without traceback text."""
+        for target in (
+            "tricoder.evals.service.load_suite",
+            "tricoder.evals.service.Path.cwd",
+            "tricoder.evals.service.load_config",
+        ):
+            with self.subTest(target=target):
+                output = io.StringIO()
+                with patch(
+                    target,
+                    side_effect=RuntimeError("BOUNDARY-SECRET-SENTINEL"),
+                ):
+                    exit_code = run_eval_command(
+                        self._args(case="case-one"),
+                        environ=self._environment(),
+                        provider_factory=lambda _config, _timeout: (
+                            FinishingWithoutChangesProvider()
+                        ),
+                        output=output,
+                    )
+
+                self.assertEqual(2, exit_code)
+                self.assertNotIn("BOUNDARY-SECRET-SENTINEL", output.getvalue())
+
+    def test_base_url_and_env_file_reach_production_provider_config(self) -> None:
+        """Dropping explicit connection options before provider construction must fail."""
+        env_file = self.root / "eval.env"
+        env_file.write_text("OPENAI_API_KEY=file-test-key\n", encoding="utf-8")
+        provider_configs: list[ProviderConfig] = []
+
+        def factory(
+            config: ProviderConfig,
+            _timeout: float,
+        ) -> FinishingWithoutChangesProvider:
+            provider_configs.append(config)
+            return FinishingWithoutChangesProvider()
+
+        exit_code = run_eval_command(
+            self._args(
+                case="case-one",
+                base_url="https://example.test/v1",
+                env_file=env_file,
+            ),
+            environ={"TRICODER_PLAN": "0"},
+            provider_factory=factory,
+            output=io.StringIO(),
+        )
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual(1, len(provider_configs))
+        self.assertEqual("https://example.test/v1", provider_configs[0].base_url)
+        self.assertEqual("file-test-key", provider_configs[0].api_key)
+
+    def test_unknown_case_returns_two_without_provider_or_runtime(self) -> None:
+        """An unknown case must stop before config, Provider, or output creation."""
+        provider_calls: list[str] = []
+
+        exit_code = run_eval_command(
+            self._args(case="missing-case"),
+            environ=self._environment(),
+            provider_factory=lambda *_args: provider_calls.append(  # type: ignore[arg-type]
+                "called"
+            ),
+            output=io.StringIO(),
+        )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual([], provider_calls)
+        self.assertFalse((self.root / "runtime").exists())
 
 
 if __name__ == "__main__":
