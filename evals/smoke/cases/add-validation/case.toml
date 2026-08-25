@@ -8,5 +8,5 @@ max_context_chars = 40000
 
 [[verification]]
 name = "hidden-tests"
-command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+command = "python .tricoder_eval_verifier/test_hidden.py"
 timeout = 30

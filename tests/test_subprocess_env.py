@@ -18,6 +18,8 @@ class SubprocessEnvironmentTests(unittest.TestCase):
             "AWS_ACCESS_KEY": "secret",
             "AUTHORIZATION": "secret",
             "ORDINARY_SETTING": "visible",
+            "PYTHONDONTWRITEBYTECODE": "0",
+            "PYTEST_ADDOPTS": "--pdb",
         }
 
         env = filtered_subprocess_env(source)
@@ -31,6 +33,8 @@ class SubprocessEnvironmentTests(unittest.TestCase):
         self.assertNotIn("AWS_ACCESS_KEY", env)
         self.assertNotIn("AUTHORIZATION", env)
         self.assertIn("CUSTOM_TOKEN", source)
+        self.assertEqual("1", env["PYTHONDONTWRITEBYTECODE"])
+        self.assertEqual("-p no:cacheprovider", env["PYTEST_ADDOPTS"])
 
 
 if __name__ == "__main__":

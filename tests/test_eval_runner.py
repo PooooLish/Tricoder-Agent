@@ -280,7 +280,7 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertIsNone(report.cases[0].usage)
         self.assertIsNone(report.usage)
 
-    def test_suite_token_usage_merges_all_known_case_fields(self) -> None:
+    def test_suite_token_usage_keeps_each_mixed_unknown_field_none(self) -> None:
         second = self._make_case("case-two")
         suite = replace(self.suite, cases=(self.case, second))
 
@@ -298,10 +298,25 @@ class EvalRunnerTests(unittest.TestCase):
         report = run_suite(suite, self.run_dir, "openai", "test-model", executor)
 
         self.assertEqual(
-            TokenUsage(input_tokens=5, output_tokens=7, cached_tokens=1),
+            TokenUsage(input_tokens=5),
             report.usage,
         )
-        self.assertIsNone(report.usage.cache_miss_tokens)  # type: ignore[union-attr]
+
+    def test_suite_token_usage_keeps_all_fields_unknown_when_a_case_is_unknown(self) -> None:
+        second = self._make_case("case-two")
+        suite = replace(self.suite, cases=(self.case, second))
+
+        def executor(
+            case: EvalCase, workspace: Path, audit_path: Path
+        ) -> RunResult:
+            result = self._passing_executor(case, workspace, audit_path)
+            if case.id == "case-one":
+                return replace(result, usage=TokenUsage(input_tokens=2, output_tokens=3))
+            return result
+
+        report = run_suite(suite, self.run_dir, "openai", "test-model", executor)
+
+        self.assertEqual(TokenUsage(), report.usage)
 
     def test_verification_timeout_has_fixed_error_mapping(self) -> None:
         case = self._make_case(
@@ -400,6 +415,59 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertFalse(
             (self.run_dir / "workspaces" / case.id / RESERVED_VERIFIER_DIR).exists()
         )
+
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 支持 junction reparse point")
+    def test_reserved_junction_is_unlinked_when_after_snapshot_fails(self) -> None:
+        """Outer cleanup must remove the reserved link without following its target."""
+        outside = self.root / "outside-reserved-target"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        probe = self.root / "junction-probe"
+        probe_result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(probe), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe_result.returncode != 0:
+            self.skipTest("当前账户不能创建 junction")
+        os.rmdir(probe)
+
+        def executor(
+            case: EvalCase, workspace: Path, audit_path: Path
+        ) -> RunResult:
+            del case, audit_path
+            (workspace / "app.py").write_text("value = 2\n", encoding="utf-8")
+            reserved = workspace / RESERVED_VERIFIER_DIR
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(reserved), str(outside)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if created.returncode != 0:
+                raise RuntimeError("junction setup failed")
+            return RunResult(True, "done", 1, 1, (), "通过")
+
+        result = run_suite(
+            self.suite,
+            self.run_dir,
+            "openai",
+            "test-model",
+            executor,
+        ).cases[0]
+        reserved = (
+            self.run_dir / "workspaces" / self.case.id / RESERVED_VERIFIER_DIR
+        )
+        remained = os.path.lexists(reserved)
+        if remained:
+            os.rmdir(reserved)
+
+        self.assertEqual("error", result.status)
+        self.assertEqual(("workspace_error",), result.failure_codes)
+        self.assertFalse(remained)
+        self.assertEqual("keep", sentinel.read_text(encoding="utf-8"))
 
     def test_nested_reserved_path_is_rejected_even_with_broad_allowed_glob(
         self,

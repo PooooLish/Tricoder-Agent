@@ -1,4 +1,6 @@
 import math
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +28,11 @@ class EvalLoaderTests(unittest.TestCase):
         allowed_changes: tuple[str, ...] = ("app.py", "tests/**"),
         required_changes: tuple[str, ...] = ("app.py",),
         verification_command: str = "python -m unittest discover -s tests -q",
+        task: str = "Repair app.py and run its tests.",
+        max_rounds: int = 8,
+        max_context_chars: int = 40000,
+        verification_timeout: int = 30,
+        verification_count: int = 1,
         include_verifier: bool = True,
     ) -> Path:
         self.suite_count += 1
@@ -41,24 +48,33 @@ class EvalLoaderTests(unittest.TestCase):
             (case_dir / "workspace" / "tests").mkdir(parents=True)
             if include_verifier:
                 (case_dir / "verifier").mkdir()
-            (case_dir / "case.toml").write_text(
-                "\n".join(
+            definition = [
+                f'id = "{case_id}"',
+                'title = "Fix the example"',
+                f'task = "{task}"',
+                f"allowed_changes = {list(allowed_changes)!r}",
+                f"required_changes = {list(required_changes)!r}",
+                f"max_rounds = {max_rounds}",
+                f"max_context_chars = {max_context_chars}",
+                "",
+            ]
+            for verification_index in range(verification_count):
+                verification_name = (
+                    "unit"
+                    if verification_count == 1
+                    else f"unit-{verification_index}"
+                )
+                definition.extend(
                     (
-                        f'id = "{case_id}"',
-                        'title = "Fix the example"',
-                        'task = "Repair app.py and run its tests."',
-                        f"allowed_changes = {list(allowed_changes)!r}",
-                        f"required_changes = {list(required_changes)!r}",
-                        "max_rounds = 8",
-                        "max_context_chars = 40000",
-                        "",
                         "[[verification]]",
-                        'name = "unit"',
+                        f'name = "{verification_name}"',
                         f'command = "{verification_command}"',
-                        "timeout = 30",
+                        f"timeout = {verification_timeout}",
                         "",
                     )
-                ),
+                )
+            (case_dir / "case.toml").write_text(
+                "\n".join(definition),
                 encoding="utf-8",
             )
         return suite_dir
@@ -135,6 +151,25 @@ class EvalLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalDefinitionError, "链接|边界"):
             load_suite(suite_dir)
 
+    @unittest.skipUnless(os.name == "nt", "仅 Windows 支持 junction reparse point")
+    def test_load_suite_rejects_nested_junction_in_unselected_case(self) -> None:
+        """Every declared fixture tree must be safe before case filtering."""
+        suite_dir = self._write_suite(case_ids=("fix-one", "fix-two"))
+        outside = self.root / "outside-verifier"
+        outside.mkdir()
+        junction = suite_dir / "cases" / "fix-two" / "verifier" / "escape"
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.skipTest("当前账户不能创建 junction")
+
+        with self.assertRaisesRegex(EvalDefinitionError, "链接|reparse"):
+            load_suite(suite_dir, case_id="fix-one")
+
     def test_load_suite_rejects_non_finite_verification_timeout(self) -> None:
         """防止 NaN 或 Infinity timeout 传入 subprocess 后破坏验证限制。"""
         for timeout in (math.nan, math.inf):
@@ -158,6 +193,64 @@ class EvalLoaderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalDefinitionError, "验证命令"):
             load_suite(suite_dir)
+
+    def test_load_suite_accepts_conservative_resource_boundaries(self) -> None:
+        """The exact documented caps must remain usable."""
+        command = "python app.py " + "x" * (2048 - len("python app.py "))
+        suite_dir = self._write_suite(
+            case_ids=tuple(f"case-{index}" for index in range(32)),
+            allowed_changes=("a" * 256,),
+            required_changes=("a" * 256,),
+            task="x" * 8000,
+            max_rounds=64,
+            max_context_chars=200_000,
+            verification_command=command,
+            verification_timeout=300,
+            verification_count=8,
+        )
+        fixture = suite_dir / "cases" / "case-0" / "workspace"
+        for index in range(256):
+            (fixture / f"file-{index}.txt").write_bytes(b"")
+
+        suite = load_suite(suite_dir)
+
+        self.assertEqual(32, len(suite.cases))
+        self.assertEqual(8, len(suite.cases[0].verifications))
+
+    def test_load_suite_rejects_resource_limit_overflow(self) -> None:
+        """Every untrusted definition and fixture dimension has a hard cap."""
+        builders = {
+            "cases": lambda: self._write_suite(
+                case_ids=tuple(f"case-{index}" for index in range(33)),
+            ),
+            "verifications": lambda: self._write_suite(verification_count=9),
+            "task": lambda: self._write_suite(task="x" * 8001),
+            "command": lambda: self._write_suite(
+                verification_command="python app.py " + "x" * 2035,
+            ),
+            "pattern": lambda: self._write_suite(allowed_changes=("a" * 257,)),
+            "rounds": lambda: self._write_suite(max_rounds=65),
+            "context": lambda: self._write_suite(max_context_chars=200_001),
+            "timeout": lambda: self._write_suite(verification_timeout=301),
+        }
+        for label, builder in builders.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(EvalDefinitionError, "资源上限"):
+                    load_suite(builder())
+
+        too_many_files = self._write_suite()
+        workspace = too_many_files / "cases" / "fix-one" / "workspace"
+        for index in range(257):
+            (workspace / f"file-{index}.txt").write_bytes(b"")
+        with self.assertRaisesRegex(EvalDefinitionError, "资源上限"):
+            load_suite(too_many_files)
+
+        too_many_bytes = self._write_suite()
+        (too_many_bytes / "cases" / "fix-one" / "workspace" / "large.bin").write_bytes(
+            b"x" * 1_000_001
+        )
+        with self.assertRaisesRegex(EvalDefinitionError, "资源上限"):
+            load_suite(too_many_bytes)
 
 
 if __name__ == "__main__":

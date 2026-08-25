@@ -98,9 +98,23 @@ def remove_verifier(workspace: Path) -> None:
     verifier = _verifier_path(root)
     if not os.path.lexists(verifier):
         return
-    _reject_link_or_reparse_path(verifier)
-    if not verifier.is_dir():
-        raise WorkspaceSafetyError("保留 verifier 路径必须是目录")
+    try:
+        metadata = verifier.lstat()
+    except OSError as exc:
+        raise WorkspaceSafetyError("保留 verifier 路径不可用") from exc
+    if verifier.is_symlink() or _is_reparse_point(metadata):
+        # The exact reserved entry is framework-owned.  Remove the link object
+        # itself and never recurse through its target.
+        if stat.S_ISDIR(metadata.st_mode):
+            os.rmdir(verifier)
+        else:
+            verifier.unlink()
+        return
+    if stat.S_ISREG(metadata.st_mode):
+        verifier.unlink()
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkspaceSafetyError("保留 verifier 路径必须是普通文件或目录")
     _remove_tree(verifier, root)
 
 
@@ -118,7 +132,7 @@ def _ensure_directory(path: Path, *, create: bool = False) -> Path:
 
 
 def _verifier_path(workspace: Path) -> Path:
-    verifier = _within_root(workspace / RESERVED_VERIFIER_DIR, workspace)
+    verifier = workspace / RESERVED_VERIFIER_DIR
     if verifier.name != RESERVED_VERIFIER_DIR or verifier.parent != workspace:
         raise WorkspaceSafetyError("保留 verifier 目录路径无效")
     return verifier

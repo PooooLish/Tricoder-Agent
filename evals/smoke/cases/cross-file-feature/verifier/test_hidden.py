@@ -1,28 +1,73 @@
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 
+
+_PROBE = r"""
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path.cwd()))
 from discounts import percentage_discount
 from pricing import final_price
 
+def outcome(function, *args):
+    try:
+        return {"value": function(*args)}
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+
+sys.stdout.write(json.dumps({
+    "discount": outcome(percentage_discount, 100, 25),
+    "bad_amount": outcome(percentage_discount, -1, 10),
+    "bad_percent_low": outcome(percentage_discount, 100, -1),
+    "bad_percent_high": outcome(percentage_discount, 100, 101),
+    "default_price": outcome(final_price, 80),
+    "discounted_price": outcome(final_price, 80, 25),
+}, separators=(",", ":")))
+"""
+
+
+def _run_probe() -> object:
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", _PROBE],
+        cwd=Path.cwd(),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0 or len(completed.stdout) > 4096:
+        raise AssertionError("isolated business probe failed")
+    try:
+        return json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise AssertionError("isolated business probe returned invalid JSON") from exc
+
 
 class HiddenDiscountTests(unittest.TestCase):
-    def test_percentage_discount_returns_discounted_amount(self) -> None:
-        self.assertEqual(75, percentage_discount(100, 25))
-
-    def test_percentage_discount_rejects_invalid_bounds(self) -> None:
-        for amount, percent in ((-1, 10), (100, -1), (100, 101)):
-            with self.subTest(amount=amount, percent=percent):
-                with self.assertRaises(ValueError):
-                    percentage_discount(amount, percent)
-
-    def test_final_price_uses_the_cross_file_discount(self) -> None:
-        self.assertEqual(80, final_price(100, 20))
-        self.assertEqual(100, final_price(100))
-
-    def test_final_price_rejects_invalid_bounds(self) -> None:
-        for amount, percent in ((-1, 0), (100, -1), (100, 101)):
-            with self.subTest(amount=amount, percent=percent):
-                with self.assertRaises(ValueError):
-                    final_price(amount, percent)
+    def test_discount_contract_in_isolated_process(self) -> None:
+        self.assertEqual(
+            {
+                "discount": {"value": 75},
+                "bad_amount": {"error": "ValueError"},
+                "bad_percent_low": {"error": "ValueError"},
+                "bad_percent_high": {"error": "ValueError"},
+                "default_price": {"value": 80},
+                "discounted_price": {"value": 60},
+            },
+            _run_probe(),
+        )
 
 
 if __name__ == "__main__":

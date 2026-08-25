@@ -5,8 +5,14 @@ from __future__ import annotations
 import os
 import re
 import shlex
-import shutil
+from collections.abc import Mapping
 from pathlib import Path
+
+from tricoder.subprocess_env import (
+    filtered_subprocess_env,
+    trusted_path_executable,
+    trusted_python_executable,
+)
 
 
 class PolicyError(PermissionError):
@@ -177,9 +183,21 @@ class CommandPolicy:
     }
     _ABSOLUTE_PATH_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
 
-    def __init__(self, workspace: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
         self._workspace_policy = (
             WorkspacePolicy(workspace) if workspace is not None else None
+        )
+        excluded_paths = [Path.cwd().resolve(strict=False)]
+        if self._workspace_policy is not None:
+            excluded_paths.append(self._workspace_policy.workspace)
+        self._subprocess_env = filtered_subprocess_env(
+            environ,
+            excluded_paths=tuple(excluded_paths),
         )
 
     def validate(self, command: str) -> list[str]:
@@ -253,11 +271,18 @@ class CommandPolicy:
         return "<工作区内脚本>"
 
     def _resolve_executable(self, name: str) -> str:
-        """把纯名称解析为 PATH 中的可信绝对路径；失败即安全拒绝。"""
-        resolved = shutil.which(name)
-        if resolved is None:
-            raise PolicyError(f"找不到可信的 {name} 可执行程序")
-        return str(Path(resolved).resolve())
+        """把纯名称解析为可信绝对路径；失败即安全拒绝。"""
+        try:
+            if name == "python":
+                return trusted_python_executable()
+            return trusted_path_executable(name, self._subprocess_env)
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+
+    def subprocess_environment(self) -> dict[str, str]:
+        """Return the same filtered environment used for executable resolution."""
+
+        return dict(self._subprocess_env)
 
     @staticmethod
     def _is_qualified_path(raw: str) -> bool:

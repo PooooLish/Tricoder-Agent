@@ -1,4 +1,6 @@
 import os
+import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +92,40 @@ class CommandPolicyTests(unittest.TestCase):
                 self.assertTrue(resolved.is_absolute())
                 self.assertEqual(name, resolved.name.lower().removesuffix(".exe"))
                 self.assertTrue(resolved.exists())
+
+    def test_validate_ignores_cwd_and_workspace_executable_hijacks(self) -> None:
+        """Python and Git must not resolve from attacker-controlled PATH entries."""
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            python_name = "python.exe" if os.name == "nt" else "python"
+            git_name = "git.exe" if os.name == "nt" else "git"
+            fake_python = workspace / python_name
+            fake_git = workspace / git_name
+            fake_python.write_bytes(b"fake-python")
+            fake_git.write_bytes(b"fake-git")
+            fake_python.chmod(0o755)
+            fake_git.chmod(0o755)
+            original_cwd = Path.cwd()
+            original_path = os.environ.get("PATH", "")
+            try:
+                os.chdir(workspace)
+                os.environ["PATH"] = f"{workspace}{os.pathsep}{original_path}"
+                policy = CommandPolicy(workspace)
+                python_executable = Path(
+                    policy.validate("python -m unittest")[0]
+                )
+                git_executable = Path(policy.validate("git status")[0])
+            finally:
+                os.environ["PATH"] = original_path
+                os.chdir(original_cwd)
+
+        self.assertEqual(Path(sys.executable).resolve(), python_executable)
+        self.assertNotEqual(fake_python.resolve(), python_executable)
+        self.assertNotEqual(fake_git.resolve(), git_executable)
+        self.assertEqual(
+            Path(shutil.which("git", path=original_path) or "").resolve(),
+            git_executable,
+        )
 
     def test_rejects_shell_chaining_deletion_install_and_git_writes(self) -> None:
         """防止审批机制被高风险命令或 Shell 元字符绕过。"""

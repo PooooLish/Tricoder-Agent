@@ -3,6 +3,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -2811,6 +2812,30 @@ class ToolTests(unittest.TestCase):
         self.assertIn("退出码：0", result.output)
         self.assertEqual("run_command", self.approver.requests[0][0])
 
+    def test_git_toplevel_uses_policy_executable_and_filtered_environment(self) -> None:
+        """Repository probing must not run a naked Git before approval."""
+        policy = CommandPolicy(self.workspace)
+        trusted_git = policy.validate("git status")[0]
+        completed = subprocess.CompletedProcess(
+            [trusted_git],
+            0,
+            stdout=str(self.workspace),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "private"}):
+            with patch.object(
+                command_module.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                root = command_module._git_toplevel(self.workspace, policy)
+
+        self.assertEqual(self.workspace.resolve(), root)
+        called_args = run.call_args.args[0]
+        called_env = run.call_args.kwargs["env"]
+        self.assertEqual(trusted_git, called_args[0])
+        self.assertNotIn("OPENAI_API_KEY", called_env)
+
     def test_filtered_env_drops_sensitive_variables(self) -> None:
         """子进程环境必须剔除 API Key/token/password 等敏感变量。"""
         with patch.dict(
@@ -2842,6 +2867,59 @@ class ToolTests(unittest.TestCase):
                 {"command": "python probe.py"},
             )
         self.assertIn("GONE", result.output)
+
+    def test_run_command_terminates_process_tree_when_output_exceeds_limit(self) -> None:
+        """Output limiting must be an in-memory boundary, not post-capture slicing."""
+        (self.workspace / "flood.py").write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "sys.stdout.write('x' * 5_000_000)\n"
+            "sys.stdout.flush()\n"
+            "Path('after-flood.txt').write_text('should-not-exist')\n",
+            encoding="utf-8",
+        )
+        self.registry.context.max_output_chars = 1024
+
+        result = self.registry.execute(
+            "run_command",
+            {"command": "python flood.py"},
+        )
+
+        self.assertFalse(result.ok, result.output)
+        self.assertIn("输出超过", result.output)
+        self.assertLessEqual(len(result.output), 1200)
+        self.assertFalse((self.workspace / "after-flood.txt").exists())
+
+    def test_run_command_timeout_terminates_descendant_processes(self) -> None:
+        """A timed-out command must not leave a child process running."""
+        child_code = (
+            "import time; from pathlib import Path; "
+            "time.sleep(0.6); Path('child-alive.txt').write_text('alive')"
+        )
+        (self.workspace / "spawn_child.py").write_text(
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "time.sleep(10)\n",
+            encoding="utf-8",
+        )
+        registry = ToolRegistry(
+            ToolContext(
+                workspace_policy=WorkspacePolicy(self.workspace),
+                command_policy=CommandPolicy(self.workspace),
+                approver=lambda _action, _detail: True,
+                timeout=0.2,
+            )
+        )
+
+        result = registry.execute(
+            "run_command",
+            {"command": "python spawn_child.py"},
+        )
+        time.sleep(0.9)
+
+        self.assertFalse(result.ok)
+        self.assertIn("超过 0.2 秒", result.output)
+        self.assertFalse((self.workspace / "child-alive.txt").exists())
 
 
 if __name__ == "__main__":

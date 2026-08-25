@@ -12,12 +12,12 @@ from typing import Literal, TypeAlias
 
 from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
-from tricoder.subprocess_env import filtered_subprocess_env
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase, EvalSuite, VerificationSpec
 from .output import validate_run_directory
 from .workspace import (
+    FileFingerprint,
     WorkspaceSafetyError,
     capture_snapshot,
     changed_paths,
@@ -131,6 +131,46 @@ def _run_case(
             run_result=run_result,
         )
 
+    cleanup_failed = False
+    try:
+        result = _run_prepared_case(
+            case=case,
+            started=started,
+            workspace=workspace,
+            before=before,
+            audit_root=audit_root,
+            agent_executor=agent_executor,
+        )
+    finally:
+        try:
+            remove_verifier(workspace)
+        except (OSError, WorkspaceSafetyError):
+            cleanup_failed = True
+    if cleanup_failed:
+        return _case_result(
+            case,
+            started,
+            ("workspace_error",),
+            modified_files=(),
+            verifications=(),
+            run_result=None,
+        )
+    return result
+
+
+def _run_prepared_case(
+    *,
+    case: EvalCase,
+    started: float,
+    workspace: Path,
+    before: dict[str, FileFingerprint],
+    audit_root: Path,
+    agent_executor: AgentExecutor,
+) -> EvalCaseResult:
+    run_result: RunResult | None = None
+    modified_files: tuple[str, ...] = ()
+    verifications: tuple[VerificationResult, ...] = ()
+
     try:
         run_result = agent_executor(
             case,
@@ -161,10 +201,6 @@ def _run_case(
         )
 
     if any(is_reserved_eval_path(path) for path in modified_files):
-        try:
-            remove_verifier(workspace)
-        except (OSError, WorkspaceSafetyError):
-            pass
         return _case_result(
             case,
             started,
@@ -175,13 +211,10 @@ def _run_case(
         )
 
     try:
-        try:
-            install_verifier(case, workspace)
-            verifications = tuple(
-                _run_verification(spec, workspace) for spec in case.verifications
-            )
-        finally:
-            remove_verifier(workspace)
+        install_verifier(case, workspace)
+        verifications = tuple(
+            _run_verification(spec, workspace) for spec in case.verifications
+        )
     except (OSError, WorkspaceSafetyError):
         return _case_result(
             case,
@@ -206,8 +239,9 @@ def _run_case(
 def _run_verification(
     spec: VerificationSpec, workspace: Path
 ) -> VerificationResult:
+    policy = CommandPolicy(workspace)
     try:
-        args = CommandPolicy(workspace).validate(spec.command)
+        args = policy.validate(spec.command)
     except PolicyError:
         return VerificationResult(
             spec.name,
@@ -227,7 +261,7 @@ def _run_verification(
         completed = subprocess.run(
             args,
             cwd=workspace,
-            env=filtered_subprocess_env(),
+            env=policy.subprocess_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -326,12 +360,26 @@ def _case_result(
 
 
 def _merge_usage(cases: tuple[EvalCaseResult, ...]) -> TokenUsage | None:
-    usage: TokenUsage | None = None
-    for case in cases:
-        if case.usage is None:
-            continue
-        usage = case.usage if usage is None else usage.merge(case.usage)
-    return usage
+    if not cases or all(case.usage is None for case in cases):
+        return None
+
+    def strict_total(field: str) -> int | None:
+        values: list[int] = []
+        for case in cases:
+            if case.usage is None:
+                return None
+            value = getattr(case.usage, field)
+            if value is None:
+                return None
+            values.append(value)
+        return sum(values)
+
+    return TokenUsage(
+        input_tokens=strict_total("input_tokens"),
+        output_tokens=strict_total("output_tokens"),
+        cached_tokens=strict_total("cached_tokens"),
+        cache_miss_tokens=strict_total("cache_miss_tokens"),
+    )
 
 
 def _elapsed_ms(started: float) -> int:

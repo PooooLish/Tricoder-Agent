@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from tricoder.models import ToolResult
-from tricoder.policy import PolicyError
+from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.subprocess_env import filtered_subprocess_env
+from tricoder.subprocess_control import run_bounded_process
 
 from tricoder.tools.handlers import ToolHandler
 
@@ -16,16 +17,18 @@ from tricoder.tools.handlers import ToolHandler
 _filtered_env = filtered_subprocess_env
 
 
-def _git_toplevel(workspace: Path) -> Path | None:
+def _git_toplevel(workspace: Path, command_policy: CommandPolicy) -> Path | None:
     """返回 workspace 所在 git 仓库根；非 git 仓库返回 None。
 
     git 会沿目录树上溯查找 .git，因此在仓库子目录工作区运行 git 会读取
     工作区外的仓库历史与源码，必须由调用方校验并拒绝。
     """
     try:
+        git_executable = command_policy.validate("git status")[0]
         completed = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            [git_executable, "rev-parse", "--show-toplevel"],
             cwd=workspace,
+            env=command_policy.subprocess_environment(),
             capture_output=True,
             text=True,
             timeout=10,
@@ -39,9 +42,12 @@ def _git_toplevel(workspace: Path) -> Path | None:
     return Path(completed.stdout.strip()).resolve()
 
 
-def _git_command_escapes_workspace(cwd: Path) -> bool:
+def _git_command_escapes_workspace(
+    cwd: Path,
+    command_policy: CommandPolicy,
+) -> bool:
     """git 命令在 cwd 执行是否会越过工作区边界读取仓库根内容。"""
-    root = _git_toplevel(cwd)
+    root = _git_toplevel(cwd, command_policy)
     return root is not None and root != cwd.resolve()
 
 
@@ -58,11 +64,15 @@ class RunCommandTool(ToolHandler):
             return ToolResult(False, "只读模式禁止执行命令")
         command = self._required_str(arguments, "command")
         args = self.context.command_policy.validate(command)
+        subprocess_env = self.context.command_policy.subprocess_environment()
         cwd = self.context.workspace_policy.resolve_path(str(arguments.get("cwd", ".")))
         if not cwd.is_dir():
             return ToolResult(False, "命令工作目录必须是目录")
         executable = Path(args[0]).name.lower().removesuffix(".exe")
-        if executable == "git" and _git_command_escapes_workspace(cwd):
+        if executable == "git" and _git_command_escapes_workspace(
+            cwd,
+            self.context.command_policy,
+        ):
             return ToolResult(
                 False,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
@@ -81,20 +91,28 @@ class RunCommandTool(ToolHandler):
         if not approved:
             return ToolResult(False, "用户拒绝了命令执行")
         try:
-            completed = subprocess.run(
+            completed = run_bounded_process(
                 args,
                 cwd=cwd,
-                env=_filtered_env(),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                env=subprocess_env,
                 timeout=self.context.timeout,
-                shell=False,
-                check=False,
+                max_output_bytes=self.context.max_output_chars,
             )
-        except subprocess.TimeoutExpired:
+        except OSError:
+            return ToolResult(False, "命令进程无法安全启动")
+        if completed.cleanup_failed:
+            return ToolResult(False, "命令进程树清理失败，结果不可信")
+        if completed.timed_out:
             return ToolResult(False, f"命令执行超过 {self.context.timeout:g} 秒")
+        if completed.output_exceeded:
+            captured = self._bounded(
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+            )
+            return ToolResult(
+                False,
+                f"命令输出超过 {self.context.max_output_chars} 字符，已终止进程树\n"
+                f"{captured}",
+            )
         output = (
             f"退出码：{completed.returncode}\n"
             f"stdout:\n{completed.stdout}\n"
@@ -136,7 +154,7 @@ class GitDiffTool(ToolHandler):
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         workspace = self.context.workspace_policy.workspace
-        if _git_command_escapes_workspace(workspace):
+        if _git_command_escapes_workspace(workspace, self.context.command_policy):
             return ToolResult(
                 False,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
@@ -146,20 +164,21 @@ class GitDiffTool(ToolHandler):
         except PolicyError as exc:
             return ToolResult(False, str(exc))
         try:
-            completed = subprocess.run(
+            completed = run_bounded_process(
                 args,
                 cwd=workspace,
-                env=_filtered_env(),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                env=self.context.command_policy.subprocess_environment(),
                 timeout=self.context.timeout,
-                shell=False,
-                check=False,
+                max_output_bytes=self.context.max_output_chars,
             )
-        except subprocess.TimeoutExpired:
+        except OSError:
+            return ToolResult(False, "git diff 进程无法安全启动")
+        if completed.cleanup_failed:
+            return ToolResult(False, "git diff 进程树清理失败，结果不可信")
+        if completed.timed_out:
             return ToolResult(False, f"git diff 超过 {self.context.timeout:g} 秒")
+        if completed.output_exceeded:
+            return ToolResult(False, "git diff 输出超过限制，已终止进程树")
         output = (completed.stdout or completed.stderr).strip()
         if not output:
             output = "工作区没有未提交变更"
