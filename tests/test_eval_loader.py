@@ -1,8 +1,13 @@
+import math
 import tempfile
 import unittest
 from pathlib import Path
 
-from tricoder.evals.loader import EvalDefinitionError, load_suite
+from tricoder.evals.loader import (
+    EvalDefinitionError,
+    is_reserved_eval_path,
+    load_suite,
+)
 
 
 class EvalLoaderTests(unittest.TestCase):
@@ -93,12 +98,57 @@ class EvalLoaderTests(unittest.TestCase):
 
     def test_load_suite_rejects_reserved_verifier_change_pattern(self) -> None:
         """防止 Agent 修改延迟注入的隐藏 verifier。"""
-        suite_dir = self._write_suite(
-            allowed_changes=(".tricoder_eval_verifier/**",),
-        )
+        for pattern in (
+            ".tricoder_eval_verifier/**",
+            "tests/.tricoder_eval_verifier/test_hidden.py",
+        ):
+            with self.subTest(pattern=pattern):
+                suite_dir = self._write_suite(allowed_changes=(pattern,))
+                with self.assertRaisesRegex(EvalDefinitionError, "保留目录"):
+                    load_suite(suite_dir)
 
-        with self.assertRaisesRegex(EvalDefinitionError, "保留目录"):
+    def test_broad_change_patterns_stay_valid_but_reserved_paths_are_identified(self) -> None:
+        """防止宽泛 workspace 模式在评分时把框架 verifier 误当成 Agent 修改。"""
+        suite_dir = self._write_suite(allowed_changes=("**", "*", "**/*"))
+
+        suite = load_suite(suite_dir)
+
+        self.assertEqual(("**", "*", "**/*"), suite.cases[0].allowed_changes)
+        self.assertTrue(is_reserved_eval_path(".tricoder_eval_verifier/test_hidden.py"))
+        self.assertTrue(is_reserved_eval_path("nested/.tricoder_eval_verifier/data.py"))
+        self.assertFalse(is_reserved_eval_path("app.py"))
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "当前平台不支持符号链接")
+    def test_load_suite_rejects_symlinked_workspace_directory(self) -> None:
+        """防止 workspace fixture 通过符号链接指向 suite 外部。"""
+        suite_dir = self._write_suite()
+        workspace_dir = suite_dir / "cases" / "fix-one" / "workspace"
+        outside = self.root / "outside-workspace"
+        outside.mkdir()
+        (workspace_dir / "tests").rmdir()
+        workspace_dir.rmdir()
+        try:
+            workspace_dir.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("当前账户不能创建符号链接")
+
+        with self.assertRaisesRegex(EvalDefinitionError, "链接|边界"):
             load_suite(suite_dir)
+
+    def test_load_suite_rejects_non_finite_verification_timeout(self) -> None:
+        """防止 NaN 或 Infinity timeout 传入 subprocess 后破坏验证限制。"""
+        for timeout in (math.nan, math.inf):
+            with self.subTest(timeout=timeout):
+                suite_dir = self._write_suite()
+                case_toml = suite_dir / "cases" / "fix-one" / "case.toml"
+                case_toml.write_text(
+                    case_toml.read_text(encoding="utf-8").replace(
+                        "timeout = 30", f"timeout = {timeout}",
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(EvalDefinitionError, "正数"):
+                    load_suite(suite_dir)
 
     def test_load_suite_rejects_verifier_command_with_shell_chaining(self) -> None:
         """防止验证命令通过 shell 元字符读取凭据或执行额外命令。"""

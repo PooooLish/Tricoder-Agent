@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+import stat
 import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -55,8 +57,12 @@ def load_suite(path: Path, *, case_id: str | None = None) -> EvalSuite:
 
 
 def _load_case(suite_dir: Path, declared_id: str) -> EvalCase:
-    cases_dir = _require_directory(suite_dir / "cases", "cases 目录")
-    case_dir = _require_directory(cases_dir / declared_id, f"case 目录：{declared_id}")
+    cases_dir = _require_directory(suite_dir / "cases", "cases 目录", boundary=suite_dir)
+    case_dir = _require_directory(
+        cases_dir / declared_id,
+        f"case 目录：{declared_id}",
+        boundary=cases_dir,
+    )
     expected_dir = (suite_dir / "cases" / declared_id).resolve()
     if case_dir != expected_dir:
         raise EvalDefinitionError(f"case 目录不符合预期：{declared_id}")
@@ -66,8 +72,12 @@ def _load_case(suite_dir: Path, declared_id: str) -> EvalCase:
     parsed_id = _require_id(case_data["id"], "case ID")
     if parsed_id != declared_id:
         raise EvalDefinitionError(f"case ID 与目录不一致：{declared_id}")
-    workspace_dir = _require_directory(case_dir / "workspace", "workspace 目录")
-    verifier_dir = _require_directory(case_dir / "verifier", "verifier 目录")
+    workspace_dir = _require_directory(
+        case_dir / "workspace", "workspace 目录", boundary=case_dir
+    )
+    verifier_dir = _require_directory(
+        case_dir / "verifier", "verifier 目录", boundary=case_dir
+    )
     if workspace_dir == verifier_dir:
         raise EvalDefinitionError("workspace 与 verifier 目录必须不同")
 
@@ -124,14 +134,31 @@ def _load_toml(path: Path) -> dict[str, Any]:
     return data
 
 
-def _require_directory(path: Path, label: str) -> Path:
+def _require_directory(path: Path, label: str, *, boundary: Path | None = None) -> Path:
     try:
+        if _is_link_or_reparse_point(path):
+            raise EvalDefinitionError(f"{label} 不能是链接或 junction")
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise EvalDefinitionError(f"缺少 {label}") from exc
     if not resolved.is_dir():
         raise EvalDefinitionError(f"{label} 必须是目录")
+    if boundary is not None and not resolved.is_relative_to(boundary):
+        raise EvalDefinitionError(f"{label} 超出目录边界")
     return resolved
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """Reject symlinks and Windows reparse points before resolving fixtures."""
+
+    if path.is_symlink():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, OSError):
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
 
 
 def _require_exact_fields(data: dict[str, Any], expected: frozenset[str], label: str) -> None:
@@ -179,9 +206,15 @@ def _require_pattern(value: Any, label: str) -> str:
     pattern = PurePosixPath(value)
     if pattern.is_absolute() or ".." in pattern.parts:
         raise EvalDefinitionError(f"{label} 模式必须是相对路径")
-    if _RESERVED_VERIFIER_DIR in pattern.parts:
+    if is_reserved_eval_path(value):
         raise EvalDefinitionError(f"{label} 模式不能触及保留目录")
     return value
+
+
+def is_reserved_eval_path(path: str) -> bool:
+    """Return whether a normalized eval-relative path is framework-owned."""
+
+    return _RESERVED_VERIFIER_DIR in PurePosixPath(path).parts
 
 
 def _require_positive_int(value: Any, label: str) -> int:
@@ -193,4 +226,10 @@ def _require_positive_int(value: Any, label: str) -> int:
 def _require_positive_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise EvalDefinitionError(f"{label} 必须是正数")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise EvalDefinitionError(f"{label} 必须是正数") from exc
+    if not math.isfinite(number):
+        raise EvalDefinitionError(f"{label} 必须是正数")
+    return number
