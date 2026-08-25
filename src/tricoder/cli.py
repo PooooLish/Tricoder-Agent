@@ -14,6 +14,7 @@ from rich.console import Console
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.config import ConfigError, load_config, provider_key_env
+from tricoder.evals.service import run_eval_command
 from tricoder.models import ProviderConfig
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
@@ -81,6 +82,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_chat_options(chat)
     tui = subparsers.add_parser("tui", help="进入 Textual 交互 TUI")
     _add_chat_options(tui)
+    eval_command = subparsers.add_parser("eval", help="运行本地 Coding Agent 评测")
+    eval_command.add_argument("suite", type=Path, help="评测套件目录")
+    eval_command.add_argument(
+        "--provider",
+        choices=("openai", "deepseek", "glm"),
+        default="openai",
+        help="模型服务，默认 openai",
+    )
+    eval_command.add_argument("--model", help="覆盖模型名称")
+    eval_command.add_argument("--base-url", help="覆盖 OpenAI-compatible API 地址")
+    eval_command.add_argument(
+        "--env-file",
+        type=Path,
+        help="显式指定本地密钥文件",
+    )
+    eval_command.add_argument("--case", help="仅运行指定 case")
+    eval_command.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只校验评测定义，不读取配置或创建运行状态",
+    )
+    eval_command.add_argument(
+        "--no-color",
+        action="store_true",
+        help="关闭颜色，适合 CI 或重定向输出",
+    )
     run.add_argument("--max-rounds", type=int, help="最大模型调用轮数")
     run.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     run.add_argument("--timeout", type=float, help="API 与命令超时秒数")
@@ -154,6 +181,13 @@ def main(
     )
     ui = TerminalUI(console=console, input_fn=input_fn)
     env = os.environ if environ is None else environ
+    if args.command == "eval":
+        return run_eval_command(
+            args,
+            environ=env,
+            provider_factory=provider_factory,
+            output=output,
+        )
     if args.command is None or args.command == "chat":
         return _run_chat(
             args,
