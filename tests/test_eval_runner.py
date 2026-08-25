@@ -312,6 +312,24 @@ class EvalRunnerTests(unittest.TestCase):
         )
         self.assertIsNone(result.verifications[0].exit_code)
 
+    def test_verification_validation_error_has_fixed_error_mapping(self) -> None:
+        with patch(
+            "tricoder.evals.runner.CommandPolicy.validate",
+            side_effect=OSError("PROVIDER-SECRET-SENTINEL"),
+        ):
+            result = run_suite(
+                self.suite,
+                self.run_dir,
+                "openai",
+                "test-model",
+                self._passing_executor,
+            ).cases[0]
+
+        self.assertEqual("error", result.status)
+        self.assertEqual(("verification_error",), result.failure_codes)
+        self.assertEqual("verification_error", result.verifications[0].error_code)
+        self.assertIsNone(result.verifications[0].exit_code)
+
     def test_verification_os_error_has_fixed_error_mapping(self) -> None:
         with patch(
             "tricoder.evals.runner.subprocess.run",

@@ -195,6 +195,13 @@ def _run_verification(
             passed=False,
             error_code="verification_policy_rejected",
         )
+    except Exception:
+        return VerificationResult(
+            spec.name,
+            exit_code=None,
+            passed=False,
+            error_code="verification_error",
+        )
 
     try:
         completed = subprocess.run(
