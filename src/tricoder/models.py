@@ -187,6 +187,9 @@ class ToolResult:
     modified_paths: tuple[str, ...] = ()
     audit_paths: tuple[str, ...] = ()
     change_chars: int = 0
+    # None 表示该工具不产生验证结论；True/False 仅由认可的测试/编译/
+    # 静态检查命令设置，git 只读与普通脚本不改变验证状态。
+    verification_passed: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

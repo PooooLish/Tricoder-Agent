@@ -11,6 +11,7 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -46,6 +47,11 @@ def _format_token_usage(usage: TokenUsage) -> str:
     )
 
 
+def _p(value: object) -> Text:
+    """把动态外部文本转为纯文本，绝不解析 Rich markup。"""
+    return Text(str(value))
+
+
 class ApprovalScreen(ModalScreen[bool]):
     """展示动作详情，仅接受明确的 y 允许 / n 或 Esc 拒绝。"""
 
@@ -61,8 +67,11 @@ class ApprovalScreen(ModalScreen[bool]):
         self._detail = detail
 
     def compose(self) -> ComposeResult:
-        yield Static(f"[bold yellow]待审批动作：{self._action}[/bold yellow]")
-        yield Static(self._detail, classes="approval-detail")
+        yield Static(
+            Text.assemble(("待审批动作：", "bold yellow"), _p(self._action))
+        )
+        # detail 含命令/diff/外部文本，必须按纯文本渲染，防止 markup 注入。
+        yield Static(Text(self._detail), classes="approval-detail")
         yield Static("[dim]按 y 允许，n 或 Esc 拒绝[/dim]", classes="approval-hint")
 
     def action_approve(self) -> None:
@@ -120,7 +129,9 @@ class TuiObserver(AgentObserver):
         self._app.begin_round(round_number, max_rounds)
 
     def on_action(self, action: ToolAction) -> None:
-        self._app.round_line(f"[bold cyan]● {action.tool}[/bold cyan]  {action.reason}")
+        self._app.round_line(
+            Text.assemble(("● ", "bold cyan"), _p(action.tool), "  ", _p(action.reason))
+        )
 
     def on_tool_result(
         self,
@@ -141,7 +152,9 @@ class TuiObserver(AgentObserver):
         )
 
     def on_error(self, message: str) -> None:
-        self._app.round_line(f"[red]✗ {message}[/red]")
+        self._app.round_line(
+            Text.assemble(("✗ ", "bold red"), _p(message))
+        )
 
 
 class TricoderApp(App[None]):
@@ -245,35 +258,47 @@ class TricoderApp(App[None]):
         try:
             self.runtime = self._runtime_factory(TuiObserver(self), self._approver)
         except Exception as exc:
-            self.log_line(f"[red]无法安全初始化会话：{type(exc).__name__}[/red]")
+            self.log_line(
+                Text.assemble(
+                    ("无法安全初始化会话：", "bold red"), _p(type(exc).__name__)
+                )
+            )
             self.exit(2)
             return
         record = self.runtime.current.record
         self.log_line(
-            f"[bold cyan]TriCoder[/bold cyan] · 会话 {record.name} · "
-            f"{record.provider} · {record.model}"
+            Text.assemble(
+                ("TriCoder", "bold cyan"),
+                " · 会话 ",
+                _p(record.name),
+                " · ",
+                _p(record.provider),
+                " · ",
+                _p(record.model),
+            )
         )
-        self.log_line(f"[dim]工作区：{record.workspace}[/dim]")
+        self.log_line(Text.assemble(("工作区：", "dim"), _p(record.workspace)))
         self._refresh_sidebar_impl()
         self.query_one(Input).focus()
 
     # ---- 线程安全日志 ----
 
-    def log_line_safe(self, text: str) -> None:
+    def log_line_safe(self, text: str | Text) -> None:
         """后台线程调用；转发到 UI 线程。"""
         try:
             self.call_from_thread(self._log_line_impl, text)
         except Exception:
             pass
 
-    def log_line(self, text: str) -> None:
+    def log_line(self, text: str | Text) -> None:
         """UI 线程直接写入。"""
         self._log_line_impl(text)
 
-    def _log_line_impl(self, text: str) -> None:
-        self._lines.append(text)
+    def _log_line_impl(self, text: str | Text) -> None:
+        renderable = text if isinstance(text, Text) else Text.from_markup(text)
+        self._lines.append(renderable.plain)
         self.query_one("#log", VerticalScroll).mount(
-            Static(text, classes="log-line")
+            Static(renderable, classes="log-line")
         )
         self.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
@@ -293,24 +318,39 @@ class TricoderApp(App[None]):
         workspace = str(record.workspace)
         if len(workspace) > 26:
             workspace = "…" + workspace[-25:]
-        content = (
-            "[b]会话[/b]\n"
-            f"{record.name}\n\n"
-            "[b]Provider[/b]\n"
-            f"{record.provider}\n\n"
-            "[b]模型[/b]\n"
-            f"{record.model}\n\n"
-            "[b]工作区[/b]\n"
-            f"{workspace}\n\n"
-            "[b]模式[/b]\n"
-            f"{'只读' if config.read_only else '可编辑'}\n\n"
-            "[b]权限[/b]\n"
-            f"{self.runtime.permission_level}\n\n"
-            "[b]验证[/b]\n"
-            f"{memory.verification}\n\n"
-            "[b]修改文件[/b]\n"
-            f"{len(memory.modified_files)}"
-        )
+        mode = "只读" if config.read_only else "可编辑"
+        content = Text()
+        content.append("会话", style="bold")
+        content.append("\n")
+        content.append(_p(record.name))
+        content.append("\n\n")
+        content.append("Provider", style="bold")
+        content.append("\n")
+        content.append(_p(record.provider))
+        content.append("\n\n")
+        content.append("模型", style="bold")
+        content.append("\n")
+        content.append(_p(record.model))
+        content.append("\n\n")
+        content.append("工作区", style="bold")
+        content.append("\n")
+        content.append(_p(workspace))
+        content.append("\n\n")
+        content.append("模式", style="bold")
+        content.append("\n")
+        content.append(_p(mode))
+        content.append("\n\n")
+        content.append("权限", style="bold")
+        content.append("\n")
+        content.append(_p(self.runtime.permission_level))
+        content.append("\n\n")
+        content.append("验证", style="bold")
+        content.append("\n")
+        content.append(_p(memory.verification))
+        content.append("\n\n")
+        content.append("修改文件", style="bold")
+        content.append("\n")
+        content.append(_p(len(memory.modified_files)))
         self.query_one("#sidebar-content", Static).update(content)
 
     def begin_round(self, round_number: int, max_rounds: int) -> None:
@@ -335,19 +375,20 @@ class TricoderApp(App[None]):
         self._current_round_log = content
         self._current_round_summary = [f"第 {round_number}/{max_rounds} 轮"]
 
-    def round_line(self, text: str) -> None:
+    def round_line(self, text: str | Text) -> None:
         """后台线程调用；写入当前轮内容。"""
         try:
             self.call_from_thread(self._round_line_impl, text)
         except Exception:
             pass
 
-    def _round_line_impl(self, text: str) -> None:
+    def _round_line_impl(self, text: str | Text) -> None:
+        renderable = text if isinstance(text, Text) else Text.from_markup(text)
         if self._current_round_log is not None:
-            self._current_round_log.write(text)
+            self._current_round_log.write(renderable)
         else:
             # 尚无轮次（规划/审计准备阶段）时回退到总日志，避免错误被吞。
-            self._log_line_impl(text)
+            self._log_line_impl(renderable)
 
     def round_summary(self, summary: str) -> None:
         """后台线程调用；更新当前轮标题摘要。"""
@@ -374,7 +415,7 @@ class TricoderApp(App[None]):
         if is_slash_command(text):
             self._handle_command(text)
         else:
-            self.log_line(f"[bold]任务：[/bold]{text}")
+            self.log_line(Text.assemble(("任务：", "bold"), _p(text)))
             self.run_worker(
                 lambda: self._run_task(text), thread=True, exclusive=True,
                 name="agent-task",
@@ -386,11 +427,18 @@ class TricoderApp(App[None]):
         try:
             result = self.runtime.run_task(task)
         except SessionRuntimeError as exc:
-            self.log_line_safe(f"[red]任务运行失败：{exc}[/red]")
+            self.log_line_safe(
+                Text.assemble(("任务运行失败：", "bold red"), _p(exc))
+            )
             return
         except Exception as exc:  # 兜底：任何未预期异常都不能杀死 TUI
             self.log_line_safe(
-                f"[red]任务异常：{type(exc).__name__}: {exc}[/red]"
+                Text.assemble(
+                    ("任务异常：", "bold red"),
+                    _p(type(exc).__name__),
+                    ": ",
+                    _p(exc),
+                )
             )
             return
         self._log_result(result)
@@ -399,10 +447,13 @@ class TricoderApp(App[None]):
         self.last_result = result
         color = "green" if result.ok else "red"
         state = "完成" if result.ok else "未完成"
+        status_text = Text.assemble(
+            (state, color),
+            f" · 工具调用 {result.tool_calls} · 修改文件 {len(result.modified_files)}",
+        )
         lines = [
-            f"[{color}]{state}[/{color}] · 工具调用 {result.tool_calls} · "
-            f"修改文件 {len(result.modified_files)} · 验证 {result.verification}",
-            f"[dim]{result.summary}[/dim]",
+            status_text,
+            Text.assemble(("", "dim"), _p(result.summary)),
         ]
         if result.usage is not None:
             lines.append(f"[dim]累计用量 · {_format_token_usage(result.usage)}[/dim]")
@@ -438,7 +489,7 @@ class TricoderApp(App[None]):
         try:
             command = parse_command(text)
         except CommandError as exc:
-            self.log_line(f"[red]{exc}[/red]")
+            self.log_line(Text.assemble(("", "red"), _p(exc)))
             return
         try:
             if command.name == "help":
@@ -460,7 +511,9 @@ class TricoderApp(App[None]):
             elif command.name == "exit":
                 self.action_quit()
         except SessionRuntimeError as exc:
-            self.log_line(f"[red]会话操作失败：{exc}[/red]")
+            self.log_line(
+                Text.assemble(("会话操作失败：", "red"), _p(exc))
+            )
 
     def _show_help(self) -> None:
         for name, spec in list_commands().items():
@@ -474,15 +527,39 @@ class TricoderApp(App[None]):
         config = self.runtime.current.config
         memory = self.runtime.current.memory
         self.log_line(
-            f"[cyan]会话[/cyan] {record.name} · [cyan]Provider[/cyan] "
-            f"{record.provider} · [cyan]模型[/cyan] {record.model}"
+            Text.assemble(
+                ("会话", "cyan"),
+                " ",
+                _p(record.name),
+                " · ",
+                ("Provider", "cyan"),
+                " ",
+                _p(record.provider),
+                " · ",
+                ("模型", "cyan"),
+                " ",
+                _p(record.model),
+            )
+        )
+        mode = "只读" if config.read_only else "可编辑 · 人工审批"
+        self.log_line(
+            Text.assemble(
+                ("工作区", "cyan"),
+                " ",
+                _p(record.workspace),
+                " · ",
+                ("模式", "cyan"),
+                " ",
+                _p(mode),
+                " · ",
+                ("验证", "cyan"),
+                " ",
+                _p(memory.verification),
+            )
         )
         self.log_line(
-            f"[cyan]工作区[/cyan] {record.workspace} · "
-            f"[cyan]模式[/cyan] {'只读' if config.read_only else '可编辑 · 人工审批'} · "
-            f"[cyan]验证[/cyan] {memory.verification}"
+            Text.assemble(("权限", "cyan"), " ", _p(self.runtime.permission_level))
         )
-        self.log_line(f"[cyan]权限[/cyan] {self.runtime.permission_level}")
 
     def _clear_current(self) -> None:
         # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。
@@ -512,7 +589,7 @@ class TricoderApp(App[None]):
             return
         self.log_line("[bold]最近任务变更：[/bold]")
         for line in latest.splitlines():
-            self.log_line(line)
+            self.log_line(_p(line))
 
     def _undo(self) -> None:
         if self.runtime is None:
@@ -520,11 +597,11 @@ class TricoderApp(App[None]):
         try:
             preview = self.runtime.prepare_undo()
         except SessionRuntimeError as exc:
-            self.log_line(f"[red]{exc}[/red]")
+            self.log_line(Text.assemble(("", "red"), _p(exc)))
             return
         self.log_line("[bold]撤销预览：[/bold]")
         for line in preview.diff.splitlines():
-            self.log_line(line)
+            self.log_line(_p(line))
         # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。
         self.run_worker(self._undo_worker, thread=True, exclusive=True, name="session-undo")
 
@@ -539,11 +616,14 @@ class TricoderApp(App[None]):
             self.log_line_safe("[yellow]已撤销最近一条任务的全部文件修改。[/yellow]")
         elif execution.conflicts:
             self.log_line_safe(
-                f"[red]撤销冲突，未执行：{'、'.join(execution.conflicts)}[/red]"
+                Text.assemble(("撤销冲突，未执行：", "red"), _p("、".join(execution.conflicts)))
             )
         elif execution.compensation_failed:
             self.log_line_safe(
-                f"[red]撤销未完成且补偿失败：{'、'.join(execution.compensation_failed)}[/red]"
+                Text.assemble(
+                    ("撤销未完成且补偿失败：", "red"),
+                    _p("、".join(execution.compensation_failed)),
+                )
             )
         else:
             self.log_line_safe("[red]撤销未完成，文件未被修改。[/red]")
@@ -555,9 +635,11 @@ class TricoderApp(App[None]):
         try:
             level = self.runtime.set_permission(argument)
         except SessionRuntimeError as exc:
-            self.log_line(f"[red]权限操作失败：{exc}[/red]")
+            self.log_line(
+                Text.assemble(("权限操作失败：", "red"), _p(exc))
+            )
             return
-        self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+        self.log_line(Text.assemble(("权限级别已切换：", "yellow"), _p(level)))
         self._refresh_sidebar_impl()
 
     def _choose_permission(self) -> None:
@@ -570,9 +652,11 @@ class TricoderApp(App[None]):
             try:
                 level = self.runtime.set_permission(value)
             except SessionRuntimeError as exc:
-                self.log_line(f"[red]权限操作失败：{exc}[/red]")
+                self.log_line(
+                    Text.assemble(("权限操作失败：", "red"), _p(exc))
+                )
                 return
-            self.log_line(f"[yellow]权限级别已切换：{level}[/yellow]")
+            self.log_line(Text.assemble(("权限级别已切换：", "yellow"), _p(level)))
             self._refresh_sidebar_impl()
 
         self.push_screen(
@@ -601,9 +685,13 @@ class TricoderApp(App[None]):
         try:
             self.runtime.change_model(provider)
         except SessionRuntimeError as exc:
-            self.log_line_safe(f"[red]模型切换失败：{exc}[/red]")
+            self.log_line_safe(
+                Text.assemble(("模型切换失败：", "red"), _p(exc))
+            )
             return
-        self.log_line_safe(f"[yellow]已切换到 Provider：{provider}[/yellow]")
+        self.log_line_safe(
+            Text.assemble(("已切换到 Provider：", "yellow"), _p(provider))
+        )
         self.refresh_sidebar()
 
     def _handle_session(self, subcommand: str | None, argument: str | None) -> None:
@@ -625,15 +713,21 @@ class TricoderApp(App[None]):
             try:
                 self.runtime.rename_current(argument)
             except SessionRuntimeError as exc:
-                self.log_line(f"[red]重命名失败：{exc}[/red]")
+                self.log_line(
+                    Text.assemble(("重命名失败：", "red"), _p(exc))
+                )
                 return
-            self.log_line(f"[yellow]当前会话已重命名为：{argument}[/yellow]")
+            self.log_line(
+                Text.assemble(("当前会话已重命名为：", "yellow"), _p(argument))
+            )
 
     def _session_new_worker(self, name: str) -> None:
         if self.runtime is None:
             return
         self.runtime.create(name)
-        self.log_line_safe(f"[yellow]已创建并切换到新会话：{name}[/yellow]")
+        self.log_line_safe(
+            Text.assemble(("已创建并切换到新会话：", "yellow"), _p(name))
+        )
         self.refresh_sidebar()
 
     def _choose_session(self) -> None:
@@ -675,9 +769,13 @@ class TricoderApp(App[None]):
                 ),
             )
         except SessionRuntimeError as exc:
-            self.log_line_safe(f"[red]会话切换失败：{exc}[/red]")
+            self.log_line_safe(
+                Text.assemble(("会话切换失败：", "red"), _p(exc))
+            )
             return
-        self.log_line_safe(f"[yellow]已切换到会话：{record.name}[/yellow]")
+        self.log_line_safe(
+            Text.assemble(("已切换到会话：", "yellow"), _p(record.name))
+        )
         self.refresh_sidebar()
 
     # ---- 退出 ----

@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Input, Static
@@ -282,6 +283,64 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
         self.assertEqual("strict", app.runtime.permission_level)
+
+    async def test_task_text_renders_literally(self) -> None:
+        """任务输入中的 Rich 标签必须按字面显示，不得被解析为 markup。"""
+        response = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c1", "finish", {"summary": "ok"}),),
+            finish_reason="tool_calls",
+        )
+        app = self._make_app([response])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "修复 [conceal]secret[/conceal] 问题")
+            await self._wait_result(pilot)
+
+        app = self.app
+        assert app is not None
+        self.assertTrue(
+            any("[conceal]secret[/conceal]" in line for line in app._lines)
+        )
+
+    async def test_approval_detail_renders_literally(self) -> None:
+        """ApprovalScreen 中的命令/diff 必须按字面显示，防止 markup 隐藏/伪造。"""
+        detail = (
+            "命令：git log --oneline [conceal]secret[/conceal]\n"
+            "--output=C:\\leak.txt [link=https://evil.example]点我[/link]"
+        )
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.push_screen(ApprovalScreen("run_command", detail))
+            for _ in range(50):
+                await pilot.pause()
+                if isinstance(app.screen, ApprovalScreen):
+                    break
+            self.assertIsInstance(app.screen, ApprovalScreen)
+            widget = app.screen.query_one(".approval-detail", Static)
+            content = widget.content
+            plain = content.plain if hasattr(content, "plain") else str(content)
+            self.assertIn("[conceal]secret[/conceal]", plain)
+            self.assertIn("[link=https://evil.example]点我[/link]", plain)
+            self.assertNotIn("secret", plain.replace("[conceal]secret[/conceal]", ""))
+            await pilot.press("n")
+
+    async def test_sidebar_session_name_renders_literally(self) -> None:
+        """侧边栏中的会话名含 Rich 标签时必须按字面显示。"""
+        response = ProviderResponse(
+            content=None,
+            tool_calls=(ToolCall("c1", "finish", {"summary": "ok"}),),
+            finish_reason="tool_calls",
+        )
+        app = self._make_app([response])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.runtime.create("[red]evil[/red]会话")
+            app._refresh_sidebar_impl()
+            content = app.query_one("#sidebar-content", Static).content
+            plain = content.plain if hasattr(content, "plain") else str(content)
+            self.assertIn("[red]evil[/red]会话", plain)
 
 
 if __name__ == "__main__":

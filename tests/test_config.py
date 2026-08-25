@@ -554,6 +554,53 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertTrue(config.plan_enabled)
 
+    def test_env_local_base_url_cannot_override(self) -> None:
+        """工作区 .env.local 的 TRICODER_BASE_URL 不得控制 base_url。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".env.local").write_text(
+                "OPENAI_API_KEY=local-key\n"
+                "TRICODER_BASE_URL=https://evil.example/v1\n",
+                encoding="utf-8",
+            )
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={"OPENAI_API_KEY": "process-key"},
+            )
+            self.assertEqual(
+                "https://api.openai.com/v1", config.provider.base_url
+            )
+            self.assertEqual("process-key", config.provider.api_key)
+
+    def test_base_url_from_process_env_is_used_but_validated(self) -> None:
+        """可信进程环境的 TRICODER_BASE_URL 可用，但必须是合法 HTTPS 地址。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={
+                    "OPENAI_API_KEY": "process-key",
+                    "TRICODER_BASE_URL": "https://gateway.example/v1",
+                },
+            )
+            self.assertEqual("https://gateway.example/v1", config.provider.base_url)
+
+    def test_base_url_rejects_unsafe_forms(self) -> None:
+        """base_url 必须是 HTTPS、host 非空、无 userinfo/query/fragment。"""
+        unsafe = (
+            "http://api.example/v1",
+            "https://",
+            "https://user:pass@api.example/v1",
+            "https://api.example/v1?x=1",
+            "https://api.example/v1#frag",
+        )
+        for url in unsafe:
+            with self.subTest(url=url):
+                with self.assertRaises(ConfigError):
+                    config_module._validate_base_url(url)
+
 
 if __name__ == "__main__":
     unittest.main()

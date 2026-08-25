@@ -15,6 +15,7 @@ from tricoder.models import (
     SessionTurnResult,
     TokenUsage,
     ToolAction,
+    ToolResult,
 )
 from tricoder.policy import PolicyError
 from tricoder.providers import ModelProvider, ProviderError, ProviderProtocolError
@@ -536,8 +537,8 @@ class CodingAgent:
                 continue
 
             # 一次可执行多个动作：逐个顺序执行、独立审批与审计，最后统一回填。
-            for action, tool_call_id in zip(
-                resolved.actions, resolved.tool_call_ids
+            for action_index, (action, tool_call_id) in enumerate(
+                zip(resolved.actions, resolved.tool_call_ids)
             ):
                 if not action.reason:
                     definition = self.tools.describe(action.tool)
@@ -566,8 +567,15 @@ class CodingAgent:
                 if changed_paths:
                     # 成功写入会使此前命令验证立即失效，必须重新验证。
                     verification = "待验证"
-                if action.tool == "run_command":
-                    verification = "通过" if result.ok else "失败"
+                if (
+                    action.tool == "run_command"
+                    and result.verification_passed is not None
+                ):
+                    if not result.verification_passed:
+                        verification = "失败"
+                    elif verification != "失败":
+                        # 同一修改版本内失败保持有效；新的文件修改会先重置为待验证。
+                        verification = "通过"
                 duration_ms = self._elapsed_ms(action_started)
                 self.observer.on_tool_result(action, result, duration_ms)
                 messages.append(
@@ -597,6 +605,19 @@ class CodingAgent:
                         )
                     )
                 if action.tool == "finish":
+                    # finish 后若仍有模型声明的后续工具调用，必须为每个 tool_call
+                    # 回填“未执行”结果，保证 Provider 历史始终包含完整 tool-result。
+                    for later_action, later_id in zip(
+                        resolved.actions[action_index + 1 :],
+                        resolved.tool_call_ids[action_index + 1 :],
+                    ):
+                        messages.append(
+                            self._protocol.tool_result_message(
+                                later_action,
+                                ToolResult(False, "任务已结束，该动作未执行"),
+                                later_id,
+                            )
+                        )
                     completed = result.ok and (not modified_files or verification == "通过")
                     summary = result.output
                     if result.ok and modified_files and verification == "待验证":

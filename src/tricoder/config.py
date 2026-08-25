@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from tricoder.models import AppConfig, ProviderConfig
 
@@ -110,6 +111,22 @@ def provider_key_env(provider: str) -> str:
     if normalized not in _PROVIDERS:
         raise ConfigError(f"不支持的 Provider：{provider}")
     return _PROVIDERS[normalized]["key_env"]
+
+
+def _validate_base_url(url: str) -> None:
+    """结构化验证 base_url：HTTPS、host 非空、拒绝 userinfo/query/fragment。"""
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ConfigError("base_url 格式无效") from exc
+    if parsed.scheme != "https":
+        raise ConfigError("base_url 必须是 HTTPS 地址")
+    if not parsed.hostname:
+        raise ConfigError("base_url 必须包含主机")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError("base_url 不能包含用户信息")
+    if parsed.query or parsed.fragment:
+        raise ConfigError("base_url 不能包含查询或片段")
 
 
 def _read_project_config(path: Path) -> dict[str, object]:
@@ -309,7 +326,9 @@ def load_config(
         or provider_table.get("model")
         or defaults["model"]
     )
-    explicit_url = base_url or env.get("TRICODER_BASE_URL")
+    # TRICODER_BASE_URL 只能来自显式 CLI 参数或可信进程环境；工作区 .env.local
+    # 不得控制它，否则可与进程 API Key 组合把 Authorization 发送到任意 HTTPS 主机。
+    explicit_url = base_url or process_env.get("TRICODER_BASE_URL")
     project_url = provider_table.get("base_url")
     if explicit_url:
         selected_url = explicit_url
@@ -360,8 +379,10 @@ def load_config(
 
     if not isinstance(selected_model, str) or not selected_model.strip():
         raise ConfigError("model 不能为空")
-    if not isinstance(selected_url, str) or not selected_url.startswith("https://"):
-        raise ConfigError("base_url 必须是 HTTPS 地址")
+    if isinstance(selected_url, str):
+        _validate_base_url(selected_url)
+    else:
+        raise ConfigError("base_url 必须是字符串")
     if (
         not isinstance(tool_protocol_value, str)
         or tool_protocol_value not in {"native", "legacy_json"}

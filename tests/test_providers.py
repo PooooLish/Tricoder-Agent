@@ -17,6 +17,7 @@ from tricoder.providers import (
     ProviderError,
     ProviderProtocolError,
     UrllibTransport,
+    _MAX_RESPONSE_BYTES,
     _stable_json_bytes,
     create_provider,
 )
@@ -35,8 +36,10 @@ class FakeHttpResponse:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        if amt < 0:
+            return self._body
+        return self._body[:amt]
 
 
 class ReadFailingHttpResponse:
@@ -51,7 +54,7 @@ class ReadFailingHttpResponse:
     def __exit__(self, *args: object) -> None:
         return None
 
-    def read(self) -> bytes:
+    def read(self, amt: int = -1) -> bytes:
         raise ConnectionResetError(self._message)
 
 
@@ -404,6 +407,25 @@ class ProviderTests(unittest.TestCase):
 
         self.assertIsInstance(caught.exception, ProviderProtocolError)
         self.assertFalse(caught.exception.retryable)
+
+    def test_urllib_transport_rejects_oversized_response_without_body(self) -> None:
+        """超限响应抛安全异常，且异常中绝不包含响应正文。"""
+        transport = UrllibTransport()
+        oversized = b"x" * (_MAX_RESPONSE_BYTES + 1)
+        with patch(
+            "tricoder.providers.urllib.request.urlopen",
+            return_value=FakeHttpResponse(oversized),
+        ):
+            with self.assertRaises(ProviderError) as caught:
+                transport.post_json(
+                    "https://example.test/chat/completions",
+                    {"Authorization": "Bearer test-key"},
+                    {"model": "test-model", "messages": []},
+                    3,
+                )
+
+        self.assertIsInstance(caught.exception, ProviderProtocolError)
+        self.assertNotIn("xxxx", str(caught.exception))
 
     def test_urllib_transport_normalizes_invalid_utf8_without_response_text(
         self,

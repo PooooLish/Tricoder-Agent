@@ -8,6 +8,9 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+# 模型响应体上限：防止恶意/异常响应拖垮内存，超限只抛不含正文的错误。
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 from typing import Callable, Protocol
 
 from tricoder.models import (
@@ -122,7 +125,7 @@ class UrllibTransport:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                response_body = response.read()
+                chunk = response.read(_MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             retryable = exc.code == 429 or 500 <= exc.code < 600
             raise ProviderError(f"模型服务返回 HTTP {exc.code}", retryable=retryable) from exc
@@ -133,6 +136,10 @@ class UrllibTransport:
             http.client.HTTPException,
         ) as exc:
             raise ProviderError("模型服务连接或响应读取失败", retryable=True) from exc
+        if len(chunk) > _MAX_RESPONSE_BYTES:
+            # 只报超限，绝不把响应正文带进异常，防止凭据/大文本外泄。
+            raise ProviderProtocolError("模型服务响应超过字节上限")
+        response_body = chunk
 
         try:
             raw = response_body.decode("utf-8")

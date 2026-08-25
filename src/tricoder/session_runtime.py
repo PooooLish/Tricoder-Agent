@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Concatenate, Mapping, ParamSpec, Protocol, TypeVar
 
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
@@ -37,6 +39,29 @@ from tricoder.tools import ToolContext, ToolRegistry, UndoConflictError
 
 class SessionRuntimeError(RuntimeError):
     """会话装配、切换或内存持久化无法安全完成。"""
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _idle_runtime_change(
+    method: Callable[Concatenate["SessionRuntime", _P], _R],
+) -> Callable[Concatenate["SessionRuntime", _P], _R]:
+    """用任务锁串行化运行时状态变更，消除“先检查、后修改”的竞态。"""
+
+    @wraps(method)
+    def guarded(self: "SessionRuntime", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if not self._task_lock.acquire(blocking=False):
+            raise SessionRuntimeError("Agent 任务运行中，禁止切换或修改配置")
+        try:
+            if self._task_active:
+                raise SessionRuntimeError("Agent 任务运行中，禁止切换或修改配置")
+            return method(self, *args, **kwargs)
+        finally:
+            self._task_lock.release()
+
+    return guarded
 
 
 # fullaccess 级别下仍要求人工审批的“明确危险”工具。
@@ -131,7 +156,7 @@ class SessionRuntime:
         model_preview_resolver: ModelPreviewResolver = preview_provider_models,
         provider_factory: ProviderFactory = create_provider,
         workspace_policy_factory: Callable[[Path], WorkspacePolicy] = WorkspacePolicy,
-        command_policy_factory: Callable[[], CommandPolicy] = CommandPolicy,
+        command_policy_factory: Callable[[Path], CommandPolicy] = CommandPolicy,
         tool_registry_factory: Callable[[ToolContext], ToolRegistry] = ToolRegistry,
         agent_factory: Callable[..., ContextAgent] = CodingAgent,
         audit_factory: Callable[[Path], AuditLogger] = AuditLogger,
@@ -155,6 +180,11 @@ class SessionRuntime:
         self._warning = ""
         self._memory_dirty = False
         self._session_cache: dict[str, ActiveSession] = {}
+        # 并发控制：同一时刻只允许一个 Agent 任务，运行期间禁止切换会话/模型/权限。
+        self._task_lock = threading.Lock()
+        self._task_active = False
+        self._task_session_id: str | None = None
+        self._task_permission: str | None = None
 
         resolved_workspace = Path(workspace).resolve()
         try:
@@ -188,6 +218,7 @@ class SessionRuntime:
         except (SessionError, ConfigError, OSError, ValueError) as exc:
             raise SessionRuntimeError("无法安全初始化会话运行时") from exc
 
+    @_idle_runtime_change
     def create(self, name: str) -> ActiveSession:
         """以当前工作区和模型创建独立会话；构建成功后才切换。"""
         current = self.current
@@ -200,7 +231,7 @@ class SessionRuntime:
             )
         except (SessionError, ConfigError, OSError, ValueError) as exc:
             raise SessionRuntimeError("无法创建会话") from exc
-        if self._memory_dirty and not self.persist_current():
+        if self._memory_dirty and not self._persist_current():
             raise SessionRuntimeError("当前会话记忆未持久化，已取消创建")
         self._cache_current()
         try:
@@ -214,6 +245,7 @@ class SessionRuntime:
         self._cache_current()
         return self.current
 
+    @_idle_runtime_change
     def switch(
         self,
         session_id: str,
@@ -230,7 +262,7 @@ class SessionRuntime:
             return original
         if record.workspace != original.record.workspace and not confirm(record.workspace):
             return original
-        if self._memory_dirty and not self.persist_current():
+        if self._memory_dirty and not self._persist_current():
             raise SessionRuntimeError("当前会话记忆未持久化，已取消切换")
         self._cache_current()
         candidate = self._session_cache.get(record.id)
@@ -247,6 +279,7 @@ class SessionRuntime:
         self._clear_unsaved_warning()
         return candidate
 
+    @_idle_runtime_change
     def rename_current(self, name: str) -> SessionRecord:
         """先持久化重命名，成功后才替换内存中的会话元数据。"""
         try:
@@ -257,6 +290,7 @@ class SessionRuntime:
         self._cache_current()
         return record
 
+    @_idle_runtime_change
     def clear_current(self) -> None:
         """清除消息和摘要，但保留文件路径与验证状态等结构化元数据。"""
         original = self.current
@@ -276,11 +310,12 @@ class SessionRuntime:
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
         try:
-            if not self.persist_current():
+            if not self._persist_current():
                 raise OSError("会话记忆清除未持久化")
         except (SessionError, OSError) as exc:
             raise SessionRuntimeError("会话记忆清除未持久化") from exc
 
+    @_idle_runtime_change
     def change_model(self, provider: str) -> ActiveSession:
         """先验证新配置并构建完整候选，最后才写入会话模型并替换当前值。"""
         original = self.current
@@ -315,7 +350,34 @@ class SessionRuntime:
         return self.current
 
     def run_task(self, task: str) -> RunResult:
-        """运行后仅提炼安全摘要和结构化元数据，绝不持久化原始消息。"""
+        """运行后仅提炼安全摘要和结构化元数据，绝不持久化原始消息。
+
+        同一时刻只允许一个 Agent 任务：运行期间拒绝第二个任务，审批使用任务
+        启动时的权限快照；任务完成后只允许更新启动该任务的会话。
+        """
+        if not self._task_lock.acquire(blocking=False):
+            raise SessionRuntimeError("已有 Agent 任务正在运行")
+        if self._task_active:
+            self._task_lock.release()
+            raise SessionRuntimeError("已有 Agent 任务正在运行")
+        try:
+            self._task_active = True
+            self._task_session_id = self.current.record.id
+            self._task_permission = self.current.memory.permission_level
+            try:
+                return self._run_task_locked(task)
+            finally:
+                if self.current.record.id != self._task_session_id:
+                    raise SessionRuntimeError(
+                        "任务运行期间会话被切换，拒绝更新该会话"
+                    )
+        finally:
+            self._task_active = False
+            self._task_session_id = None
+            self._task_permission = None
+            self._task_lock.release()
+
+    def _run_task_locked(self, task: str) -> RunResult:
         original = self.current
         original.journal.begin_task(
             tuple(original.context.modified_files),
@@ -351,7 +413,7 @@ class SessionRuntime:
         self.current = replace(original, memory=memory, context=turn.context)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
-        self.persist_current()
+        self._persist_current()
         return result
 
     def diff_latest(self) -> str | None:
@@ -366,6 +428,7 @@ class SessionRuntime:
             )
         return render_change_set_diff(latest)
 
+    @_idle_runtime_change
     def prepare_undo(self) -> UndoPreview:
         """在用户确认前首次全量核验，并只返回反向差异与结构化路径。"""
 
@@ -391,6 +454,7 @@ class SessionRuntime:
             )
             raise SessionRuntimeError("无法安全预览最近任务的撤销") from exc
 
+    @_idle_runtime_change
     def undo_latest(self) -> UndoExecution:
         """执行第二次全量核验；仅在文件全部恢复后提交会话状态。"""
 
@@ -440,7 +504,7 @@ class SessionRuntime:
             paths=execution.paths,
             compensation_status="not-required",
         )
-        self.persist_current()
+        self._persist_current()
         return execution
 
     def _audit_undo(
@@ -482,8 +546,13 @@ class SessionRuntime:
             raise SessionRuntimeError("当前 Session 未装配可撤销工具")
         return change_set, self.current.tools
 
+    @_idle_runtime_change
     def persist_current(self) -> bool:
         """尝试保存安全摘要；失败时保留内存状态并暴露未保存警告。"""
+        return self._persist_current()
+
+    def _persist_current(self) -> bool:
+        """调用方持有任务锁时执行实际持久化。"""
         if not self._memory_dirty:
             return True
         try:
@@ -496,19 +565,22 @@ class SessionRuntime:
         self._clear_unsaved_warning()
         return True
 
+    @_idle_runtime_change
     def retry_persist(self) -> bool:
         """供退出流程再尝试一次保存，失败由调用方返回非零退出码。"""
-        return self.persist_current()
+        return self._persist_current()
 
     @property
     def permission_level(self) -> str:
         """当前会话的权限级别：strict（默认）、relaxed 或 fullaccess。"""
         return self.current.memory.permission_level
 
+    @_idle_runtime_change
     def set_permission(self, level: str | None) -> str:
         """查看或切换当前会话的权限级别并持久化。
 
-        relaxed 自动放行只读/测试命令；fullaccess 放行全部非危险工具。
+        relaxed 只自动放行 git 只读命令；fullaccess 放行全部非危险工具
+        （明确非沙盒）。持久化失败时保留内存状态并抛出异常，绝不谎报成功。
         """
         if level is None:
             return self.permission_level
@@ -516,29 +588,45 @@ class SessionRuntime:
         if normalized not in {"strict", "relaxed", "fullaccess"}:
             raise SessionRuntimeError("permission 只能是 strict、relaxed 或 fullaccess")
         current = self.current
+        original_dirty = self._memory_dirty
+        original_unsaved = self._unsaved_memory
+        original_warning = self._warning
         memory = replace(current.memory, permission_level=normalized)
         self.current = replace(current, memory=memory)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
-        self.persist_current()
+        if not self._persist_current():
+            # 权限是安全状态：数据库未提交时，内存也必须恢复旧值。
+            self.current = current
+            self._cache_current()
+            self._memory_dirty = original_dirty
+            self._unsaved_memory = original_unsaved
+            self._warning = original_warning
+            raise SessionRuntimeError("权限持久化失败，已恢复原权限")
         return normalized
 
     def _effective_approver(self, action: str, detail: str) -> bool:
-        """按当前会话权限级别决定审批策略。
+        """按任务启动时快照的权限级别决定审批策略。
 
-        - relaxed：只读/测试命令（已被 CommandPolicy 白名单约束）自动放行；
-        - fullaccess：放行全部非危险工具（命令仍受 CommandPolicy 白名单、
-          read_only/敏感路径等硬边界不放松）；
-        - strict：全部交回人工审批。
+        - strict：全部交回人工审批；
+        - relaxed：不自动放行任何命令（git 只读命令由工具层 auto_approve 处理）；
+        - fullaccess：放行全部非危险工具（明确非沙盒；命令仍受 CommandPolicy
+          白名单、read_only/敏感路径等硬边界约束）。
+        审批使用任务启动时的权限快照，不在执行中读取另一个会话的 current。
         """
-        if self.current.memory.permission_level == "relaxed" and action == "run_command":
-            return True
+        permission = self._task_permission or self.current.memory.permission_level
         if (
-            self.current.memory.permission_level == "fullaccess"
+            permission == "fullaccess"
             and action not in _DANGEROUS_TOOLS
         ):
             return True
         return self._approver(action, detail)
+
+    def _auto_approve_git_command(self, args: list[str]) -> bool:
+        """relaxed 仅自动放行策略明确分类为安全的 Git 元数据查询。"""
+        if (self._task_permission or self.current.memory.permission_level) != "relaxed":
+            return False
+        return CommandPolicy.is_relaxed_git_metadata_command(args)
 
     def status(self) -> RuntimeStatus:
         """返回不含任务原文、工具输出或凭据的状态快照。"""
@@ -638,8 +726,9 @@ class SessionRuntime:
         tools = self._tool_registry_factory(
             ToolContext(
                 workspace_policy=workspace_policy,
-                command_policy=self._command_policy_factory(),
+                command_policy=self._command_policy_factory(loaded.workspace),
                 approver=self._effective_approver,
+                auto_approve_git=self._auto_approve_git_command,
                 read_only=loaded.read_only,
                 timeout=loaded.timeout,
                 change_journal=active_journal,

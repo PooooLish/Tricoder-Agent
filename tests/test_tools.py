@@ -21,6 +21,7 @@ from tricoder.models import ToolDefinition
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
 from tricoder.tools import binding as binding_module
+from tricoder.tools import command as command_module
 from tricoder.tools import write as write_module
 from tricoder.tools.handlers import ToolHandler
 
@@ -2800,7 +2801,7 @@ class ToolTests(unittest.TestCase):
         self.assertIs(change_set, journal.latest())
 
     def test_approved_command_runs_without_shell(self) -> None:
-        """防止合法检查命令在审批后仍无法执行。"""
+        """防止合法命令经 Shell 拼接造成意外代码执行。"""
         result = self.registry.execute(
             "run_command",
             {"command": "python -m compileall -q src"},
@@ -2809,6 +2810,38 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("退出码：0", result.output)
         self.assertEqual("run_command", self.approver.requests[0][0])
+
+    def test_filtered_env_drops_sensitive_variables(self) -> None:
+        """子进程环境必须剔除 API Key/token/password 等敏感变量。"""
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "k1",
+                "DEEPSEEK_API_TOKEN": "t1",
+                "PGPASSWORD": "p1",
+                "MYAPP_SECRET": "s1",
+                "AWS_ACCESS_KEY": "a1",
+            },
+        ):
+            env = command_module._filtered_env()
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("DEEPSEEK_API_TOKEN", env)
+        self.assertNotIn("PGPASSWORD", env)
+        self.assertNotIn("MYAPP_SECRET", env)
+        self.assertNotIn("AWS_ACCESS_KEY", env)
+        # 必要系统/构建变量被显式保留
+        self.assertIn("PATH", env)
+
+    def test_approved_command_receives_filtered_environment(self) -> None:
+        """实际执行验证：子进程读不到被剔除的 API Key。"""
+        probe = "import os;print('FOUND' if 'OPENAI_API_KEY' in os.environ else 'GONE')"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "k1"}):
+            (self.workspace / "probe.py").write_text(probe, encoding="utf-8")
+            result = self.registry.execute(
+                "run_command",
+                {"command": "python probe.py"},
+            )
+        self.assertIn("GONE", result.output)
 
 
 if __name__ == "__main__":

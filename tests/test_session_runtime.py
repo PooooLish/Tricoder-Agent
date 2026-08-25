@@ -1,6 +1,7 @@
 import inspect
 import json
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1203,20 +1204,59 @@ class SessionRuntimeTests(unittest.TestCase):
             self.runtime.set_permission("admin")
         self.assertEqual("strict", self.runtime.set_permission(None))
 
-    def test_permission_relaxed_auto_allows_read_only_commands_only(self) -> None:
-        """relaxed 只自动放行只读/测试命令，文件写入仍人工审批。"""
+    def test_permission_relaxed_does_not_auto_approve_code_commands(self) -> None:
+        """relaxed 不自动放行任何命令；代码/测试/脚本执行仍走人工审批。"""
         self.runtime.set_permission("relaxed")
         self.assertEqual("relaxed", self.runtime.permission_level)
-        self.assertTrue(self.runtime._effective_approver("run_command", "detail"))
+        # relaxed 下 run_command 一律人工审批（不再放行 Python/测试/脚本）
+        self.assertFalse(self.runtime._effective_approver("run_command", "detail"))
         self.assertFalse(self.runtime._effective_approver("edit_file", "detail"))
         self.assertFalse(self.runtime._effective_approver("create_file", "detail"))
         self.assertFalse(self.runtime._effective_approver("apply_patch", "detail"))
-        # strict 下命令也交回人工审批（base approver 为 False）
+        # strict 下同样人工审批
         self.runtime.set_permission("strict")
         self.assertFalse(self.runtime._effective_approver("run_command", "detail"))
 
+    def test_permission_relaxed_auto_approves_git_only(self) -> None:
+        """relaxed 只自动放行不返回文件内容的 Git 元数据查询。"""
+        self.runtime.set_permission("relaxed")
+        self.assertTrue(
+            self.runtime._auto_approve_git_command(
+                ["C:\\git.exe", "status", "--short"]
+            )
+        )
+        self.assertTrue(
+            self.runtime._auto_approve_git_command(
+                ["C:\\git.exe", "diff", "--stat"]
+            )
+        )
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(
+                ["C:\\git.exe", "show", "HEAD:.env.local"]
+            )
+        )
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(
+                ["C:\\git.exe", "status", "--verbose"]
+            )
+        )
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(
+                ["C:\\python.exe", "-m", "unittest"]
+            )
+        )
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(
+                ["C:\\python.exe", "test/script.py"]
+            )
+        )
+        self.runtime.set_permission("strict")
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(["C:\\git.exe", "status"])
+        )
+
     def test_permission_fullaccess_allows_all_but_dangerous_tools(self) -> None:
-        """fullaccess 放行全部现有工具；危险工具集合（当前为空）中的动作仍审批。"""
+        """fullaccess 放行全部现有工具（明确非沙盒）；危险工具集合仍审批。"""
         self.runtime.set_permission("fullaccess")
         self.assertEqual("fullaccess", self.runtime.permission_level)
         for action in ("edit_file", "create_file", "apply_patch", "run_command"):
@@ -1233,6 +1273,86 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual("relaxed", self.runtime.permission_level)
         persisted = self.store.load_memory(self.runtime.current.record.id)
         self.assertEqual("relaxed", persisted.permission_level)
+
+    def test_set_permission_reports_persist_failure(self) -> None:
+        """安全权限持久化失败时必须回滚内存中的权限。"""
+        failing = FailingMemoryStore(self.store)
+        failing.fail_writes = True
+        runtime = SessionRuntime(
+            failing,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=FakeBuilder(set()),
+        )
+        with self.assertRaises(SessionRuntimeError):
+            runtime.set_permission("relaxed")
+        self.assertEqual("strict", runtime.permission_level)
+        self.assertEqual(
+            "strict",
+            self.store.load_memory(runtime.current.record.id).permission_level,
+        )
+
+    def test_session_switch_and_task_start_are_atomic(self) -> None:
+        """会话候选仍在构建时，任务不得穿过空闲检查并开始执行。"""
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def blocking_builder(record, memory, options):  # type: ignore[no-untyped-def]
+            if record.id == self.second.id:
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise TimeoutError("测试未及时释放会话构建")
+            return self.builder(record, memory, options)
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=blocking_builder,
+        )
+
+        def switch_session() -> None:
+            try:
+                runtime.switch(self.second.id, confirm=lambda _workspace: True)
+            except BaseException as exc:  # pragma: no cover - 仅用于跨线程回传
+                errors.append(exc)
+
+        worker = threading.Thread(target=switch_session)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+        try:
+            with self.assertRaises(SessionRuntimeError):
+                runtime.run_task("不得与会话切换并发")
+        finally:
+            release.set()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([], errors)
+
+    def test_run_task_lock_rejects_second_task_and_config_changes(self) -> None:
+        """同一时刻只允许一个任务；任务运行期间拒绝权限/会话修改。"""
+        self.runtime._task_lock.acquire()
+        self.runtime._task_active = True
+        self.runtime._task_session_id = "occupied"
+        self.runtime._task_permission = "strict"
+        try:
+            with self.assertRaises(SessionRuntimeError):
+                self.runtime.run_task("second")
+            with self.assertRaises(SessionRuntimeError):
+                self.runtime.set_permission("relaxed")
+            with self.assertRaises(SessionRuntimeError):
+                self.runtime.switch(self.second.id, confirm=lambda w: True)
+            with self.assertRaises(SessionRuntimeError):
+                self.runtime.change_model("glm")
+        finally:
+            self.runtime._task_active = False
+            self.runtime._task_session_id = None
+            self.runtime._task_permission = None
+            self.runtime._task_lock.release()
+        # 释放后可正常操作
+        self.runtime.set_permission("relaxed")
+        self.assertEqual("relaxed", self.runtime.permission_level)
 
 
 if __name__ == "__main__":

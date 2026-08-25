@@ -1869,13 +1869,14 @@ class AgentTests(unittest.TestCase):
 
     def test_finish_after_failed_verification_fails(self) -> None:
         """防止验证命令失败后仍将修改任务报告为成功。"""
+        (self.workspace / "bad.py").write_text("def broken(:\n", encoding="utf-8")
         provider = ScriptedProvider(
             [
                 action(
                     "edit_file",
                     {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
                 ),
-                action("run_command", {"command": "python -c \"import sys; sys.exit(1)\""}),
+                action("run_command", {"command": "python -m compileall -q bad.py"}),
                 action("finish", {"summary": "已修改"}),
             ]
         )
@@ -1886,6 +1887,69 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual("失败", result.verification)
         self.assertIn("验证失败", result.summary)
+
+    def test_script_success_does_not_mark_verification_passed(self) -> None:
+        """普通脚本成功不得自动视为验证通过。"""
+        (self.workspace / "helper.py").write_text("x = 1\n", encoding="utf-8")
+        provider = ScriptedProvider(
+            [
+                action(
+                    "edit_file",
+                    {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
+                ),
+                action("run_command", {"command": "python helper.py"}),
+                action("finish", {"summary": "已修改"}),
+            ]
+        )
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
+
+        result = agent.run("修改示例")
+
+        self.assertFalse(result.ok)
+        self.assertIn("尚未运行验证命令", result.summary)
+
+    def test_unrelated_success_does_not_override_failed_verification(self) -> None:
+        """验证失败后，无关的成功命令不得把状态覆盖为通过。"""
+        (self.workspace / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+        (self.workspace / "helper.py").write_text("x = 1\n", encoding="utf-8")
+        provider = ScriptedProvider(
+            [
+                action(
+                    "edit_file",
+                    {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
+                ),
+                action("run_command", {"command": "python -m compileall -q bad.py"}),
+                action("run_command", {"command": "python helper.py"}),
+                action("finish", {"summary": "已修改"}),
+            ]
+        )
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
+
+        result = agent.run("修改示例")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("失败", result.verification)
+
+    def test_successful_verification_does_not_override_prior_failure(self) -> None:
+        """同一修改版本内，后续成功的验证命令也不能掩盖先前失败。"""
+        (self.workspace / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+        provider = ScriptedProvider(
+            [
+                action(
+                    "edit_file",
+                    {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
+                ),
+                action("run_command", {"command": "python -m compileall -q bad.py"}),
+                action("run_command", {"command": "python -m compileall -q sample.py"}),
+                action("finish", {"summary": "已修改"}),
+            ]
+        )
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
+
+        result = agent.run("修改示例")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("失败", result.verification)
 
     def test_finish_after_successful_verification_succeeds(self) -> None:
         """防止已修改且验证通过的任务被错误地判定为失败。"""
@@ -1929,6 +1993,38 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual("待验证", result.verification)
         self.assertIn("尚未运行验证命令", result.summary)
+
+    def test_finish_not_last_does_not_execute_later_actions(self) -> None:
+        """finish 提前返回时不得执行后续工具，也不得让任务异常结束。"""
+        scripted = ProviderResponse(
+            content=None,
+            tool_calls=(
+                ToolCall("c1", "finish", {"summary": "先结束"}),
+                ToolCall(
+                    "c2",
+                    "edit_file",
+                    {
+                        "path": "sample.py",
+                        "old_text": "value = 1",
+                        "new_text": "value = 9",
+                    },
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+        provider = StructuredScriptedProvider([scripted])
+        agent = CodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
+
+        result = agent.run("任务")
+
+        self.assertTrue(result.ok)
+        # 后续 edit 未执行
+        self.assertEqual(
+            "value = 1\n",
+            (self.workspace / "sample.py").read_text(encoding="utf-8"),
+        )
+        # 只执行了 finish 一个工具；未执行的动作没有产生残缺调用
+        self.assertEqual(1, result.tool_calls)
 
     def test_committed_create_with_cleanup_warning_requires_new_verification(self) -> None:
         """防止已发布文件因临时文件清理失败而漏记修改并沿用旧验证状态。"""

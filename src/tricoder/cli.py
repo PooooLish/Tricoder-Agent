@@ -212,7 +212,7 @@ def main(
     tools = ToolRegistry(
         ToolContext(
             workspace_policy=WorkspacePolicy(config.workspace),
-            command_policy=CommandPolicy(),
+            command_policy=CommandPolicy(config.workspace),
             approver=ui.approve,
             read_only=config.read_only,
             timeout=config.timeout,

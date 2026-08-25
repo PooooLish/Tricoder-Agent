@@ -182,8 +182,8 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/session current` | 显示当前 Session 的详细信息。 |
 | `/session rename <名称>` | 重命名当前 Session。 |
 | `/permission` | 查看当前权限级别（strict / relaxed / fullaccess），级别随会话记忆持久化，重启或切换会话自动恢复。 |
-| `/permission relaxed` | 切换为 relaxed：只读/测试命令（`CommandPolicy` 白名单内）自动放行，文件写入仍人工审批。 |
-| `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；命令仍受 `CommandPolicy` 白名单、`--read-only` 与敏感路径等硬边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
+| `/permission relaxed` | 切换为 relaxed：仅不返回文件正文的 Git 元数据查询（受限的 `status`、`diff --stat`、`diff --name-only`）自动放行；`show`、`log`、补丁 diff 及一切能执行代码的命令继续要求人工审批；文件写入仍人工审批。 |
+| `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；**这不是进程沙盒**——命令仍受 `CommandPolicy` 白名单、`--read-only`、敏感路径与 git 仓库根边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
 | `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |
 | `/exit` | 保存安全记忆并退出。 |
 
@@ -215,13 +215,18 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 ## 运行边界
 
 - 文件写入和命令执行都需要在终端明确输入 `y` 或 `yes` 审批；`--read-only` 会禁止这两类操作。
-- `/permission relaxed` 与 `/permission fullaccess` 是显式降级：relaxed 放行白名单内只读/测试命令，fullaccess 放行全部非危险工具；两者都**不放松**命令白名单、`--read-only`、敏感路径等硬边界，默认 `strict` 模式下所有操作都审批。
+- `/permission relaxed` 与 `/permission fullaccess` 是显式降级：relaxed 仅自动放行受限的 Git 元数据查询，
+  fullaccess 自动放行全部非危险工具（**明确不是进程沙盒**）；两者都**不放松**命令白名单、
+  `--read-only`、敏感路径与 git 仓库根边界，默认 `strict` 模式下所有操作都审批。
 - Agent 只能访问指定工作区内的非敏感文件，越界或敏感路径会被拒绝。
 - git 只读命令仅在工作区本身就是仓库根时可用；工作区是仓库子目录时 git 会向上读取
   仓库根的历史与源码，此类执行会被拒绝。
 - 允许的命令限于测试、静态检查、只读 Git 查询，以及工作区内相对 `.py` 脚本执行
-  （`python <脚本>`；脚本必须相对、无 `..`、无绝对路径；自动执行与否由权限级别控制，
+  （`python <脚本>`；脚本必须解析为工作区内存在的普通 `.py` 文件，无 `..`、无绝对路径、
+  无符号链接逃逸；**relaxed 不自动放行任何代码执行命令**，自动执行与否由权限级别控制，
   `fullaccess` 放行，`strict`/`relaxed` 仍需人工审批）。审批不是操作系统或容器沙箱的替代品。
+- 子进程环境会剔除名称匹配 `api_key`/`token`/`password`/`secret`/`credential` 等敏感模式的变量，
+  防止 Provider API Key 与其它凭据泄漏给被执行的测试、脚本或子进程。
 - 发送任务会将相关代码片段交给所选 Provider；只应在获准发送的项目中使用。
 
 ## 审计、上下文与退出码
@@ -257,7 +262,7 @@ python -m compileall -q src tests
 
 ### 本地真实 API 冒烟测试
 
-真实 API 测试只在开发者明确配置 `.env.local` 后本地执行，可能产生费用，也可能受 Provider 网络状态影响，因此不纳入 CI。读取、修改和命令执行练习应在 [`test/`](test/README.md) 沙盒中进行，不要放入真实密钥、私人数据或重要文件。
+真实 API 测试只在开发者明确配置 `.env.local` 后本地执行，可能产生费用，也可能受 Provider 网络状态影响，因此不纳入 CI。读取、修改和命令执行练习应在 [`test/`](test/README.md) 手动实验区中进行，不要放入真实密钥、私人数据或重要文件。
 
 ```powershell
 python -m tricoder run "只读检查 smoke_demo.py，并说明 add 函数的行为" --provider openai --workspace test --read-only

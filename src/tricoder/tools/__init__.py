@@ -57,6 +57,8 @@ class ToolContext:
     max_output_chars: int = 20_000
     max_search_file_bytes: int = 1_000_000
     change_journal: ChangeJournal | None = None
+    # relaxed 级别下对 git 只读命令的自动放行判定（其余命令一律人工审批）。
+    auto_approve_git: Callable[[list[str]], bool] | None = None
 
 
 class ToolRegistry:

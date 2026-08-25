@@ -28,8 +28,17 @@ class WorkspacePolicy:
         "secrets",
         "id_rsa",
         "id_ed25519",
+        "service-account",
+        "serviceaccount",
     }
-    _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+    _SENSITIVE_PREFIXES = (
+        ".env.",
+        "credentials.",
+        "secrets.",
+        "id_rsa",
+        "id_ed25519",
+    )
+    _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".gpg"}
 
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve(strict=True)
@@ -54,12 +63,22 @@ class WorkspacePolicy:
             raise PolicyError(f"目标路径不存在：{path}")
         return resolved
 
+    @staticmethod
+    def _is_sensitive_part(lowered: str) -> bool:
+        if lowered in WorkspacePolicy._SENSITIVE_PARTS:
+            return True
+        if any(lowered.startswith(prefix) for prefix in WorkspacePolicy._SENSITIVE_PREFIXES):
+            return True
+        if lowered.startswith("service-account") or lowered.startswith("serviceaccount"):
+            return True
+        return False
+
     def _check_sensitive_parts(self, parts: tuple[str, ...]) -> None:
         for part in parts:
             lowered = part.lower()
             if lowered == ".env.example":
                 continue
-            if lowered in self._SENSITIVE_PARTS or Path(lowered).suffix in self._SENSITIVE_SUFFIXES:
+            if self._is_sensitive_part(lowered) or Path(lowered).suffix in self._SENSITIVE_SUFFIXES:
                 raise PolicyError(f"拒绝访问敏感路径：{part}")
 
 
@@ -68,6 +87,9 @@ class CommandPolicy:
 
     白名单按工具维护明确允许的参数集合；可执行程序必须是 PATH 中的纯名称，
     校验通过后解析为可信绝对路径交给 subprocess，审批与审计均展示实际程序。
+
+    当传入 ``workspace`` 时，所有路径参数都会通过 WorkspacePolicy 真实解析
+    （符号链接、junction、存在性与敏感段），防止越界读取。
     """
 
     _META_PATTERN = re.compile(r"[|&;><`\r\n]")
@@ -81,9 +103,53 @@ class CommandPolicy:
     # Git 全局选项白名单；其余全局选项（-C、-c、--git-dir、--work-tree、
     # --exec-path 等）可切换目录、覆盖配置或执行外部程序，一律拒绝。
     _GIT_ALLOWED_PREFIX = {"--no-pager"}
-    _GIT_FORBIDDEN_FLAGS = {"--no-index", "--ext-diff", "--textconv", "--paginate"}
+    # 可能写文件、执行外部程序、配置覆盖或越界读取的 git 选项，一律拒绝。
+    _GIT_FORBIDDEN = {
+        "--no-index", "--ext-diff", "--textconv", "--paginate", "--output",
+        "--git-dir", "--work-tree", "--exec-path", "-C", "-c",
+    }
+    # 每个 git 只读子命令的明确允许参数集合。
+    _GIT_SUBCOMMAND_OPTIONS: dict[str, set[str]] = {
+        "status": {
+            "--short", "--porcelain", "--branch", "--untracked-files",
+            "--ignored", "-v", "--verbose", "--no-renames",
+        },
+        "diff": {
+            "--stat", "--numstat", "--shortstat", "--name-only", "--name-status",
+            "--check", "--color", "--no-color", "--no-renames", "--exit-code",
+            "--quiet", "--patch", "-p", "--no-ext-diff", "--no-textconv",
+            "--no-color-moved", "--color-moved",
+        },
+        "show": {
+            "--stat", "--numstat", "--shortstat", "--name-only", "--name-status",
+            "--color", "--no-color", "--no-renames", "--format", "--oneline",
+            "--quiet", "--no-ext-diff", "--no-textconv",
+        },
+        "log": {
+            "--oneline", "--stat", "--numstat", "--shortstat", "--name-only",
+            "--name-status", "-n", "--max-count", "--since", "--until",
+            "--grep", "--author", "--color", "--no-color", "--format",
+            "--decorate", "--no-decorate", "--no-patch", "-p", "--patch",
+        },
+    }
     # 每工具独立的允许参数集合；不在集合内的选项一律拒绝，
     # 避免通用黑名单随工具版本演化而漏禁。
+    _UNITTEST_ALLOWED_OPTIONS = {
+        "-v", "--verbose", "-q", "--quiet", "-f", "--failfast",
+        "-c", "--catch", "-b", "--buffer", "-k", "--locals",
+        "-s", "--start-directory", "-t", "--top-level-directory", "-p", "--pattern",
+    }
+    _UNITTEST_VALUE_OPTIONS = {
+        "-k", "-s", "--start-directory", "-t", "--top-level-directory",
+        "-p", "--pattern",
+    }
+    _UNITTEST_PATH_OPTIONS = {
+        "-s", "--start-directory", "-t", "--top-level-directory",
+    }
+    _COMPILEALL_ALLOWED_OPTIONS = {
+        "-q", "--quiet", "-l", "-f", "-j", "-x", "-r",
+        "--invalidation-mode",
+    }
     _PYTEST_ALLOWED_OPTIONS = {
         "-q", "--quiet", "-v", "--verbose", "-s", "--capture",
         "-x", "--exitfirst", "--maxfail", "-k", "-m", "--tb",
@@ -110,11 +176,11 @@ class CommandPolicy:
         "--show-error-codes", "--pretty", "--no-error-summary",
     }
     _ABSOLUTE_PATH_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
-    _SENSITIVE_PARTS = {
-        ".git", ".ssh", ".aws", ".config", ".local", ".env", ".env.local",
-        "credentials", "secrets", "id_rsa", "id_ed25519",
-    }
-    _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace_policy = (
+            WorkspacePolicy(workspace) if workspace is not None else None
+        )
 
     def validate(self, command: str) -> list[str]:
         """返回可交给 `subprocess` 的参数数组，否则抛出策略错误。
@@ -166,10 +232,25 @@ class CommandPolicy:
             "argument_count": len(args) - 1,
         }
         if executable in {"python", "py"}:
-            metadata["python_module"] = args[2].lower()
+            if len(args) >= 3 and args[1] == "-m":
+                metadata["execution_kind"] = "module"
+                metadata["python_module"] = args[2].lower()
+            else:
+                metadata["execution_kind"] = "script"
+                metadata["script"] = self._safe_relative_script(args[1])
         elif executable == "git":
             metadata["git_subcommand"] = args[1].lower()
         return metadata
+
+    def _safe_relative_script(self, script: str) -> str:
+        """把脚本路径规范化为工作区内相对路径；不可解析时返回受限提示。"""
+        if self._workspace_policy is not None:
+            try:
+                resolved = self._workspace_policy.resolve_path(script, must_exist=True)
+                return resolved.relative_to(self._workspace_policy.workspace).as_posix()
+            except PolicyError:
+                pass
+        return "<工作区内脚本>"
 
     def _resolve_executable(self, name: str) -> str:
         """把纯名称解析为 PATH 中的可信绝对路径；失败即安全拒绝。"""
@@ -196,7 +277,11 @@ class CommandPolicy:
         module = args[2].lower()
         if module not in self._PYTHON_MODULES:
             raise PolicyError(f"Python 模块不在允许列表中：{args[2]}")
-        if module == "pytest":
+        if module == "unittest":
+            self._validate_unittest_args(args[3:])
+        elif module == "compileall":
+            self._validate_tool_params(args[3:], self._COMPILEALL_ALLOWED_OPTIONS, "compileall")
+        elif module == "pytest":
             self._validate_tool_params(args[3:], self._PYTEST_ALLOWED_OPTIONS, "pytest")
         elif module == "ruff":
             self._validate_ruff_args(args[3:])
@@ -207,26 +292,133 @@ class CommandPolicy:
     def _validate_python_script(self, args: list[str]) -> list[str]:
         """允许运行工作区内相对路径的 .py 脚本。
 
-        脚本与后续位置参数必须是工作区内相对路径（无绝对、无 ``..``、
-        无敏感路径段）；该能力在审批层由权限级别控制（fullaccess 自动放行）。
+        脚本必须是工作区内存在的普通 .py 文件（真实解析，含符号链接与
+        敏感段检查）；该能力在审批层由权限级别控制（fullaccess 自动放行）。
         """
         if len(args) < 2 or args[1].startswith("-"):
             raise PolicyError("Python 脚本必须以工作区内相对路径开始")
         if not args[1].endswith(".py"):
             raise PolicyError("Python 仅允许运行 .py 脚本")
-        for segment in re.split(r"[\\/]+", args[1]):
-            lowered = segment.lower()
-            if lowered in self._SENSITIVE_PARTS or (
-                Path(lowered).suffix in self._SENSITIVE_SUFFIXES
-            ):
-                raise PolicyError(f"Python 脚本路径包含敏感段：{segment}")
-        self._require_relative_paths(args[1:], "python")
+        if self._workspace_policy is not None:
+            try:
+                resolved = self._workspace_policy.resolve_path(args[1], must_exist=True)
+            except PolicyError:
+                raise PolicyError(f"Python 脚本不在工作区内：{args[1]}")
+            if not resolved.is_file():
+                raise PolicyError(f"Python 脚本不是普通文件：{args[1]}")
+            self._require_relative_paths(args[1:], "python")
+        else:
+            for segment in re.split(r"[\\/]+", args[1]):
+                lowered = segment.lower()
+                if lowered == ".env.example":
+                    continue
+                if (
+                    lowered in {"", ".", ".."}
+                    or lowered in {
+                        ".git", ".ssh", ".aws", ".config", ".local", ".env",
+                        ".env.local", "credentials", "secrets", "id_rsa",
+                        "id_ed25519",
+                    }
+                    or lowered.startswith((".env.", "credentials.", "secrets."))
+                    or Path(lowered).suffix in {".pem", ".key", ".p12", ".pfx"}
+                ):
+                    raise PolicyError(f"Python 脚本路径包含敏感段：{segment}")
+            self._require_relative_paths(args[1:], "python")
         return args
 
     def _validate_ruff_args(self, params: list[str]) -> None:
         if not params or params[0].lower() != "check":
             raise PolicyError("ruff 仅允许 check 子命令")
         self._validate_tool_params(params[1:], self._RUFF_ALLOWED_OPTIONS, "ruff")
+
+    def _validate_unittest_args(self, params: list[str]) -> None:
+        """只允许 discover 或工作区内测试文件，禁止通过 dotted name 导入模块。"""
+        discover = bool(params and params[0].lower() == "discover")
+        index = 1 if discover else 0
+        while index < len(params):
+            token = params[index]
+            if token.startswith("-"):
+                name, separator, value = token.partition("=")
+                if name not in self._UNITTEST_ALLOWED_OPTIONS:
+                    raise PolicyError(f"unittest 参数不在允许列表：{name}")
+                if name in self._UNITTEST_VALUE_OPTIONS:
+                    if not separator:
+                        index += 1
+                        if index >= len(params) or params[index].startswith("-"):
+                            raise PolicyError(f"unittest 参数缺少值：{name}")
+                        value = params[index]
+                    if not value:
+                        raise PolicyError(f"unittest 参数缺少值：{name}")
+                    if name in self._UNITTEST_PATH_OPTIONS:
+                        self._validate_unittest_discovery_path(value)
+                elif separator:
+                    raise PolicyError(f"unittest 参数不接受值：{name}")
+            else:
+                if discover:
+                    raise PolicyError(f"unittest discover 不接受位置参数：{token}")
+                self._validate_unittest_file_target(token)
+            index += 1
+
+    def _validate_unittest_discovery_path(self, raw: str) -> None:
+        """discover 的起始目录和顶层目录必须真实位于工作区内。"""
+        if self._workspace_policy is None:
+            self._require_relative_paths([raw], "unittest")
+            return
+        try:
+            resolved = self._workspace_policy.resolve_path(raw, must_exist=True)
+        except PolicyError:
+            raise PolicyError(f"unittest 路径不在工作区内：{raw}") from None
+        if not resolved.is_dir():
+            raise PolicyError(f"unittest discover 路径不是目录：{raw}")
+
+    def _validate_unittest_file_target(self, raw: str) -> None:
+        """点名运行只接受相对 `.py` 文件，不接受可触发导入的模块名称。"""
+        if not raw.lower().endswith(".py"):
+            raise PolicyError(f"unittest 点名目标必须是工作区内 .py 文件：{raw}")
+        self._require_relative_paths([raw], "unittest")
+        if self._workspace_policy is None:
+            return
+        try:
+            resolved = self._workspace_policy.resolve_path(raw, must_exist=True)
+        except PolicyError:
+            raise PolicyError(f"unittest 测试文件不在工作区内：{raw}") from None
+        if not resolved.is_file():
+            raise PolicyError(f"unittest 测试目标不是普通文件：{raw}")
+
+    @classmethod
+    def is_relaxed_git_metadata_command(cls, args: list[str]) -> bool:
+        """判断命令是否只返回工作区 Git 元数据，可在 relaxed 下自动执行。"""
+        if not args or Path(args[0]).name.lower().removesuffix(".exe") != "git":
+            return False
+        index = 1
+        while index < len(args) and args[index] in cls._GIT_ALLOWED_PREFIX:
+            index += 1
+        if index >= len(args):
+            return False
+        subcommand = args[index].lower()
+        tail = args[index + 1 :]
+        if subcommand == "status":
+            safe_flags = {
+                "--short", "--porcelain", "--branch", "--untracked-files",
+                "--ignored", "--no-renames",
+            }
+            safe_values = {
+                "--porcelain": {"v1", "v2"},
+                "--untracked-files": {"no", "normal", "all"},
+                "--ignored": {"no", "traditional", "matching"},
+            }
+            for token in tail:
+                name, separator, value = token.partition("=")
+                if name not in safe_flags:
+                    return False
+                if separator and value not in safe_values.get(name, set()):
+                    return False
+            return True
+        if subcommand == "diff":
+            if not any(token in {"--stat", "--name-only"} for token in tail):
+                return False
+            return all(token in {"--stat", "--name-only", "--no-color"} for token in tail)
+        return False
 
     def _validate_tool_params(
         self,
@@ -254,20 +446,32 @@ class CommandPolicy:
             index += 1
         if index >= len(args) or args[index].lower() not in self._GIT_READ_ONLY:
             raise PolicyError("Git 仅允许 status、diff、show 和 log")
-        for token in args[index:]:
-            name = token.split("=", 1)[0]
-            if name in self._GIT_FORBIDDEN_FLAGS:
-                raise PolicyError(f"git 参数被禁止：{name}")
-            if name.startswith("-C") or (
-                name.startswith("-c") and not name.startswith("--")
-            ):
-                raise PolicyError(f"git 参数被禁止：{name}")
+        subcommand = args[index].lower()
+        allowed = self._GIT_SUBCOMMAND_OPTIONS[subcommand]
+        for token in args[index + 1 :]:
+            if token.startswith("-"):
+                name, separator, value = token.partition("=")
+                if name in self._GIT_FORBIDDEN:
+                    raise PolicyError(f"git 参数被禁止：{name}")
+                # git log 的 -N 是 --max-count 简写（-5 等价 -n 5）。
+                if subcommand == "log" and re.fullmatch(r"-\d+", token):
+                    continue
+                if name not in allowed:
+                    raise PolicyError(f"git {subcommand} 参数不在允许列表：{name}")
+                if separator:
+                    self._reject_path_like_value(value, "git")
         return args
 
     def _require_relative_paths(self, params: list[str], label: str) -> None:
         """路径位置参数必须是在工作区内的相对路径，防止越界读取。"""
         for token in params:
             if token.startswith("-"):
+                continue
+            if self._workspace_policy is not None:
+                try:
+                    self._workspace_policy.resolve_path(token, must_exist=False)
+                except PolicyError:
+                    raise PolicyError(f"{label} 路径不在工作区内：{token}")
                 continue
             if (
                 self._ABSOLUTE_PATH_PREFIX.match(token)

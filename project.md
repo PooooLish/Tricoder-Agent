@@ -31,11 +31,13 @@ provider-action protocols, and bound retrieval resources.
 
 ## Acceptance Criteria
 
-- `python -m unittest discover -s tests` passes (403 tests, 1 platform skip).
+- `python -m unittest discover -s tests` passes (456 tests, 2 platform skips).
 - `python -m compileall -q src tests` passes.
 - `workspace.py doctor tricoder-cli` reports no findings for this project.
 - CommandPolicy rejects qualified executable paths, direct `pytest`/`ruff`/`mypy`
-  invocation, `--opt=value` external paths, and git compact/pager/textconv options.
+  invocation, external/absolute/`..`/symlink paths in tool commands, and git
+  write/pager/textconv/config-override options; git repo-root boundary preserved.
+- relaxed 不自动放行任何代码执行命令（仅 git 只读）；子进程环境剔除敏感凭据变量。
 - Protocol abstraction keeps native and legacy_json behavior identical
   (covered by `tests/test_protocols.py`).
 
@@ -104,9 +106,37 @@ provider-action protocols, and bound retrieval resources.
 - Completed: permission is persisted per session (`SessionMemory.permission_level`
   in SQLite with schema migration); sidebar refresh bug fixed (mis-indented call
   in the permission selector callback). (2 new tests.)
-- Verified locally: 435 tricoder tests pass, compileall OK. (Full-suite runs
-  show rare Windows file-timing flakes in pre-existing file-op tests; each
-  passes in isolation.)
+- Completed: P0/P1/P2 security hardening (uncommitted, review before commit):
+  - relaxed 不再自动放行任何代码执行命令，仅受限的 git status/diff 元数据查询
+    由策略分类后在工具层 auto-approve；show/log/补丁正文仍需审批；fullaccess
+    保留自动执行但文档明确非沙盒；子进程环境过滤 API Key/token/
+    password/secret/credential 等敏感变量（`_filtered_env`）。
+  - CommandPolicy 接受 workspace，所有路径参数经 WorkspacePolicy 真实解析
+    （符号链接/junction/存在性/敏感段）；unittest/compileall 建立允许集；
+    git 每个只读子命令参数白名单（拒绝 --output/--ext-diff/--textconv/--no-index/
+    --git-dir/--work-tree/-C/-c 等）；脚本必须是工作区内存在的普通 .py 文件。
+  - TRICODER_BASE_URL 只从进程环境读取，.env.local 不再控制；urlsplit 结构化
+    验证（HTTPS、host、拒绝 userinfo/query/fragment）。
+  - audit_metadata 区分 `-m <module>` 与 `<script.py>`（execution_kind + 规范化
+    相对路径），修复脚本审计 IndexError。
+  - 验证状态只由认可的测试/编译/静态检查命令产生（ToolResult.verification_passed）；
+    git 只读与普通脚本成功不再标记“通过”，同一修改版本内失败不被任何后续
+    成功命令覆盖，新的文件修改会将状态重置为待验证。
+  - TUI 动态文本（任务/错误/摘要/diff/session 名/审批详情）一律按纯文本渲染
+    （rich.text.Text），固定内部样式才用 markup。
+  - SessionRuntime 统一互斥锁：任务启动与 session/model/permission/undo/
+    持久化等状态修改原子互斥；审批使用任务启动时的权限快照；完成后只更新
+    启动会话。
+  - set_permission 采用事务语义，持久化失败时恢复原内存权限；敏感路径覆盖
+    .env.*/credentials.*/secrets.*/私钥/服务账号；Provider 响应字节上限
+    （超限抛不含正文的 ProviderProtocolError）；finish 非最后时回填“未执行”
+    结果保证 tool-result 完整；README 中“沙盒/只读测试/验证通过”描述已对齐。
+  - 回归测试：workspace 逃逸 4 条攻击命令、relaxed 不放行代码、env 过滤、
+    Base URL 泄露、审计脚本、验证状态绑定、TUI markup 字面、并发锁、
+    set_permission 回滚、Git 历史敏感读取、unittest dotted import、compileall
+    间接路径清单、Provider 超限、finish 顺序。
+- Verified locally: 459 tricoder tests pass (2 Windows symlink skips),
+  compileall OK.
 
 ## Next Action
 
@@ -127,7 +157,7 @@ provider-action protocols, and bound retrieval resources.
 
 ## Verification
 
-- `.venv\Scripts\python -m unittest discover -s tests` → Ran 406, OK (1 skip:
+- `.venv\Scripts\python -m unittest discover -s tests` → Ran 459, OK (2 skips:
   Windows cannot create symlinks).
 - `.venv\Scripts\python -m compileall -q src tests` → OK.
 - `python -B capabilities/tools/test_opencode_v2.py` → 3 OK (includes junction

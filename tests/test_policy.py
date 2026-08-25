@@ -311,5 +311,111 @@ class CommandPolicyTests(unittest.TestCase):
                     self.policy.validate(command)
 
 
+class CommandPolicyWorkspaceTests(unittest.TestCase):
+    """带 workspace 的 CommandPolicy：所有路径参数经 WorkspacePolicy 真实解析。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name)
+        (self.workspace / "test").mkdir()
+        (self.workspace / "src").mkdir()
+        (self.workspace / "test" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+        (self.workspace / "src" / "app.py").write_text("y = 2\n", encoding="utf-8")
+        self.policy = CommandPolicy(self.workspace)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_rejects_absolute_paths_in_tool_commands(self) -> None:
+        """unittest/compileall/pytest/ruff/mypy 的路径参数必须真实位于工作区内。"""
+        commands = (
+            "python -m compileall C:\\outside",
+            "python -m unittest discover -s C:\\outside",
+            "python -m pytest C:\\outside",
+            "python -m mypy C:\\outside",
+            "python -m ruff check C:\\outside",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(PolicyError):
+                    self.policy.validate(command)
+
+    def test_rejects_indirect_compileall_and_unittest_boundaries(self) -> None:
+        """禁止从清单读取路径，也禁止 unittest 通过模块名导入任意代码。"""
+        commands = (
+            "python -m compileall -i test/paths.txt",
+            "python -m unittest xml.etree.ElementTree",
+            "python -m unittest tests.test_example",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(PolicyError):
+                    self.policy.validate(command)
+
+    def test_rejects_git_output_redirect(self) -> None:
+        """git 只读命令禁止 --output 等写文件选项。"""
+        commands = (
+            "git diff --output=C:\\outside\\leak.txt",
+            "git log --output C:\\outside\\leak.txt",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(PolicyError):
+                    self.policy.validate(command)
+
+    def test_rejects_scripts_outside_workspace(self) -> None:
+        """脚本必须解析为工作区内存在的普通 .py 文件。"""
+        commands = (
+            "python C:\\outside\\script.py",
+            "python ..\\outside.py",
+            "python test/missing.py",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(PolicyError):
+                    self.policy.validate(command)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "当前平台不支持符号链接")
+    def test_rejects_script_through_symlink_escape(self) -> None:
+        """符号链接指向工作区外时，脚本路径必须被拒绝。"""
+        outside = Path(tempfile.mkdtemp(prefix="script-outside-"))
+        (outside / "outside.py").write_text("x = 1\n", encoding="utf-8")
+        link = self.workspace / "test" / "link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("当前账户不能创建符号链接")
+        try:
+            with self.assertRaises(PolicyError):
+                self.policy.validate("python test/link/outside.py")
+        finally:
+            link.unlink(missing_ok=True)
+            outside.rmdir()
+
+    def test_accepts_in_workspace_paths(self) -> None:
+        """工作区内路径参数正常放行。"""
+        commands = (
+            "python -m compileall src",
+            "python -m unittest discover -s test",
+            "python -m unittest test/ok.py",
+            "python test/ok.py",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(self.policy.validate(command))
+
+    def test_audit_metadata_script_does_not_crash(self) -> None:
+        """脚本命令的审计元数据必须结构化且不崩溃（原 IndexError）。"""
+        meta = self.policy.audit_metadata("python test/ok.py")
+        self.assertTrue(meta["command_valid"])
+        self.assertEqual("script", meta["execution_kind"])
+        self.assertEqual("test/ok.py", meta["script"])
+        module_meta = self.policy.audit_metadata("python -m unittest")
+        self.assertEqual("module", module_meta["execution_kind"])
+        self.assertEqual("unittest", module_meta["python_module"])
+        invalid = self.policy.audit_metadata("python C:\\outside\\script.py")
+        self.assertFalse(invalid["command_valid"])
+
+
 if __name__ == "__main__":
     unittest.main()
