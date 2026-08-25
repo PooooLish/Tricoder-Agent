@@ -30,14 +30,29 @@ class FileFingerprint:
 def prepare_workspace(case: EvalCase, workspaces_root: Path) -> Path:
     """Copy one case fixture into a new isolated workspace."""
 
-    root = _ensure_directory(workspaces_root, create=True)
     if Path(case.id).name != case.id:
         raise WorkspaceSafetyError("case ID 不能包含路径分隔符")
+    fixture = _ensure_directory(case.workspace_dir)
+    verifier_source = _ensure_directory(case.verifier_dir)
+    root = workspaces_root.resolve(strict=False)
+    workspace = _within_root(root / case.id, root)
+    for source in (fixture, verifier_source):
+        if _paths_overlap(root, source) or _paths_overlap(workspace, source):
+            raise WorkspaceSafetyError("工作副本与评测源目录重叠，无法隔离")
+    _validate_fixture_tree(fixture, fixture)
+
+    root = _ensure_directory(workspaces_root, create=True)
     workspace = _within_root(root / case.id, root)
     if os.path.lexists(workspace):
         raise WorkspaceSafetyError(f"工作副本已存在：{case.id}")
     workspace.mkdir()
-    _copy_tree(case.workspace_dir, workspace, workspace)
+    _copy_tree(
+        fixture,
+        workspace,
+        workspace,
+        reject_reserved_paths=True,
+        fixture_root=fixture,
+    )
     return workspace
 
 
@@ -118,18 +133,55 @@ def _within_root(path: Path, root: Path) -> Path:
     return resolved
 
 
-def _copy_tree(source: Path, destination: Path, root: Path) -> None:
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _validate_fixture_tree(directory: Path, fixture_root: Path) -> None:
+    directory = _ensure_directory(directory)
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            _reject_link_or_reparse_entry(entry)
+            path = Path(entry.path)
+            if is_reserved_eval_path(path.relative_to(fixture_root).as_posix()):
+                raise WorkspaceSafetyError("fixture 不能包含保留 verifier 目录")
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                _validate_fixture_tree(path, fixture_root)
+            elif not stat.S_ISREG(entry_stat.st_mode):
+                raise WorkspaceSafetyError(f"仅允许复制普通文件和目录：{path.name}")
+
+
+def _copy_tree(
+    source: Path,
+    destination: Path,
+    root: Path,
+    *,
+    reject_reserved_paths: bool = False,
+    fixture_root: Path | None = None,
+) -> None:
     source = _ensure_directory(source)
+    fixture_root = fixture_root or source
     destination = _within_root(destination, root)
     with os.scandir(source) as entries:
         for entry in entries:
             _reject_link_or_reparse_entry(entry)
             source_path = Path(entry.path)
+            if reject_reserved_paths and is_reserved_eval_path(
+                source_path.relative_to(fixture_root).as_posix()
+            ):
+                raise WorkspaceSafetyError("fixture 不能包含保留 verifier 目录")
             destination_path = _within_root(destination / entry.name, root)
             entry_stat = entry.stat(follow_symlinks=False)
             if stat.S_ISDIR(entry_stat.st_mode):
                 destination_path.mkdir()
-                _copy_tree(source_path, destination_path, root)
+                _copy_tree(
+                    source_path,
+                    destination_path,
+                    root,
+                    reject_reserved_paths=reject_reserved_paths,
+                    fixture_root=fixture_root,
+                )
             elif stat.S_ISREG(entry_stat.st_mode):
                 shutil.copyfile(source_path, destination_path)
             else:

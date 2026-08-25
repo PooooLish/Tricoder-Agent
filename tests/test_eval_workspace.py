@@ -2,6 +2,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from tricoder.evals.models import EvalCase, VerificationSpec
@@ -53,6 +54,32 @@ class EvalWorkspaceTests(unittest.TestCase):
         self.assertFalse((workspace / RESERVED_VERIFIER_DIR).exists())
         self.assertFalse((workspace / "hidden_test.py").exists())
         self.assertEqual("value = 1\n", (self.fixture / "app.py").read_text("utf-8"))
+
+    def test_prepare_workspace_rejects_roots_overlapping_fixture_or_verifier(self) -> None:
+        """防止工作副本根目录写入 fixture 或 verifier 源目录。"""
+        nested_fixture = self.fixture / "nested-fixture"
+        nested_fixture.mkdir()
+        (nested_fixture / "app.py").write_text("value = 1\n", encoding="utf-8")
+        nested_case = replace(self.case, id="nested-case", workspace_dir=nested_fixture)
+
+        with self.assertRaisesRegex(WorkspaceSafetyError, "重叠|隔离"):
+            prepare_workspace(nested_case, self.fixture)
+        with self.assertRaisesRegex(WorkspaceSafetyError, "重叠|隔离"):
+            prepare_workspace(self.case, self.verifier_source)
+
+        self.assertFalse((self.fixture / "nested-case").exists())
+        self.assertFalse((self.verifier_source / self.case.id).exists())
+
+    def test_prepare_workspace_rejects_reserved_verifier_in_fixture(self) -> None:
+        """防止畸形 fixture 在隐藏验证注入前泄露 verifier 内容。"""
+        reserved = self.fixture / RESERVED_VERIFIER_DIR
+        reserved.mkdir()
+        (reserved / "test_hidden.py").write_text("raise AssertionError\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceSafetyError, "保留"):
+            prepare_workspace(self.case, self.run_root / "workspaces")
+
+        self.assertFalse((self.run_root / "workspaces" / self.case.id).exists())
 
     def test_verifier_is_installed_after_snapshot_and_removed(self) -> None:
         """防止隐藏 verifier 被快照误报为 Agent 的修改。"""
