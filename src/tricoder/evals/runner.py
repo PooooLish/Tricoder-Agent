@@ -154,6 +154,20 @@ def _run_case(
             run_result=run_result,
         )
 
+    if any(is_reserved_eval_path(path) for path in modified_files):
+        try:
+            remove_verifier(workspace)
+        except (OSError, WorkspaceSafetyError):
+            pass
+        return _case_result(
+            case,
+            started,
+            ("workspace_error",),
+            modified_files=modified_files,
+            verifications=verifications,
+            run_result=run_result,
+        )
+
     try:
         try:
             install_verifier(case, workspace)

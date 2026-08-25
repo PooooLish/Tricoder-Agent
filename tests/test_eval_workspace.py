@@ -82,7 +82,7 @@ class EvalWorkspaceTests(unittest.TestCase):
         self.assertFalse((self.run_root / "workspaces" / self.case.id).exists())
 
     def test_verifier_is_installed_after_snapshot_and_removed(self) -> None:
-        """防止隐藏 verifier 被快照误报为 Agent 的修改。"""
+        """注入前的 after 快照固定 Agent 修改，后续 verifier 不参与该差异。"""
         workspace = prepare_workspace(self.case, self.run_root / "workspaces")
         before = capture_snapshot(workspace)
         (workspace / "app.py").write_text("value = 2\n", encoding="utf-8")
@@ -92,9 +92,31 @@ class EvalWorkspaceTests(unittest.TestCase):
 
         self.assertTrue((verifier / "test_hidden.py").is_file())
         self.assertEqual(("app.py",), changed_paths(before, after))
-        self.assertEqual(after, capture_snapshot(workspace))
+        self.assertIn(
+            f"{RESERVED_VERIFIER_DIR}/test_hidden.py",
+            capture_snapshot(workspace),
+        )
         remove_verifier(workspace)
         self.assertFalse(verifier.exists())
+
+    def test_capture_snapshot_includes_agent_created_nested_reserved_path(self) -> None:
+        """防止任意层级的保留目录名从 Agent 阶段修改集合中消失。"""
+        workspace = prepare_workspace(self.case, self.run_root / "workspaces")
+        before = capture_snapshot(workspace)
+        reserved = workspace / "nested" / RESERVED_VERIFIER_DIR
+        reserved.mkdir(parents=True)
+        (reserved / "forged.py").write_text("pass\n", encoding="utf-8")
+
+        after = capture_snapshot(workspace)
+
+        self.assertIn(
+            f"nested/{RESERVED_VERIFIER_DIR}/forged.py",
+            after,
+        )
+        self.assertEqual(
+            (f"nested/{RESERVED_VERIFIER_DIR}/forged.py",),
+            changed_paths(before, after),
+        )
 
     def test_changed_paths_reports_added_deleted_and_modified_paths_in_order(self) -> None:
         """防止快照遗漏新增、删除或内容变化的普通文件。"""

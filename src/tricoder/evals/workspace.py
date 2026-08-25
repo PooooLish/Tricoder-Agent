@@ -57,14 +57,12 @@ def prepare_workspace(case: EvalCase, workspaces_root: Path) -> Path:
 
 
 def capture_snapshot(workspace: Path) -> dict[str, FileFingerprint]:
-    """Fingerprint ordinary workspace files, excluding framework-owned paths."""
+    """Fingerprint every ordinary file present at the time of the snapshot."""
 
     root = _ensure_directory(workspace)
     snapshot: dict[str, FileFingerprint] = {}
     for path in _iter_regular_files(root, root):
         relative_path = path.relative_to(root).as_posix()
-        if is_reserved_eval_path(relative_path):
-            continue
         snapshot[relative_path] = _fingerprint(path)
     return snapshot
 

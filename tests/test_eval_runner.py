@@ -368,8 +368,39 @@ class EvalRunnerTests(unittest.TestCase):
 
         self.assertEqual("error", result.status)
         self.assertEqual(("workspace_error",), result.failure_codes)
-        self.assertNotIn(
+        self.assertIn(
             f"{RESERVED_VERIFIER_DIR}/forged.py", result.modified_files
+        )
+        self.assertFalse(
+            (self.run_dir / "workspaces" / case.id / RESERVED_VERIFIER_DIR).exists()
+        )
+
+    def test_nested_reserved_path_is_rejected_even_with_broad_allowed_glob(
+        self,
+    ) -> None:
+        case = replace(self.case, allowed_changes=("**",))
+        suite = replace(self.suite, cases=(case,))
+
+        def executor(
+            case: EvalCase, workspace: Path, audit_path: Path
+        ) -> RunResult:
+            del case, audit_path
+            (workspace / "app.py").write_text("value = 2\n", encoding="utf-8")
+            reserved = workspace / "nested" / RESERVED_VERIFIER_DIR
+            reserved.mkdir(parents=True)
+            (reserved / "forged.py").write_text("pass\n", encoding="utf-8")
+            return RunResult(True, "done", 1, 1, (), "通过")
+
+        result = run_suite(
+            suite, self.run_dir, "openai", "test-model", executor
+        ).cases[0]
+
+        self.assertEqual("error", result.status)
+        self.assertEqual(("workspace_error",), result.failure_codes)
+        self.assertEqual((), result.verifications)
+        self.assertIn(
+            f"nested/{RESERVED_VERIFIER_DIR}/forged.py",
+            result.modified_files,
         )
         self.assertFalse(
             (self.run_dir / "workspaces" / case.id / RESERVED_VERIFIER_DIR).exists()
