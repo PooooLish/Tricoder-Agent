@@ -60,10 +60,31 @@ def run_bounded_process(
         shell=False,
         **popen_options,
     )
-    windows_job = _create_windows_job(process) if os.name == "nt" else None
-    if os.name == "nt" and windows_job is None:
-        _terminate_process_tree(process, env, None)
-        raise OSError("无法建立 Windows 进程树约束")
+    windows_job: _WindowsJob | None = None
+    try:
+        windows_job = _create_windows_job(process) if os.name == "nt" else None
+        if os.name == "nt" and windows_job is None:
+            raise OSError("无法建立 Windows 进程树约束")
+        return _collect_bounded_process(
+            process,
+            env=env,
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            windows_job=windows_job,
+        )
+    except BaseException:
+        _terminate_process_tree(process, env, windows_job)
+        raise
+
+
+def _collect_bounded_process(
+    process: subprocess.Popen[bytes],
+    *,
+    env: Mapping[str, str],
+    timeout: float,
+    max_output_bytes: int,
+    windows_job: "_WindowsJob | None",
+) -> BoundedProcessResult:
     assert process.stdout is not None
     assert process.stderr is not None
 
@@ -112,13 +133,9 @@ def run_bounded_process(
         except subprocess.TimeoutExpired:
             continue
 
-    cleanup_failed = False
-    if exceeded.is_set() or timed_out:
-        cleanup_failed = not _terminate_process_tree(process, env, windows_job)
-    else:
+    if not exceeded.is_set() and not timed_out:
         process.wait()
-        if windows_job is not None and not windows_job.close():
-            cleanup_failed = True
+    cleanup_failed = not _terminate_process_tree(process, env, windows_job)
 
     for reader in readers:
         reader.join(timeout=_CLEANUP_TIMEOUT_SECONDS)

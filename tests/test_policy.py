@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import tricoder.policy as policy_module
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 
 
@@ -42,6 +43,26 @@ class WorkspacePolicyTests(unittest.TestCase):
                     self.policy.resolve_path(candidate, must_exist=False)
         allowed = self.policy.resolve_path(".env.example", must_exist=False)
         self.assertEqual((self.workspace / ".env.example").resolve(), allowed)
+
+    def test_public_sensitive_path_predicate_matches_workspace_policy(self) -> None:
+        """Loader and workspace access must share one pure sensitive-path rule."""
+        predicate = getattr(
+            policy_module,
+            "is_sensitive_workspace_path",
+            lambda _path: False,
+        )
+
+        for candidate in (
+            ".git/config",
+            "nested/.env.local",
+            "nested/.envrc",
+            "config/credentials.json",
+            "keys/private.pem",
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertTrue(predicate(candidate))
+        self.assertFalse(predicate("nested/.env.example"))
+        self.assertFalse(predicate("src/app.py"))
 
     @unittest.skipUnless(hasattr(os, "symlink"), "当前平台不支持符号链接")
     def test_rejects_symlink_that_points_outside(self) -> None:

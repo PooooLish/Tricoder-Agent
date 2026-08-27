@@ -15,14 +15,8 @@ from tricoder.subprocess_env import (
 )
 
 
-class PolicyError(PermissionError):
-    """表示动作超出了 MVP 允许的安全边界。"""
-
-
-class WorkspacePolicy:
-    """确保模型只能访问明确指定的工作区。"""
-
-    _SENSITIVE_PARTS = {
+_SENSITIVE_PATH_PARTS = frozenset(
+    {
         ".git",
         ".ssh",
         ".aws",
@@ -37,14 +31,46 @@ class WorkspacePolicy:
         "service-account",
         "serviceaccount",
     }
-    _SENSITIVE_PREFIXES = (
-        ".env.",
-        "credentials.",
-        "secrets.",
-        "id_rsa",
-        "id_ed25519",
+)
+_SENSITIVE_PATH_PREFIXES = (
+    ".env.",
+    "credentials.",
+    "secrets.",
+    "id_rsa",
+    "id_ed25519",
+)
+_SENSITIVE_PATH_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".gpg"})
+
+
+def is_sensitive_workspace_path(path: str | Path) -> bool:
+    """Return whether any path segment is reserved for credentials or secrets."""
+
+    return any(
+        _is_sensitive_path_part(part.lower())
+        for part in re.split(r"[\\/]+", os.fspath(path))
+        if part
     )
-    _SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".gpg"}
+
+
+def _is_sensitive_path_part(lowered: str) -> bool:
+    if lowered == ".env.example":
+        return False
+    return (
+        lowered in _SENSITIVE_PATH_PARTS
+        or lowered.startswith(".env")
+        or any(lowered.startswith(prefix) for prefix in _SENSITIVE_PATH_PREFIXES)
+        or lowered.startswith("service-account")
+        or lowered.startswith("serviceaccount")
+        or Path(lowered).suffix in _SENSITIVE_PATH_SUFFIXES
+    )
+
+
+class PolicyError(PermissionError):
+    """表示动作超出了 MVP 允许的安全边界。"""
+
+
+class WorkspacePolicy:
+    """确保模型只能访问明确指定的工作区。"""
 
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve(strict=True)
@@ -69,22 +95,10 @@ class WorkspacePolicy:
             raise PolicyError(f"目标路径不存在：{path}")
         return resolved
 
-    @staticmethod
-    def _is_sensitive_part(lowered: str) -> bool:
-        if lowered in WorkspacePolicy._SENSITIVE_PARTS:
-            return True
-        if any(lowered.startswith(prefix) for prefix in WorkspacePolicy._SENSITIVE_PREFIXES):
-            return True
-        if lowered.startswith("service-account") or lowered.startswith("serviceaccount"):
-            return True
-        return False
-
     def _check_sensitive_parts(self, parts: tuple[str, ...]) -> None:
         for part in parts:
             lowered = part.lower()
-            if lowered == ".env.example":
-                continue
-            if self._is_sensitive_part(lowered) or Path(lowered).suffix in self._SENSITIVE_SUFFIXES:
+            if _is_sensitive_path_part(lowered):
                 raise PolicyError(f"拒绝访问敏感路径：{part}")
 
 
@@ -333,21 +347,11 @@ class CommandPolicy:
                 raise PolicyError(f"Python 脚本不是普通文件：{args[1]}")
             self._require_relative_paths(args[1:], "python")
         else:
-            for segment in re.split(r"[\\/]+", args[1]):
-                lowered = segment.lower()
-                if lowered == ".env.example":
-                    continue
-                if (
-                    lowered in {"", ".", ".."}
-                    or lowered in {
-                        ".git", ".ssh", ".aws", ".config", ".local", ".env",
-                        ".env.local", "credentials", "secrets", "id_rsa",
-                        "id_ed25519",
-                    }
-                    or lowered.startswith((".env.", "credentials.", "secrets."))
-                    or Path(lowered).suffix in {".pem", ".key", ".p12", ".pfx"}
-                ):
-                    raise PolicyError(f"Python 脚本路径包含敏感段：{segment}")
+            segments = tuple(re.split(r"[\\/]+", args[1]))
+            if any(segment.lower() in {"", ".", ".."} for segment in segments):
+                raise PolicyError(f"Python 脚本路径包含敏感段：{args[1]}")
+            if is_sensitive_workspace_path(args[1]):
+                raise PolicyError(f"Python 脚本路径包含敏感段：{args[1]}")
             self._require_relative_paths(args[1:], "python")
         return args
 

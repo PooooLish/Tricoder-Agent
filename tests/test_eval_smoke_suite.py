@@ -174,6 +174,47 @@ class EvalSmokeSuiteTests(unittest.TestCase):
         self.assertEqual("failed", result.status, result)
         self.assertIn("verification_failed", result.failure_codes)
 
+    def test_hidden_probe_bounds_stdout_and_stderr_before_marker(self) -> None:
+        """Probe capture must cap both streams and kill the flooding process."""
+        suite = load_suite(
+            self._original_cwd / "evals" / "smoke",
+            case_id="fix-subtract",
+        )
+        for stream_name in ("stdout", "stderr"):
+            with self.subTest(stream=stream_name):
+                run_dir = reserve_run_directory(
+                    Path.cwd(),
+                    f"malicious-{stream_name}-flood",
+                )
+                marker_name = f"probe-{stream_name}-after-flood.txt"
+
+                def executor(case, workspace, audit_path):  # type: ignore[no-untyped-def]
+                    del case, audit_path
+                    (workspace / "calculator.py").write_text(
+                        "from pathlib import Path\n"
+                        "import sys\n"
+                        f"sys.{stream_name}.write('x' * 5_000_000)\n"
+                        f"sys.{stream_name}.flush()\n"
+                        f"Path({marker_name!r}).write_text('alive')\n\n"
+                        "def subtract(a: int, b: int) -> int:\n"
+                        "    return a - b\n",
+                        encoding="utf-8",
+                    )
+                    return RunResult(True, "offline", 1, verification="通过")
+
+                result = run_suite(
+                    suite,
+                    run_dir,
+                    "offline",
+                    f"malicious-{stream_name}",
+                    executor,
+                ).cases[0]
+                marker = run_dir / "workspaces" / "fix-subtract" / marker_name
+
+                self.assertEqual("failed", result.status, result)
+                self.assertIn("verification_failed", result.failure_codes)
+                self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -194,6 +194,101 @@ class EvalLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalDefinitionError, "验证命令"):
             load_suite(suite_dir)
 
+    def test_load_suite_rejects_sensitive_workspace_and_verifier_entries(self) -> None:
+        """No credential-shaped fixture may reach an Agent or hidden verifier."""
+        entries = (
+            ("workspace", ".env.local"),
+            ("workspace", ".envrc"),
+            ("workspace", ".git/config"),
+            ("workspace", "config/credentials.json"),
+            ("verifier", "nested/secrets/token.txt"),
+            ("verifier", "keys/private.pem"),
+        )
+        for fixture_name, relative in entries:
+            with self.subTest(fixture=fixture_name, relative=relative):
+                suite_dir = self._write_suite()
+                path = (
+                    suite_dir
+                    / "cases"
+                    / "fix-one"
+                    / fixture_name
+                    / relative
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("synthetic-sensitive-fixture", encoding="utf-8")
+
+                with self.assertRaisesRegex(EvalDefinitionError, "敏感"):
+                    load_suite(suite_dir)
+
+    def test_load_suite_allows_env_example_in_both_fixture_trees(self) -> None:
+        """The committed placeholder template is not a credential fixture."""
+        suite_dir = self._write_suite()
+        case_dir = suite_dir / "cases" / "fix-one"
+        for fixture_name in ("workspace", "verifier"):
+            (case_dir / fixture_name / ".env.example").write_text(
+                "OPENAI_API_KEY=placeholder\n",
+                encoding="utf-8",
+            )
+
+        suite = load_suite(suite_dir)
+
+        self.assertEqual(("fix-one",), tuple(case.id for case in suite.cases))
+
+    def test_load_suite_rejects_reserved_path_at_any_workspace_depth(self) -> None:
+        """The framework verifier name is forbidden throughout Agent fixtures."""
+        suite_dir = self._write_suite()
+        reserved = (
+            suite_dir
+            / "cases"
+            / "fix-one"
+            / "workspace"
+            / "nested"
+            / ".tricoder_eval_verifier"
+        )
+        reserved.mkdir(parents=True)
+        (reserved / "forged.py").write_text("pass\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(EvalDefinitionError, "保留"):
+            load_suite(suite_dir)
+
+    def test_load_suite_accepts_exact_fixture_entry_and_depth_limits(self) -> None:
+        """Exact entry and depth budgets remain usable by legitimate fixtures."""
+        entries_suite = self._write_suite()
+        workspace = entries_suite / "cases" / "fix-one" / "workspace"
+        for index in range(511):
+            (workspace / f"empty-{index}").mkdir()
+
+        loaded = load_suite(entries_suite)
+
+        self.assertEqual(("fix-one",), tuple(case.id for case in loaded.cases))
+
+        depth_suite = self._write_suite()
+        current = depth_suite / "cases" / "fix-one" / "workspace"
+        for _index in range(32):
+            current = current / "d"
+            current.mkdir()
+
+        loaded = load_suite(depth_suite)
+
+        self.assertEqual(("fix-one",), tuple(case.id for case in loaded.cases))
+
+    def test_load_suite_rejects_fixture_entry_and_depth_limit_plus_one(self) -> None:
+        """Large empty trees and over-deep trees fail with the fixed prefix."""
+        entries_suite = self._write_suite()
+        workspace = entries_suite / "cases" / "fix-one" / "workspace"
+        for index in range(512):
+            (workspace / f"empty-{index}").mkdir()
+        with self.assertRaisesRegex(EvalDefinitionError, "评测定义超过资源上限"):
+            load_suite(entries_suite)
+
+        depth_suite = self._write_suite()
+        current = depth_suite / "cases" / "fix-one" / "workspace"
+        for _index in range(33):
+            current = current / "d"
+            current.mkdir()
+        with self.assertRaisesRegex(EvalDefinitionError, "评测定义超过资源上限"):
+            load_suite(depth_suite)
+
     def test_load_suite_accepts_conservative_resource_boundaries(self) -> None:
         """The exact documented caps must remain usable."""
         command = "python app.py " + "x" * (2048 - len("python app.py "))

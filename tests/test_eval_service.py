@@ -156,6 +156,33 @@ class EvalServiceTests(unittest.TestCase):
         self.assertNotIn("test-key", output.getvalue())
         self.assertNotIn("TASK-SECRET-SENTINEL", output.getvalue())
 
+    def test_sensitive_fixture_is_rejected_before_provider_or_runtime(self) -> None:
+        """Fixture preflight must fail before costly or writable eval setup."""
+        sensitive = (
+            self.suite_dir
+            / "cases"
+            / "case-two"
+            / "workspace"
+            / ".env.local"
+        )
+        sensitive.write_text("OPENAI_API_KEY=synthetic", encoding="utf-8")
+        output = io.StringIO()
+        provider_calls: list[str] = []
+
+        exit_code = run_eval_command(
+            self._args(case="case-one"),
+            environ=self._environment(),
+            provider_factory=lambda *_args: provider_calls.append(  # type: ignore[arg-type]
+                "called"
+            ),
+            output=output,
+        )
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual([], provider_calls)
+        self.assertFalse((self.root / "runtime").exists())
+        self.assertNotIn("synthetic", output.getvalue())
+
     def test_real_mode_success_filters_case_and_writes_runtime_report(self) -> None:
         """Bypassing production assembly, case filtering, or cwd output must fail."""
         output = io.StringIO()

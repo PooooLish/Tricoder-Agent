@@ -7,10 +7,15 @@ import os
 import re
 import stat
 import tomllib
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from tricoder.policy import CommandPolicy, PolicyError
+from tricoder.policy import (
+    CommandPolicy,
+    PolicyError,
+    is_sensitive_workspace_path,
+)
 
 from .models import EvalCase, EvalSuite, VerificationSpec
 
@@ -43,6 +48,8 @@ MAX_CASE_CONTEXT_CHARS = 200_000
 MAX_VERIFICATION_TIMEOUT = 300.0
 MAX_FIXTURE_FILES = 256
 MAX_FIXTURE_BYTES = 1_000_000
+MAX_FIXTURE_ENTRIES = 512
+MAX_FIXTURE_DEPTH = 32
 MAX_DEFINITION_BYTES = 256_000
 _RESOURCE_LIMIT_PREFIX = "评测定义超过资源上限"
 
@@ -94,9 +101,17 @@ def _load_case(suite_dir: Path, declared_id: str) -> EvalCase:
     )
     if workspace_dir == verifier_dir:
         raise EvalDefinitionError("workspace 与 verifier 目录必须不同")
-    fixture_budget = [0, 0]
-    _validate_regular_tree(workspace_dir, fixture_budget)
-    _validate_regular_tree(verifier_dir, fixture_budget)
+    fixture_budget = [0, 0, 0]
+    _validate_regular_tree(
+        workspace_dir,
+        fixture_budget,
+        reject_reserved_paths=True,
+    )
+    _validate_regular_tree(
+        verifier_dir,
+        fixture_budget,
+        reject_reserved_paths=False,
+    )
 
     verifications = _load_verifications(case_data["verification"])
     return EvalCase(
@@ -204,13 +219,31 @@ def _require_regular_file(path: Path, label: str, *, boundary: Path) -> Path:
     return resolved
 
 
-def _validate_regular_tree(root: Path, budget: list[int]) -> None:
-    """Reject every link/reparse/special entry before Provider construction."""
+def _validate_regular_tree(
+    root: Path,
+    budget: list[int],
+    *,
+    reject_reserved_paths: bool,
+) -> None:
+    """Iteratively reject unsafe or over-budget fixture entries."""
 
     root = _require_directory(root, "fixture 目录")
-    with os.scandir(root) as entries:
-        for entry in entries:
-            metadata = entry.stat(follow_symlinks=False)
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    while pending:
+        directory, parent_depth = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                remaining_entries = MAX_FIXTURE_ENTRIES - budget[2]
+                scanned = tuple(islice(entries, remaining_entries + 1))
+        except OSError as exc:
+            raise EvalDefinitionError("fixture 路径不可用") from exc
+        if len(scanned) > remaining_entries:
+            _raise_resource_limit("fixture entry 数")
+        for entry in scanned:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise EvalDefinitionError("fixture 路径不可用") from exc
             if entry.is_symlink() or _is_reparse_stat(metadata):
                 raise EvalDefinitionError(
                     f"fixture 不能包含链接或 reparse point：{entry.name}"
@@ -222,8 +255,22 @@ def _validate_regular_tree(root: Path, budget: list[int]) -> None:
                 raise EvalDefinitionError("fixture 路径不可用") from exc
             if not resolved.is_relative_to(root):
                 raise EvalDefinitionError("fixture 路径超出目录边界")
+
+            relative = resolved.relative_to(root).as_posix()
+            if is_sensitive_workspace_path(relative):
+                raise EvalDefinitionError(f"fixture 不能包含敏感路径：{entry.name}")
+            if reject_reserved_paths and is_reserved_eval_path(relative):
+                raise EvalDefinitionError("workspace fixture 不能包含保留 verifier 目录")
+
+            entry_depth = parent_depth + 1
+            budget[2] += 1
+            if budget[2] > MAX_FIXTURE_ENTRIES:
+                _raise_resource_limit("fixture entry 数")
+            if entry_depth > MAX_FIXTURE_DEPTH:
+                _raise_resource_limit("fixture 最大深度")
+
             if stat.S_ISDIR(metadata.st_mode):
-                _validate_regular_tree(path, budget)
+                pending.append((path, entry_depth))
             elif stat.S_ISREG(metadata.st_mode):
                 budget[0] += 1
                 budget[1] += metadata.st_size

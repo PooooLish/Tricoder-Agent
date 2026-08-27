@@ -6,12 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-import subprocess
 import time
 from typing import Literal, TypeAlias
 
 from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
+from tricoder.subprocess_control import run_bounded_process
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase, EvalSuite, VerificationSpec
@@ -33,6 +33,7 @@ AgentExecutor: TypeAlias = Callable[[EvalCase, Path, Path], RunResult]
 _ERROR_FAILURE_CODES = frozenset(
     {"executor_error", "workspace_error", "verification_error"}
 )
+_VERIFICATION_MAX_OUTPUT_BYTES = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,22 +259,12 @@ def _run_verification(
         )
 
     try:
-        completed = subprocess.run(
+        completed = run_bounded_process(
             args,
             cwd=workspace,
             env=policy.subprocess_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             timeout=spec.timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return VerificationResult(
-            spec.name,
-            exit_code=None,
-            passed=False,
-            error_code="verification_timeout",
+            max_output_bytes=_VERIFICATION_MAX_OUTPUT_BYTES,
         )
     except Exception:
         return VerificationResult(
@@ -281,6 +272,21 @@ def _run_verification(
             exit_code=None,
             passed=False,
             error_code="verification_error",
+        )
+
+    if completed.cleanup_failed or completed.output_exceeded:
+        return VerificationResult(
+            spec.name,
+            exit_code=None,
+            passed=False,
+            error_code="verification_error",
+        )
+    if completed.timed_out:
+        return VerificationResult(
+            spec.name,
+            exit_code=None,
+            passed=False,
+            error_code="verification_timeout",
         )
 
     passed = completed.returncode == 0

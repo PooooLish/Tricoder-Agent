@@ -1,9 +1,10 @@
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import unittest
+
+from _tricoder_bounded_process import run_bounded_process
 
 
 _PROBE = r"""
@@ -24,19 +25,19 @@ sys.stdout.write(json.dumps({
 def _run_probe() -> object:
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    completed = subprocess.run(
+    completed = run_bounded_process(
         [sys.executable, "-I", "-B", "-c", _PROBE],
         cwd=Path.cwd(),
         env=env,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=5,
-        check=False,
+        max_output_bytes=4096,
     )
-    if completed.returncode != 0 or len(completed.stdout) > 4096:
+    if (
+        completed.returncode != 0
+        or completed.timed_out
+        or completed.output_exceeded
+        or completed.cleanup_failed
+    ):
         raise AssertionError("isolated business probe failed")
     try:
         return json.loads(completed.stdout)

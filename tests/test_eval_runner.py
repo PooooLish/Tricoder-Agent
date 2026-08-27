@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -335,6 +336,54 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertEqual("verification_timeout", result.verifications[0].error_code)
         self.assertIsNone(result.verifications[0].exit_code)
 
+    def test_verification_timeout_terminates_descendant_processes(self) -> None:
+        """A verifier timeout must kill a delayed child before it writes a marker."""
+        child_code = (
+            "import time; from pathlib import Path; "
+            "time.sleep(0.6); Path('verifier-child-alive.txt').write_text('alive')"
+        )
+        case = self._make_case(
+            "timeout-tree-case",
+            timeout=0.2,
+            verifier_source=(
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                "time.sleep(10)\n"
+            ),
+        )
+        suite = replace(self.suite, cases=(case,))
+
+        result = run_suite(
+            suite, self.run_dir, "openai", "test-model", self._passing_executor
+        ).cases[0]
+        time.sleep(0.9)
+
+        marker = self.run_dir / "workspaces" / case.id / "verifier-child-alive.txt"
+        self.assertEqual("verification_timeout", result.verifications[0].error_code)
+        self.assertFalse(marker.exists())
+
+    def test_verification_output_overflow_terminates_before_marker(self) -> None:
+        """Verifier stdout must have a real byte cap, not a discard-only sink."""
+        case = self._make_case(
+            "overflow-case",
+            verifier_source=(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "sys.stdout.write('x' * 5_000_000)\n"
+                "sys.stdout.flush()\n"
+                "Path('verifier-after-flood.txt').write_text('alive')\n"
+            ),
+        )
+        suite = replace(self.suite, cases=(case,))
+
+        result = run_suite(
+            suite, self.run_dir, "openai", "test-model", self._passing_executor
+        ).cases[0]
+
+        marker = self.run_dir / "workspaces" / case.id / "verifier-after-flood.txt"
+        self.assertEqual("verification_error", result.verifications[0].error_code)
+        self.assertFalse(marker.exists())
+
     def test_verification_policy_rejection_has_fixed_error_mapping(self) -> None:
         case = replace(
             self.case,
@@ -373,7 +422,7 @@ class EvalRunnerTests(unittest.TestCase):
 
     def test_verification_os_error_has_fixed_error_mapping(self) -> None:
         with patch(
-            "tricoder.evals.runner.subprocess.run",
+            "tricoder.evals.runner.run_bounded_process",
             side_effect=OSError("PROVIDER-SECRET-SENTINEL"),
         ):
             result = run_suite(

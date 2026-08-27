@@ -10,11 +10,14 @@ import shutil
 import stat
 from typing import Mapping
 
+import tricoder.subprocess_control as subprocess_control
+
 from .loader import is_reserved_eval_path
 from .models import EvalCase
 
 
 RESERVED_VERIFIER_DIR = ".tricoder_eval_verifier"
+_HIDDEN_PROCESS_HELPER = "_tricoder_bounded_process.py"
 
 
 class WorkspaceSafetyError(ValueError):
@@ -88,6 +91,9 @@ def install_verifier(case: EvalCase, workspace: Path) -> Path:
         raise WorkspaceSafetyError("保留 verifier 目录已存在")
     verifier.mkdir()
     _copy_tree(case.verifier_dir, verifier, root)
+    helper_source = Path(subprocess_control.__file__).resolve(strict=True)
+    helper_destination = _within_root(verifier / _HIDDEN_PROCESS_HELPER, root)
+    shutil.copyfile(helper_source, helper_destination)
     return verifier
 
 
