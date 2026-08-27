@@ -97,7 +97,10 @@ def _collect_bounded_process(
     def drain(stream, target: bytearray) -> None:  # type: ignore[no-untyped-def]
         try:
             while not exceeded.is_set():
-                chunk = stream.read(_READ_CHUNK_BYTES)
+                # ``BufferedReader.read(size)`` 可能等待凑满 size 或等到 EOF，
+                # 导致“仅超限 1 字节后挂起”的进程直到 timeout 才被发现。
+                # ``read1`` 每次只进行一次底层读取，能立即处理管道中现有数据。
+                chunk = stream.read1(_READ_CHUNK_BYTES)
                 if not chunk:
                     return
                 with lock:

@@ -340,14 +340,16 @@ class EvalRunnerTests(unittest.TestCase):
         """A verifier timeout must kill a delayed child before it writes a marker."""
         child_code = (
             "import time; from pathlib import Path; "
-            "time.sleep(0.6); Path('verifier-child-alive.txt').write_text('alive')"
+            "time.sleep(2); Path('verifier-child-alive.txt').write_text('alive')"
         )
         case = self._make_case(
             "timeout-tree-case",
-            timeout=0.2,
+            timeout=1.0,
             verifier_source=(
                 "import subprocess, sys, time\n"
+                "from pathlib import Path\n"
                 f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                "Path('verifier-ready.txt').write_text('ready')\n"
                 "time.sleep(10)\n"
             ),
         )
@@ -356,10 +358,12 @@ class EvalRunnerTests(unittest.TestCase):
         result = run_suite(
             suite, self.run_dir, "openai", "test-model", self._passing_executor
         ).cases[0]
-        time.sleep(0.9)
+        time.sleep(2.2)
 
         marker = self.run_dir / "workspaces" / case.id / "verifier-child-alive.txt"
+        ready = self.run_dir / "workspaces" / case.id / "verifier-ready.txt"
         self.assertEqual("verification_timeout", result.verifications[0].error_code)
+        self.assertTrue(ready.exists())
         self.assertFalse(marker.exists())
 
     def test_verification_output_overflow_terminates_before_marker(self) -> None:
