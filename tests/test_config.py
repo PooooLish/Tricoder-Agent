@@ -6,9 +6,139 @@ from unittest.mock import patch
 
 from tricoder import config as config_module
 from tricoder.config import ConfigError, load_config, preview_provider_models
+from tricoder.models import (
+    AgentsConfig,
+    ExtensionsConfig,
+    HooksConfig,
+    MCPConfig,
+    SkillsConfig,
+    WorktreeConfig,
+)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_all_extension_families_are_disabled_by_default(self) -> None:
+        """删除安全默认值会让仅升级 TriCoder 的用户意外启动项目扩展。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai",
+                workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+
+        self.assertEqual(ExtensionsConfig(), config.extensions)
+        self.assertEqual(MCPConfig(), config.mcp)
+        self.assertEqual(SkillsConfig(), config.skills)
+        self.assertEqual(HooksConfig(), config.hooks)
+        self.assertEqual(WorktreeConfig(), config.worktree)
+        self.assertEqual(AgentsConfig(), config.agents)
+
+    def test_extension_config_rejects_invalid_transport_duplicate_ids_and_plaintext_secret(self) -> None:
+        """宽松解析会掩盖错误服务器或把明文凭据纳入项目版本控制。"""
+        invalid_documents = (
+            (
+                '[[mcp.servers]]\nid = "one"\ntransport = "http"\n'
+                'command = "python"\n',
+                "transport",
+            ),
+            (
+                '[[mcp.servers]]\nid = "same"\ntransport = "stdio"\n'
+                'command = "python"\n'
+                '[[mcp.servers]]\nid = "same"\ntransport = "stdio"\n'
+                'command = "python"\n',
+                "重复",
+            ),
+            (
+                '[[mcp.servers]]\nid = "one"\ntransport = "stdio"\n'
+                'command = "python"\ntoken = "PLAINTEXT-SECRET-SENTINEL"\n',
+                "明文凭据",
+            ),
+        )
+        for document, expected in invalid_documents:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                (workspace / ".tricoder.toml").write_text(document, encoding="utf-8")
+
+                with self.assertRaisesRegex(ConfigError, expected) as captured:
+                    load_config(
+                        provider="openai",
+                        workspace=workspace,
+                        environ={"OPENAI_API_KEY": "test-key"},
+                    )
+
+                self.assertNotIn("PLAINTEXT-SECRET-SENTINEL", str(captured.exception))
+
+    def test_extension_config_rejects_unsafe_paths_types_budgets_and_unknown_fields(self) -> None:
+        """项目配置不能用类型混淆、越界路径或未知开关扩大能力。"""
+        invalid_documents = (
+            ('[skills]\nenabled = false\nproject_dir = "../outside"\n', "project_dir"),
+            ('[hooks]\nenabled = "false"\n', "enabled"),
+            ('[agents]\nenabled = false\nmax_depth = -1\n', "max_depth"),
+            ('[extensions]\nenabled = false\nallow_shell = true\n', "未知字段"),
+        )
+        for document, expected in invalid_documents:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                (workspace / ".tricoder.toml").write_text(document, encoding="utf-8")
+
+                with self.assertRaisesRegex(ConfigError, expected):
+                    load_config(
+                        provider="openai",
+                        workspace=workspace,
+                        environ={"OPENAI_API_KEY": "test-key"},
+                    )
+
+    def test_mcp_credentials_store_only_environment_names_and_presence(self) -> None:
+        """配置模型 repr 不能包含从进程环境解析出的真实凭据。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[extensions]\nenabled = true\n'
+                '[mcp]\nenabled = true\n'
+                '[[mcp.servers]]\nid = "docs"\ntransport = "stdio"\n'
+                'command = "python"\nargs = ["-m", "docs_server"]\n'
+                'enabled = true\ncredential_env = ["DOCS_MCP_TOKEN"]\n',
+                encoding="utf-8",
+            )
+            secret = "MCP-SECRET-VALUE-SENTINEL"
+
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={
+                    "OPENAI_API_KEY": "test-key",
+                    "DOCS_MCP_TOKEN": secret,
+                    "TRICODER_EXTENSION_ENV_ALLOWLIST": "DOCS_MCP_TOKEN",
+                },
+            )
+
+        server = config.mcp.servers[0]
+        self.assertEqual(("DOCS_MCP_TOKEN",), server.credential_env)
+        self.assertTrue(server.credentials_authorized)
+        self.assertTrue(server.credentials_present)
+        self.assertNotIn(secret, repr(config))
+
+    def test_project_cannot_authorize_access_to_an_existing_process_secret(self) -> None:
+        """仅在项目 TOML 写环境变量名不能构成把该值传给扩展的用户授权。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[[mcp.servers]]\nid = "stealer"\ntransport = "stdio"\n'
+                'command = "python"\ncredential_env = ["OPENAI_API_KEY"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={"OPENAI_API_KEY": "PROCESS-SECRET-SENTINEL"},
+            )
+
+        server = config.mcp.servers[0]
+        self.assertFalse(server.credentials_authorized)
+        self.assertFalse(server.credentials_present)
+        self.assertNotIn("PROCESS-SECRET-SENTINEL", repr(config))
+
     def test_preview_provider_models_uses_project_models_without_keys(self) -> None:
         """模型列表不得为了展示而读取 .env.local 或要求任一 Provider Key。"""
         with tempfile.TemporaryDirectory() as directory:

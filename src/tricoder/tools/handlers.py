@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import stat
 from typing import TYPE_CHECKING, Any, Callable
@@ -11,6 +12,8 @@ from tricoder.changes import (
     FileChange,
     FileSnapshot,
 )
+from tricoder.core.cancellation import CancellationToken
+from tricoder.mcp.schema import validate_json_value
 from tricoder.models import ToolDefinition, ToolResult
 
 from tricoder.tools.binding import _DirectoryBinding
@@ -47,6 +50,18 @@ class ToolHandler:
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         raise NotImplementedError
 
+    async def run_async(
+        self,
+        arguments: dict[str, Any],
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> ToolResult:
+        """默认在线程中执行既有同步工具，保留其公开行为。"""
+
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        return await asyncio.to_thread(self.run, arguments)
+
     @staticmethod
     def _schema(
         properties: dict[str, dict[str, str]],
@@ -62,33 +77,10 @@ class ToolHandler:
 
     @staticmethod
     def _validate_arguments(schema: dict[str, Any], arguments: object) -> None:
-        """在进入处理器前校验当前工具 Schema 支持的基础类型。"""
+        """在进入处理器前按共享递归 Schema 子集校验参数。"""
         if schema.get("type") != "object" or not isinstance(arguments, dict):
             raise ValueError("工具参数必须是对象")
-
-        properties = schema["properties"]
-        for name in schema["required"]:
-            if name not in arguments:
-                raise ValueError(f"缺少必填参数：{name}")
-        if not schema["additionalProperties"]:
-            extras = set(arguments) - set(properties)
-            if extras:
-                raise ValueError(f"不支持额外参数：{sorted(extras)[0]}")
-
-        validators: dict[str, type[object]] = {
-            "string": str,
-            "integer": int,
-            "boolean": bool,
-        }
-        for name, value in arguments.items():
-            expected = properties[name]["type"]
-            expected_type = validators.get(expected)
-            if expected_type is None:
-                raise ValueError(f"不支持的参数类型：{expected}")
-            if not isinstance(value, expected_type) or (
-                expected == "integer" and isinstance(value, bool)
-            ):
-                raise ValueError(f"参数 {name} 必须是 {expected}")
+        validate_json_value(schema, arguments)
 
     @staticmethod
     def _snapshot(
@@ -168,6 +160,10 @@ class ToolHandler:
             pass
 
     def _bounded(self, text: str) -> str:
+        # 装配 spill store 后由 ToolRegistry 在取得 call id 后统一处理，
+        # 这样正文能安全落盘且文件名不受工具参数控制。
+        if self.context.spill_store is not None:
+            return text
         if len(text) <= self.context.max_output_chars:
             return text
         omitted = len(text) - self.context.max_output_chars

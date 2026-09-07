@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Any
 
+from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.models import ToolResult
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.subprocess_env import filtered_subprocess_env
@@ -60,6 +62,31 @@ class RunCommandTool(ToolHandler):
     )
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
+        return self.run_with_cancellation(arguments, None)
+
+    async def run_async(
+        self,
+        arguments: dict[str, Any],
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> ToolResult:
+        """在线程中运行受控命令，并把取消令牌传入进程树控制。"""
+
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        return await asyncio.to_thread(
+            self.run_with_cancellation,
+            arguments,
+            cancellation,
+        )
+
+    def run_with_cancellation(
+        self,
+        arguments: dict[str, Any],
+        cancellation: CancellationToken | None,
+    ) -> ToolResult:
+        """执行受控命令，并允许运行时取消信号终止整个进程树。"""
+
         if self.context.read_only:
             return ToolResult(False, "只读模式禁止执行命令")
         command = self._required_str(arguments, "command")
@@ -97,7 +124,10 @@ class RunCommandTool(ToolHandler):
                 env=subprocess_env,
                 timeout=self.context.timeout,
                 max_output_bytes=self.context.max_output_chars,
+                cancellation=cancellation,
             )
+        except CancellationError:
+            raise
         except OSError:
             return ToolResult(False, "命令进程无法安全启动")
         if completed.cleanup_failed:

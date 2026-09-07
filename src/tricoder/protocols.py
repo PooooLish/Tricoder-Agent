@@ -30,6 +30,7 @@ LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Mark
 可用工具：
 - list_files: {"path":"相对目录"}
 - read_file: {"path":"相对文件"}
+- read_tool_result: {"reference":"spill 引用","offset":0}
 - search_text: {"path":"相对目录","query":"文本","use_regex":false}
 - glob_files: {"path":"相对目录","pattern":"相对glob模式"}
 - edit_file: {"path":"相对文件","old_text":"精确旧文本","new_text":"新文本"}

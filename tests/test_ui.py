@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
+from tricoder.core.events import TextDelta
 from tricoder.models import AppConfig, ProviderConfig, RunResult, TokenUsage, ToolAction, ToolResult
 from tricoder.models import SessionRecord
 from tricoder.ui import TerminalUI
@@ -29,6 +30,16 @@ def recording_ui(*, answers: list[str] | None = None) -> tuple[TerminalUI, Conso
 
 
 class TerminalUITests(unittest.TestCase):
+    def test_streaming_text_is_rendered_literally(self) -> None:
+        """Provider 增量不得被 Rich 当成 markup，也不能在 chunk 间插入换行。"""
+        ui, console = recording_ui()
+
+        ui(TextDelta("[bold red]hel"))
+        ui(TextDelta("lo[/bold red]"))
+        ui.finish_stream()
+
+        self.assertIn("[bold red]hello[/bold red]", console.export_text())
+
     def test_provider_usage_renders_each_round_cache_metrics(self) -> None:
         """缺少每轮缓存用量展示时，用户无法判断本轮缓存命中情况。"""
         ui, console = recording_ui()
@@ -298,6 +309,36 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("通过", text)
         self.assertIn("example.jsonl", text)
         self.assertNotIn("secret", text)
+
+    def test_doctor_key_mask_is_cp936_encodable_without_exposing_key(self) -> None:
+        """Windows CP936 控制台也必须能输出 doctor 的非明文 Key 状态。"""
+
+        buffer = io.BytesIO()
+        output = io.TextIOWrapper(buffer, encoding="cp936", errors="strict")
+        console = Console(
+            file=output,
+            width=100,
+            force_terminal=False,
+            color_system=None,
+            no_color=True,
+        )
+        ui = TerminalUI(console=console)
+        config = AppConfig(
+            Path("D:/demo"),
+            ProviderConfig(
+                "openai",
+                "CP936-KEY-SENTINEL",
+                "https://example.test/v1",
+                "model-test",
+            ),
+        )
+
+        ui.show_doctor(config, "OPENAI_API_KEY")
+        output.flush()
+        text = buffer.getvalue().decode("cp936")
+
+        self.assertIn("********", text)
+        self.assertNotIn("CP936-KEY-SENTINEL", text)
 
     def test_doctor_redacts_base_url_credentials_query_and_fragment(self) -> None:
         """防止自定义 Base URL 把 userinfo、查询凭据或片段写入诊断输出。"""

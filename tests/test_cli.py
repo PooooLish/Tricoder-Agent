@@ -1,23 +1,40 @@
+import asyncio
 import io
 import inspect
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import tricoder.cli as cli_module
 from tricoder.audit import AuditLogger
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.cli import ConsoleApprover, build_parser, main
+from tricoder.core.cancellation import CancellationToken
+from tricoder.mcp.sdk import MCPDependencyError
+from tricoder.mcp.manager import MCPManager
+from tricoder.mcp.models import MCPCallResult, MCPToolSpec
+from tricoder.mcp.runtime import run_mcp_task_sync
 from tricoder.models import (
+    AppConfig,
+    ExtensionsConfig,
+    MCPConfig,
+    MCPServerConfig,
     Message,
     ProviderConfig,
     ProviderResponse,
     ToolCall,
     ToolDefinition,
+    RunResult,
+    SessionContext,
+    SessionTurnResult,
 )
+from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ProviderError, ProviderProtocolError, create_provider
 from tricoder.sessions import SessionError, SessionStore
+from tricoder.tools import ToolContext, ToolRegistry
 
 
 def _planning_response(
@@ -144,7 +161,284 @@ class ProviderFailingProvider:
         raise ProviderError("PROVIDER-ERROR-SECRET-SENTINEL")
 
 
+class _OneShotAgent:
+    """同时暴露同步与异步入口，记录 CLI 实际选择的路径。"""
+
+    def __init__(self, *, interrupt: bool = False, cancel_async: bool = False) -> None:
+        self.interrupt = interrupt
+        self.cancel_async = cancel_async
+        self.sync_calls = 0
+        self.async_calls = 0
+
+    def run(self, _task, **_kwargs):  # type: ignore[no-untyped-def]
+        self.sync_calls += 1
+        return RunResult(True, "sync", 1)
+
+    async def run_with_context_async(
+        self,
+        _task: str,
+        context: SessionContext,
+        **_kwargs,  # type: ignore[no-untyped-def]
+    ) -> SessionTurnResult:
+        self.async_calls += 1
+        if self.cancel_async:
+            # asyncio.Runner 首次 SIGINT 的核心行为是取消主 task；在测试中
+            # 直接复现该状态迁移，不发送真实进程信号。
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            await asyncio.sleep(0)
+        if self.interrupt:
+            raise KeyboardInterrupt
+        return SessionTurnResult(RunResult(True, "async", 1), context)
+
+
+class _OneShotManager:
+    def __init__(self, events, token):  # type: ignore[no-untyped-def]
+        self.events = events
+        self.token = token
+
+    async def start_all(self, _cancellation):  # type: ignore[no-untyped-def]
+        self.events.append("start")
+
+    def register_tools(self, _registry):  # type: ignore[no-untyped-def]
+        self.events.append("register")
+        return 0
+
+    def unregister_tools(self, _registry):  # type: ignore[no-untyped-def]
+        return 0
+
+    async def stop_all(self) -> None:
+        self.events.append(f"stop:cancelled={self.token.is_cancelled}")
+
+
 class CliTests(unittest.TestCase):
+    def _mcp_config(self, workspace: Path, *, enabled: bool = True) -> AppConfig:
+        return AppConfig(
+            workspace=workspace,
+            provider=ProviderConfig("openai", "test-key", "https://example.test", "test"),
+            audit_dir=workspace / "audit",
+            extensions=ExtensionsConfig(enabled=enabled),
+            mcp=MCPConfig(
+                enabled=enabled,
+                servers=(MCPServerConfig("docs", "stdio", "python", enabled=enabled),),
+            ),
+        )
+
+    def _registry(self, workspace: Path) -> ToolRegistry:
+        return ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(workspace),
+                CommandPolicy(),
+                lambda _action, _detail: False,
+            )
+        )
+
+    def test_one_shot_helper_uses_mcp_scope_only_when_effectively_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            registry = self._registry(workspace)
+            token = CancellationToken()
+            enabled_agent = _OneShotAgent()
+            events: list[str] = []
+
+            enabled_result = cli_module._run_once_with_config(
+                self._mcp_config(workspace),
+                enabled_agent,
+                registry,
+                "enabled",
+                source_env={},
+                audit=None,
+                cancellation=token,
+                event_sink=None,
+                mcp_manager_factory=lambda *_args: _OneShotManager(events, token),
+            )
+            disabled_agent = _OneShotAgent()
+            disabled_result = cli_module._run_once_with_config(
+                self._mcp_config(workspace, enabled=False),
+                disabled_agent,
+                registry,
+                "disabled",
+                source_env={},
+                audit=None,
+                cancellation=CancellationToken(),
+                event_sink=None,
+                mcp_manager_factory=lambda *_args: self.fail("disabled 构造了 manager"),
+            )
+
+        self.assertEqual("async", enabled_result.summary)
+        self.assertEqual(["start", "register", "stop:cancelled=False"], events)
+        self.assertEqual((0, 1), (enabled_agent.sync_calls, enabled_agent.async_calls))
+        self.assertEqual("sync", disabled_result.summary)
+        self.assertEqual((1, 0), (disabled_agent.sync_calls, disabled_agent.async_calls))
+
+    def test_one_shot_keyboard_interrupt_cancels_before_scope_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            token = CancellationToken()
+            events: list[str] = []
+
+            with self.assertRaises(KeyboardInterrupt):
+                cli_module._run_once_with_config(
+                    self._mcp_config(workspace),
+                    _OneShotAgent(interrupt=True),
+                    self._registry(workspace),
+                    "interrupt",
+                    source_env={},
+                    audit=None,
+                    cancellation=token,
+                    event_sink=None,
+                    mcp_manager_factory=lambda *_args: _OneShotManager(events, token),
+                )
+
+        self.assertTrue(token.is_cancelled)
+        self.assertEqual(["start", "register", "stop:cancelled=True"], events)
+
+    def test_one_shot_runner_cancellation_sets_token_before_scope_cleanup(self) -> None:
+        """模拟 asyncio Runner 的 SIGINT 首阶段：operation 先收到 CancelledError。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            token = CancellationToken()
+            events: list[str] = []
+
+            with self.assertRaises(asyncio.CancelledError):
+                cli_module._run_once_with_config(
+                    self._mcp_config(workspace),
+                    _OneShotAgent(cancel_async=True),
+                    self._registry(workspace),
+                    "runner-cancel",
+                    source_env={},
+                    audit=None,
+                    cancellation=token,
+                    event_sink=None,
+                    mcp_manager_factory=lambda *_args: _OneShotManager(events, token),
+                )
+
+        self.assertTrue(token.is_cancelled)
+        self.assertEqual(["start", "register", "stop:cancelled=True"], events)
+
+    def test_one_shot_missing_sdk_returns_fixed_exit_two_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            output = io.StringIO()
+            config = self._mcp_config(workspace.resolve())
+            config.audit_dir.mkdir(parents=True)
+
+            with patch("tricoder.cli.load_config", return_value=config), patch(
+                "tricoder.cli._run_once_with_config",
+                side_effect=MCPDependencyError("PRIVATE-SDK-DETAIL"),
+            ):
+                exit_code = main(
+                    ["run", "task", "--workspace", str(workspace), "--no-color"],
+                    environ={"OPENAI_API_KEY": "test-key"},
+                    provider_factory=lambda _config, _timeout: FinishingProvider(),
+                    output=output,
+                )
+
+        text = output.getvalue()
+        self.assertEqual(2, exit_code)
+        self.assertIn(cli_module.MCP_SDK_MISSING_GUIDANCE, text)
+        self.assertNotIn("PRIVATE-SDK-DETAIL", text)
+
+    def test_one_shot_keyboard_interrupt_returns_130_after_scope_returns(self) -> None:
+        """scope 完成取消与清理后，顶层 CLI 保持脚本可识别的 130。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            output = io.StringIO()
+            config = self._mcp_config(workspace)
+            config.audit_dir.mkdir(parents=True)
+
+            with patch("tricoder.cli.load_config", return_value=config), patch(
+                "tricoder.cli._run_once_with_config",
+                side_effect=KeyboardInterrupt,
+            ):
+                exit_code = main(
+                    ["run", "task", "--workspace", str(workspace), "--no-color"],
+                    environ={"OPENAI_API_KEY": "test-key"},
+                    provider_factory=lambda _config, _timeout: FinishingProvider(),
+                    output=output,
+                )
+
+        self.assertEqual(130, exit_code)
+        self.assertIn("任务已取消", output.getvalue())
+
+    def test_real_one_shot_assembly_spills_mcp_result_and_cleans_task_store(self) -> None:
+        """真实 main/Agent/manager 装配必须提供有界正文与本任务可回读引用。"""
+        payload = "X" * 200_000
+        histories = []
+        captured_registries = []
+
+        class Client:
+            async def start(self, cancellation):
+                pass
+
+            async def list_tools(self, cancellation):
+                return (MCPToolSpec(
+                    "docs", "large", "mcp__docs__large", "controlled large output",
+                    {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                ),)
+
+            async def call_tool(self, name, arguments, cancellation):
+                return MCPCallResult(True, payload)
+
+            async def stop(self):
+                pass
+
+        class Provider:
+            def complete(self, messages, tools=()):
+                planning = _planning_response(messages, tools)
+                if planning is not None:
+                    return planning
+                histories.append(list(messages))
+                if len(histories) == 1:
+                    call = ToolCall("large-result", "mcp__docs__large", {})
+                elif len(histories) == 2:
+                    reference = re.search(r"spill_[0-9a-f]{32}", messages[-1].content)
+                    call = (
+                        ToolCall("read-middle", "read_tool_result", {"reference": reference[0], "offset": 100_000})
+                        if reference else ToolCall("finish", "finish", {"summary": "missing spill"})
+                    )
+                else:
+                    call = ToolCall("finish", "finish", {"summary": "complete"})
+                return ProviderResponse(tool_calls=(call,), finish_reason="tool_calls")
+
+        def task_scope(*args, **kwargs):
+            return run_mcp_task_sync(*args, **kwargs, manager_factory=lambda *manager_args: MCPManager(
+                *manager_args, client_factory=lambda *_args: Client(),
+            ))
+
+        def registry_factory(context):
+            registry = ToolRegistry(context)
+            captured_registries.append(registry)
+            return registry
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            workspace.mkdir()
+            config = self._mcp_config(workspace)
+            with (
+                patch("tricoder.cli.load_config", return_value=config),
+                patch("tricoder.cli.ToolRegistry", side_effect=registry_factory),
+                patch("tricoder.mcp.runtime.run_mcp_task_sync", side_effect=task_scope),
+            ):
+                exit_code = main(
+                    ["run", "large result", "--workspace", str(workspace), "--no-color"],
+                    environ={}, provider_factory=lambda *_args: Provider(),
+                    input_fn=lambda _prompt: "yes", output=io.StringIO(),
+                )
+            self.assertEqual(0, exit_code)
+            tool_message = next(message for message in histories[1] if message.role == "tool")
+            tool_output = json.loads(tool_message.content)["tool_result"]["output"]
+            self.assertLessEqual(len(tool_output), 20_000)
+            self.assertRegex(tool_message.content, r"spill_[0-9a-f]{32}")
+            self.assertEqual("X" * 20_000, json.loads(histories[2][-1].content)["tool_result"]["output"])
+            store = captured_registries[0].context.spill_store
+            self.assertIsNotNone(store)
+            self.assertEqual([], list(store.session_dir.iterdir()))
+            audit_text = "".join(path.read_text(encoding="utf-8") for path in config.audit_dir.glob("*.jsonl"))
+            self.assertNotIn("X" * 100, audit_text)
+            self.assertNotIn(str(store.session_dir), tool_message.content)
+
     def test_one_shot_run_uses_shared_provider_factory_by_default(self) -> None:
         """防止 CLI 一次性运行保留独立工厂并绕过 Provider 注册表。"""
         default_factory = inspect.signature(main).parameters["provider_factory"].default
@@ -291,6 +585,39 @@ class CliTests(unittest.TestCase):
             self.assertIn("已设置", text)
             self.assertIn("native", text)
             self.assertNotIn("super-secret-value", text)
+
+    def test_doctor_lists_extensions_without_exposing_credential_values(self) -> None:
+        """doctor 只显示扩展安全元数据和凭据存在性，不创建扩展或回显值。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[extensions]\nenabled = true\n'
+                '[mcp]\nenabled = true\n'
+                '[[mcp.servers]]\nid = "docs"\ntransport = "stdio"\n'
+                'command = "python"\nenabled = true\n'
+                'credential_env = ["DOCS_MCP_TOKEN"]\n',
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            secret = "DOCTOR-MCP-SECRET-SENTINEL"
+
+            exit_code = main(
+                ["doctor", "--provider", "openai", "--workspace", directory, "--no-color"],
+                environ={
+                    "OPENAI_API_KEY": "test-key",
+                    "DOCS_MCP_TOKEN": secret,
+                    "TRICODER_EXTENSION_ENV_ALLOWLIST": "DOCS_MCP_TOKEN",
+                },
+                output=output,
+            )
+
+            text = output.getvalue()
+            self.assertEqual(0, exit_code)
+            self.assertIn("docs", text)
+            self.assertIn("mcp", text)
+            self.assertIn("project", text)
+            self.assertIn("已设置", text)
+            self.assertNotIn(secret, text)
 
     def test_doctor_reports_explicit_legacy_protocol_without_exposing_key(self) -> None:
         """防止 doctor 隐藏显式回滚状态，或在诊断输出中泄露凭据。"""

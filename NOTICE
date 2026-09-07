@@ -1,0 +1,24 @@
+TriCoder CLI
+Copyright (c) 2026 PooooLish
+Licensed under the MIT License. See LICENSE.
+
+Hcode capability migration reference
+------------------------------------
+
+Repository: git@github.com:PooooLish/Hcode.git
+Reviewed baseline: d77927f7f2079b103c8077d321f0b24077c75800
+License: MIT License
+Copyright: Copyright (c) 2026 PooooLish
+
+Phase 0 used Hcode only as a read-only source of architecture, algorithms,
+and test scenarios.
+
+Phase 3 adapted the usage-anchor and conservative-estimation design from
+`hcode/conversation.py` and `hcode/context/manager.py` into
+`src/tricoder/context/manager.py`. The TriCoder message grouping and
+`src/tricoder/context/spill.py` security/lifecycle implementation were
+independently rewritten for TriCoder; no Hcode source text was copied.
+
+If a later phase copies or substantially adapts Hcode implementation code,
+this notice must be updated with the affected TriCoder and Hcode file paths,
+and the Hcode copyright and MIT permission notice must be retained.

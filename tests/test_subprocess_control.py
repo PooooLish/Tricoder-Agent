@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
+from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.subprocess_control import run_bounded_process
 
 
@@ -19,6 +21,39 @@ class BoundedProcessTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_cancellation_terminates_running_process_before_side_effect(self) -> None:
+        """取消命令时必须终止受管进程树，并以主动取消而非超时结束。"""
+        marker = self.root / "cancelled-process-survived.txt"
+        script = self.root / "cancellable.py"
+        script.write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "time.sleep(1.0)\n"
+            f"Path({str(marker)!r}).write_text('alive')\n",
+            encoding="utf-8",
+        )
+        token = CancellationToken()
+        timer = threading.Timer(0.15, token.cancel)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(CancellationError):
+                run_bounded_process(
+                    [sys.executable, str(script)],
+                    cwd=self.root,
+                    env=dict(os.environ),
+                    timeout=5,
+                    max_output_bytes=4096,
+                    cancellation=token,
+                )
+        finally:
+            timer.cancel()
+        elapsed = time.monotonic() - started
+        time.sleep(1.1)
+
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(marker.exists())
 
     def test_normal_parent_exit_cleans_delayed_descendant(self) -> None:
         """A zero-exit session leader must not orphan a delayed child."""

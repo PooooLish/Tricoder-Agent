@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
-from tricoder.models import AppConfig, ProviderConfig
+from tricoder.models import (
+    AgentsConfig,
+    AppConfig,
+    ExtensionsConfig,
+    HooksConfig,
+    MCPConfig,
+    MCPServerConfig,
+    ProviderConfig,
+    SkillsConfig,
+    WorktreeConfig,
+)
 
 try:
     import tomllib
@@ -146,6 +156,16 @@ def _read_project_config(path: Path) -> dict[str, object]:
 
 
 _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_EXTENSION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_COMMAND_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SENSITIVE_CONFIG_KEY_PATTERN = re.compile(
+    r"(?:api[_-]?key|token|password|secret|authorization|credential)",
+    re.IGNORECASE,
+)
+_SENSITIVE_ARGUMENT_PATTERN = re.compile(
+    r"^--?(?:api[-_]?key|token|password|secret|authorization)(?:=|$)",
+    re.IGNORECASE,
+)
 
 
 def _read_local_env(path: Path) -> dict[str, str]:
@@ -249,6 +269,212 @@ def _positive_float(value: object, name: str) -> float:
     if parsed <= 0:
         raise ConfigError(f"{name} 必须是正数")
     return parsed
+
+
+def _strict_table(
+    project: dict[str, object],
+    name: str,
+    allowed: frozenset[str],
+) -> dict[str, object]:
+    """返回严格表：敏感字段优先拒绝，其余未知字段也不静默忽略。"""
+
+    value = project.get(name, {})
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} 配置必须是表")
+    _reject_sensitive_fields(value, name)
+    extras = set(value) - allowed
+    if extras:
+        raise ConfigError(f"{name} 包含未知字段：{sorted(extras)[0]}")
+    return value
+
+
+def _reject_sensitive_fields(table: Mapping[str, object], context: str) -> None:
+    """配置中只允许 credential_env 这类引用字段，不接受任何明文凭据键。"""
+
+    for key in table:
+        if key == "credential_env":
+            continue
+        if _SENSITIVE_CONFIG_KEY_PATTERN.search(str(key)):
+            raise ConfigError(f"{context} 不允许明文凭据字段")
+
+
+def _strict_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} 必须是布尔值")
+    return value
+
+
+def _safe_project_directory(value: object, workspace: Path) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("skills.project_dir 必须是非空相对路径")
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ConfigError("skills.project_dir 必须位于工作区内")
+    try:
+        resolved = (workspace / candidate).resolve()
+    except OSError as exc:
+        raise ConfigError("skills.project_dir 无法安全解析") from exc
+    if not resolved.is_relative_to(workspace):
+        raise ConfigError("skills.project_dir 必须位于工作区内")
+    normalized = candidate.as_posix().strip("/")
+    if normalized in {"", "."}:
+        raise ConfigError("skills.project_dir 不能是工作区根目录")
+    return normalized
+
+
+def _string_list(value: object, name: str, *, maximum: int) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise ConfigError(f"{name} 必须是长度不超过 {maximum} 的字符串数组")
+    if not all(isinstance(item, str) and item and len(item) <= 512 for item in value):
+        raise ConfigError(f"{name} 必须是非空字符串数组")
+    return tuple(value)
+
+
+def _extension_env_allowlist(process_env: Mapping[str, str]) -> frozenset[str]:
+    """只接受可信进程环境中的逐项授权；工作区 .env.local 不能授予权限。"""
+
+    raw = process_env.get("TRICODER_EXTENSION_ENV_ALLOWLIST", "")
+    if not raw.strip():
+        return frozenset()
+    names = tuple(part.strip() for part in raw.split(","))
+    if (
+        any(not name or not _ENV_NAME_PATTERN.fullmatch(name) for name in names)
+        or len(names) > 32
+        or len(set(names)) != len(names)
+    ):
+        raise ConfigError(
+            "TRICODER_EXTENSION_ENV_ALLOWLIST 必须是无重复的环境变量名列表"
+        )
+    return frozenset(names)
+
+
+def _parse_extension_config(
+    project: dict[str, object],
+    workspace: Path,
+    env: Mapping[str, str],
+    process_env: Mapping[str, str],
+) -> tuple[
+    ExtensionsConfig,
+    MCPConfig,
+    SkillsConfig,
+    HooksConfig,
+    WorktreeConfig,
+    AgentsConfig,
+]:
+    """严格解析未来扩展声明，但不启动或导入任何真实扩展。"""
+
+    extensions_table = _strict_table(project, "extensions", frozenset({"enabled"}))
+    extensions = ExtensionsConfig(
+        _strict_bool(extensions_table.get("enabled", False), "extensions.enabled")
+    )
+
+    mcp_table = _strict_table(project, "mcp", frozenset({"enabled", "servers"}))
+    mcp_enabled = _strict_bool(mcp_table.get("enabled", False), "mcp.enabled")
+    authorized_env = _extension_env_allowlist(process_env)
+    raw_servers = mcp_table.get("servers", [])
+    if not isinstance(raw_servers, list) or len(raw_servers) > 32:
+        raise ConfigError("mcp.servers 必须是长度不超过 32 的表数组")
+    servers: list[MCPServerConfig] = []
+    ids: set[str] = set()
+    for index, raw_server in enumerate(raw_servers):
+        context = f"mcp.servers[{index}]"
+        if not isinstance(raw_server, dict):
+            raise ConfigError(f"{context} 必须是表")
+        _reject_sensitive_fields(raw_server, context)
+        allowed = {
+            "id",
+            "transport",
+            "command",
+            "args",
+            "enabled",
+            "credential_env",
+        }
+        extras = set(raw_server) - allowed
+        if extras:
+            raise ConfigError(f"{context} 包含未知字段：{sorted(extras)[0]}")
+        extension_id = raw_server.get("id")
+        if not isinstance(extension_id, str) or not _EXTENSION_ID_PATTERN.fullmatch(
+            extension_id
+        ):
+            raise ConfigError(f"{context}.id 必须是规范化标识")
+        if extension_id in ids:
+            raise ConfigError(f"mcp.servers 包含重复 id：{extension_id}")
+        ids.add(extension_id)
+        transport = raw_server.get("transport")
+        if transport != "stdio":
+            raise ConfigError(f"{context}.transport 目前只支持 stdio")
+        command = raw_server.get("command")
+        if not isinstance(command, str) or not _COMMAND_NAME_PATTERN.fullmatch(command):
+            raise ConfigError(f"{context}.command 只能是纯可执行文件名")
+        args = _string_list(raw_server.get("args", []), f"{context}.args", maximum=64)
+        if any(_SENSITIVE_ARGUMENT_PATTERN.match(argument) for argument in args):
+            raise ConfigError(f"{context}.args 不允许携带明文凭据参数")
+        credential_env = _string_list(
+            raw_server.get("credential_env", []),
+            f"{context}.credential_env",
+            maximum=16,
+        )
+        if len(set(credential_env)) != len(credential_env) or not all(
+            _ENV_NAME_PATTERN.fullmatch(name) for name in credential_env
+        ):
+            raise ConfigError(f"{context}.credential_env 包含重复或非法变量名")
+        credentials_authorized = all(name in authorized_env for name in credential_env)
+        servers.append(
+            MCPServerConfig(
+                id=extension_id,
+                transport="stdio",
+                command=command,
+                args=args,
+                enabled=_strict_bool(
+                    raw_server.get("enabled", False),
+                    f"{context}.enabled",
+                ),
+                credential_env=credential_env,
+                credentials_authorized=credentials_authorized,
+                credentials_present=credentials_authorized
+                and all(bool(env.get(name, "").strip()) for name in credential_env),
+            )
+        )
+    mcp = MCPConfig(mcp_enabled, tuple(servers))
+
+    skills_table = _strict_table(
+        project,
+        "skills",
+        frozenset({"enabled", "project_dir"}),
+    )
+    skills = SkillsConfig(
+        enabled=_strict_bool(skills_table.get("enabled", False), "skills.enabled"),
+        project_dir=_safe_project_directory(
+            skills_table.get("project_dir", ".tricoder/skills"),
+            workspace,
+        ),
+    )
+    hooks_table = _strict_table(project, "hooks", frozenset({"enabled"}))
+    hooks = HooksConfig(
+        _strict_bool(hooks_table.get("enabled", False), "hooks.enabled")
+    )
+    worktree_table = _strict_table(project, "worktree", frozenset({"enabled"}))
+    worktree = WorktreeConfig(
+        _strict_bool(worktree_table.get("enabled", False), "worktree.enabled")
+    )
+    agents_table = _strict_table(
+        project,
+        "agents",
+        frozenset({"enabled", "max_depth", "max_concurrency", "default_read_only"}),
+    )
+    agents = AgentsConfig(
+        enabled=_strict_bool(agents_table.get("enabled", False), "agents.enabled"),
+        max_depth=_positive_int(agents_table.get("max_depth", 1), "agents.max_depth"),
+        max_concurrency=_positive_int(
+            agents_table.get("max_concurrency", 1),
+            "agents.max_concurrency",
+        ),
+        default_read_only=_strict_bool(
+            agents_table.get("default_read_only", True),
+            "agents.default_read_only",
+        ),
+    )
+    return extensions, mcp, skills, hooks, worktree, agents
 
 
 def load_config(
@@ -389,6 +615,13 @@ def load_config(
     ):
         raise ConfigError("tool_protocol 只能是 native 或 legacy_json")
 
+    extensions, mcp, skills, hooks, worktree, agents = _parse_extension_config(
+        project,
+        resolved_workspace,
+        env,
+        process_env,
+    )
+
     return AppConfig(
         workspace=resolved_workspace,
         provider=ProviderConfig(
@@ -406,4 +639,10 @@ def load_config(
         audit_dir=resolved_audit_dir,
         tool_protocol=tool_protocol_value,
         plan_enabled=plan_value,
+        extensions=extensions,
+        mcp=mcp,
+        skills=skills,
+        hooks=hooks,
+        worktree=worktree,
+        agents=agents,
     )

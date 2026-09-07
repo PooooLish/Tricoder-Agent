@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -117,6 +118,43 @@ WEATHER_TOOL = ToolDefinition(
 
 
 class ProviderTests(unittest.TestCase):
+    def test_urllib_stream_uses_incremental_read1_and_closes_response(self) -> None:
+        """小型 SSE chunk 不应等待 read(size) 填满后才交付给 Agent。"""
+
+        class Response:
+            def __init__(self) -> None:
+                self.chunks = [b"one", b"two", b""]
+                self.closed = False
+
+            def read(self, _size: int) -> bytes:
+                raise AssertionError("流式传输不应使用可能等待填满的 read(size)")
+
+            def read1(self, _size: int) -> bytes:
+                return self.chunks.pop(0)
+
+            def close(self) -> None:
+                self.closed = True
+
+        response = Response()
+
+        async def collect() -> list[bytes]:
+            transport = UrllibTransport()
+            return [
+                chunk
+                async for chunk in transport.post_stream(
+                    "https://example.test/v1/chat/completions",
+                    {},
+                    {},
+                    1,
+                )
+            ]
+
+        with patch("tricoder.providers.urllib.request.urlopen", return_value=response):
+            chunks = asyncio.run(collect())
+
+        self.assertEqual([b"one", b"two"], chunks)
+        self.assertTrue(response.closed)
+
     def test_normalizes_usage_for_each_provider_dialect(self) -> None:
         cases = {
             "openai": (

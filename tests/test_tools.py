@@ -18,7 +18,10 @@ from tricoder.changes import (
     TaskChangeSet,
     render_change_set_diff,
 )
-from tricoder.models import ToolDefinition
+from tricoder.core.cancellation import CancellationToken
+from tricoder.extensions import ToolOrigin
+from tricoder.mcp.schema import validate_mcp_schema
+from tricoder.models import ToolDefinition, ToolResult
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
 from tricoder.tools import binding as binding_module
@@ -527,6 +530,34 @@ class ToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_unregister_requires_exact_handler_identity(self) -> None:
+        """同名冒充对象不得删除已注册 handler，避免 scope 清理误伤。"""
+        class DynamicHandler(ToolHandler):
+            name = "dynamic_identity_probe"
+            description = "identity probe"
+            parameters = {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            }
+
+            def run(self, _arguments):  # type: ignore[no-untyped-def]
+                return ToolResult(True, "original")
+
+        original = DynamicHandler(self.registry.context)
+        impostor = DynamicHandler(self.registry.context)
+        self.registry.register(
+            original,
+            origin=ToolOrigin("mcp", "docs", "dangerous"),
+        )
+
+        self.assertFalse(self.registry.unregister(impostor))
+        self.assertTrue(self.registry.contains(original.name))
+        self.assertTrue(self.registry.unregister(original))
+        self.assertFalse(self.registry.contains(original.name))
+        self.assertFalse(self.registry.unregister(original))
+
     def test_definitions_are_stable_read_only_and_match_handler_names(self) -> None:
         """防止公开工具契约与实际可调用工具分叉或被调用方改写。"""
         definitions = self.registry.definitions
@@ -595,6 +626,10 @@ class ToolTests(unittest.TestCase):
 
         for definition in self.registry.definitions:
             with self.subTest(tool=definition.name):
+                self.assertEqual(
+                    definition.parameters,
+                    validate_mcp_schema(definition.parameters),
+                )
                 self.assertEqual("object", definition.parameters["type"])
                 self.assertEqual(expected[definition.name][0], definition.parameters["properties"])
                 self.assertEqual(expected[definition.name][1], definition.parameters["required"])
@@ -2920,6 +2955,43 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("超过 0.2 秒", result.output)
         self.assertFalse((self.workspace / "child-alive.txt").exists())
+
+
+class NativeAsyncCommandToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_command_async_passes_cancellation_to_native_execution(self) -> None:
+        """命令工具的异步入口必须把同一取消令牌传给受控进程执行器。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            registry = ToolRegistry(
+                ToolContext(
+                    WorkspacePolicy(workspace),
+                    CommandPolicy(workspace),
+                    approver=lambda _action, _detail: True,
+                )
+            )
+            handler = registry._handlers["run_command"]
+            cancellation = CancellationToken()
+            received: list[CancellationToken | None] = []
+
+            def run_with_cancellation(
+                _arguments: dict[str, object],
+                token: CancellationToken | None,
+            ) -> ToolResult:
+                received.append(token)
+                return ToolResult(True, "ok")
+
+            with patch.object(
+                handler,
+                "run_with_cancellation",
+                side_effect=run_with_cancellation,
+            ):
+                result = await handler.run_async(
+                    {"command": "python -m unittest"},
+                    cancellation=cancellation,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual([cancellation], received)
 
 
 if __name__ == "__main__":

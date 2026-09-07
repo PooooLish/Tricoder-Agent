@@ -1,10 +1,13 @@
+import asyncio
 import inspect
 import json
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest import mock
 
 from tricoder.audit import AuditLogger
 from tricoder.changes import (
@@ -14,7 +17,22 @@ from tricoder.changes import (
     UndoExecution,
 )
 from tricoder.config import ConfigError
-from tricoder.models import AppConfig, Message, ProviderConfig, RunResult, SessionContext, SessionMemory, SessionTurnResult
+from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.context.spill import ToolResultSpillStore
+from tricoder.extensions import ToolOrigin
+from tricoder.models import (
+    AppConfig,
+    ExtensionsConfig,
+    MCPConfig,
+    MCPServerConfig,
+    Message,
+    ProviderConfig,
+    RunResult,
+    SessionContext,
+    SessionMemory,
+    SessionTurnResult,
+    ToolResult,
+)
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import create_provider
 from tricoder.session_runtime import (
@@ -25,6 +43,7 @@ from tricoder.session_runtime import (
 )
 from tricoder.sessions import SessionStore
 from tricoder.tools import ToolContext, ToolRegistry
+from tricoder.tools.handlers import ToolHandler
 
 
 class FakeAgent:
@@ -51,6 +70,29 @@ class FakeAgent:
                 verification="通过",
             ),
         )
+
+
+class BlockingCancellableAgent:
+    """等待 Runtime 传入的取消令牌，验证跨线程取消通路。"""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def run_with_context(
+        self,
+        task: str,
+        context: SessionContext,
+        *,
+        cancellation=None,  # type: ignore[no-untyped-def]
+    ) -> SessionTurnResult:
+        if cancellation is None:
+            raise AssertionError("Runtime 未传递取消令牌")
+        self.started.set()
+        if not cancellation.wait(timeout=2):
+            raise TimeoutError("测试未收到取消信号")
+        self.cancelled.set()
+        return SessionTurnResult(RunResult(False, "任务已取消", 0), context)
 
 
 @dataclass
@@ -214,6 +256,128 @@ class ExplodingJournalAgent:
         after = FileSnapshot("src/error.py", "after\n", 0o644, FileIdentity(1, 2))
         self.journal.record_committed("src/error.py", before, after)
         raise self.error
+
+
+class _MCPProbeHandler(ToolHandler):
+    """用于确认临时注册表确实包含 MCP 工具。"""
+
+    name = "mcp__docs__echo"
+    description = "fake MCP echo"
+    parameters = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+    def run(self, _arguments):  # type: ignore[no-untyped-def]
+        return ToolResult(False, "仅测试异步边界")
+
+
+class _TaskManager:
+    """每个任务一实例的 fake manager；不创建 SDK、网络或进程。"""
+
+    def __init__(self, owner, config, context, source_env, audit):  # type: ignore[no-untyped-def]
+        self.owner = owner
+        self.config = config
+        self.context = context
+        self.source_env = source_env
+        self.audit = audit
+        self.stopped = False
+
+    async def start_all(self, _cancellation):  # type: ignore[no-untyped-def]
+        self.owner.manager_events.append(("start", self))
+
+    def register_tools(self, registry: ToolRegistry) -> int:
+        registry.register(
+            _MCPProbeHandler(registry.context),
+            origin=ToolOrigin("mcp", "docs", "dangerous"),
+        )
+        self.owner.manager_events.append(("register", self))
+        return 1
+
+    def unregister_tools(self, registry: ToolRegistry) -> int:
+        handler = registry._handlers.get("mcp__docs__echo")
+        return int(handler is not None and registry.unregister(handler))
+
+    async def stop_all(self) -> None:
+        self.stopped = True
+        self.owner.manager_events.append(("stop", self))
+
+
+class MCPRuntimeFactory:
+    """为 SessionRuntime 构造启用 MCP 的长期会话与任务级 Agent。"""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self.manager_events: list[tuple[str, _TaskManager]] = []
+        self.task_agents: list[object] = []
+        self.audit = mock.sentinel.mcp_audit
+        self.spill = mock.sentinel.spill_store
+
+    def config(self, provider: str = "openai", model: str = "model-a") -> AppConfig:
+        return AppConfig(
+            workspace=self.workspace,
+            provider=ProviderConfig(provider, "test-key", "https://example.test", model),
+            extensions=ExtensionsConfig(enabled=True),
+            mcp=MCPConfig(
+                enabled=True,
+                servers=(MCPServerConfig("docs", "stdio", "python", enabled=True),),
+            ),
+        )
+
+    def active(self, record, memory, _options):  # type: ignore[no-untyped-def]
+        journal = ChangeJournal()
+        context = ToolContext(
+            WorkspacePolicy(record.workspace),
+            CommandPolicy(),
+            lambda _action, _detail: False,
+            change_journal=journal,
+            spill_store=self.spill,  # type: ignore[arg-type]
+        )
+        tools = ToolRegistry(context)
+        return ActiveSession(
+            record,
+            memory,
+            SessionContext(persisted_summary=memory.summary),
+            self.config(record.provider, record.model),
+            FakeAgent(record.provider),
+            tools,
+            journal,
+            self.audit,  # type: ignore[arg-type]
+        )
+
+    def manager(self, config, context, source_env, audit):  # type: ignore[no-untyped-def]
+        return _TaskManager(self, config, context, source_env, audit)
+
+    def agent(self, _provider, tools, **kwargs):  # type: ignore[no-untyped-def]
+        owner = self
+
+        class TaskAgent:
+            def __init__(self) -> None:
+                self.tools = tools
+                self.kwargs = kwargs
+
+            async def run_with_context_async(
+                self,
+                task: str,
+                context: SessionContext,
+                *,
+                cancellation=None,  # type: ignore[no-untyped-def]
+                event_sink=None,  # type: ignore[no-untyped-def]
+            ) -> SessionTurnResult:
+                owner.task_agents.append(self)
+                self.task = task
+                self.context = context
+                self.cancellation = cancellation
+                self.event_sink = event_sink
+                self.definitions = tuple(definition.name for definition in tools.definitions)
+                return SessionTurnResult(
+                    RunResult(True, "MCP task", 1),
+                    context,
+                )
+
+        return TaskAgent()
 @dataclass
 class JournalSessionFactory:
     journals: dict[str, CountingJournal]
@@ -374,6 +538,146 @@ class SessionRuntimeTests(unittest.TestCase):
         ].default
 
         self.assertIs(create_provider, default_factory)
+
+    def test_mcp_tasks_use_fresh_registry_manager_and_agent_without_mutating_session(self) -> None:
+        """两个任务不得复用 MCP 连接或把动态工具写入长期会话。"""
+        factory = MCPRuntimeFactory(self.workspace)
+        source_env = {
+            "TRICODER_EXTENSION_ENV_ALLOWLIST": "DOCS_MCP_TOKEN",
+            "DOCS_MCP_TOKEN": "test-token",
+        }
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ=source_env),
+            active_session_factory=factory.active,
+            provider_factory=lambda _config, _timeout: mock.sentinel.provider,
+            agent_factory=factory.agent,
+            mcp_manager_factory=factory.manager,
+        )
+        original = runtime.current
+        builtin_names = tuple(definition.name for definition in original.tools.definitions)  # type: ignore[union-attr]
+
+        runtime.run_task("first")
+        runtime.run_task("second")
+
+        managers = [manager for event, manager in factory.manager_events if event == "start"]
+        self.assertEqual(2, len(managers))
+        self.assertIsNot(managers[0], managers[1])
+        self.assertTrue(all(manager.stopped for manager in managers))
+        self.assertEqual(2, len(factory.task_agents))
+        self.assertIsNot(factory.task_agents[0], factory.task_agents[1])
+        self.assertIsNot(factory.task_agents[0].tools, factory.task_agents[1].tools)  # type: ignore[attr-defined]
+        self.assertIn("mcp__docs__echo", factory.task_agents[0].definitions)  # type: ignore[attr-defined]
+        self.assertIn("mcp__docs__echo", factory.task_agents[1].definitions)  # type: ignore[attr-defined]
+        self.assertEqual(builtin_names, tuple(definition.name for definition in runtime.current.tools.definitions))  # type: ignore[union-attr]
+        self.assertFalse(runtime.current.tools.contains("mcp__docs__echo"))  # type: ignore[union-attr]
+
+        for manager in managers:
+            self.assertIs(original.tools.context, manager.context)  # type: ignore[union-attr]
+            self.assertIs(original.audit, manager.audit)
+            self.assertEqual(source_env, manager.source_env)
+        for task_agent in factory.task_agents:
+            self.assertIs(original.context, task_agent.context)  # type: ignore[attr-defined]
+            self.assertIs(original.tools.context.change_journal, task_agent.tools.context.change_journal)  # type: ignore[union-attr]
+            self.assertIs(original.tools.context.spill_store, task_agent.tools.context.spill_store)  # type: ignore[union-attr]
+            self.assertIs(original.tools.context.approver, task_agent.tools.context.approver)  # type: ignore[union-attr]
+
+    def test_disabled_mcp_uses_existing_agent_and_never_loads_sdk(self) -> None:
+        """关闭配置必须保持旧调用对象和惰性 SDK 边界。"""
+        original_agent = self.runtime.current.agent
+        with mock.patch(
+            "tricoder.mcp.sdk.load_mcp_sdk",
+            side_effect=AssertionError("disabled path loaded SDK"),
+        ), mock.patch(
+            "tricoder.session_runtime.run_mcp_task_sync",
+            side_effect=AssertionError("disabled path entered MCP scope"),
+            create=True,
+        ):
+            result = self.runtime.run_task("disabled")
+
+        self.assertTrue(result.ok)
+        self.assertIs(original_agent, self.runtime.current.agent)
+        self.assertEqual(["disabled"], original_agent.calls)  # type: ignore[attr-defined]
+
+    def test_mcp_runner_cancel_signals_command_before_cleanup_and_seals_journal(self) -> None:
+        """真实 Runtime/Gateway 的 runner 取消须先通知命令线程，再清理并封存账本。"""
+        factory = MCPRuntimeFactory(self.workspace)
+        events = []
+        original_errors = []
+        worker_started = threading.Event()
+        worker_cancelled = threading.Event()
+        shared_tokens = []
+
+        class Journal(CountingJournal):
+            def seal_task(self, modified_files, verification):
+                events.append(("seal", shared_tokens[0].is_cancelled))
+                return super().seal_task(modified_files, verification)
+
+        journal = Journal()
+
+        class Manager:
+            async def start_all(self, cancellation):
+                shared_tokens.append(cancellation)
+
+            def register_tools(self, registry):
+                return 0
+
+            def unregister_tools(self, registry):
+                events.append(("unregister", shared_tokens[0].is_cancelled))
+                return 0
+
+            async def stop_all(self):
+                events.append(("stop", shared_tokens[0].is_cancelled))
+
+        class Agent:
+            def __init__(self, provider, tools, **kwargs):
+                self.tools = tools
+
+            async def run_with_context_async(self, task, context, *, cancellation, **kwargs):
+                written = await self.tools.execute_async(
+                    "create_file", {"path": "cancelled.txt", "content": "controlled change"},
+                    cancellation=cancellation,
+                )
+                if not written.ok:
+                    raise AssertionError(written.output)
+                command = asyncio.create_task(self.tools.execute_async(
+                    "run_command", {"command": "python -m unittest"}, cancellation=cancellation,
+                ))
+                while not worker_started.is_set():
+                    await asyncio.sleep(0)
+                asyncio.current_task().cancel("runner-cancel")
+                try:
+                    await command
+                except asyncio.CancelledError as exc:
+                    original_errors.append(exc)
+                    raise
+
+        def controlled_process(args, *, cancellation, **kwargs):
+            # 仅替换操作系统进程层，其上的审批、网关和线程桥接均使用真实代码。
+            worker_started.set()
+            if cancellation.wait(timeout=1.0):
+                worker_cancelled.set()
+            raise CancellationError("controlled command stopped")
+
+        runtime = SessionRuntime(
+            self.store, self.workspace, options=RuntimeOptions(environ={}),
+            active_session_factory=factory.active,
+            provider_factory=lambda *_args: object(), agent_factory=Agent,
+            mcp_manager_factory=lambda *_args: Manager(),
+        )
+        runtime.current = replace(runtime.current, journal=journal)
+        runtime.current.tools.context.change_journal = journal
+        runtime.current.tools.context.approver = lambda *_args: True
+        with mock.patch("tricoder.tools.command.run_bounded_process", side_effect=controlled_process):
+            with self.assertRaises(asyncio.CancelledError) as caught:
+                runtime.run_task("cancel running command")
+        self.assertEqual([("unregister", True), ("stop", True), ("seal", True)], events)
+        self.assertTrue(worker_cancelled.is_set())
+        self.assertIs(original_errors[0], caught.exception)
+        self.assertEqual((1, 1), (journal.begun, journal.sealed))
+        self.assertIsNotNone(journal.latest())
+        self.assertFalse(runtime.cancel_current())
 
     def test_failed_write_is_sealed_once_and_no_write_keeps_latest_diff(self) -> None:
         journals: dict[str, CountingJournal] = {}
@@ -1133,6 +1437,51 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(original_files, self.runtime.current.memory.modified_files)
         self.assertTrue(self.runtime.retry_persist())
 
+    def test_default_runtime_binds_spill_to_state_directory_and_clear_cleans_it(self) -> None:
+        """spill 不能落在源码工作区，/clear 必须结束当前会话结果生命周期。"""
+        audit_dir = (self.root / "audit").resolve()
+        stale_store = ToolResultSpillStore(
+            self.store.database_path.parent / "runtime" / "tool-results",
+            self.first.id,
+        )
+        stale_record = stale_store.persist("old-process-call", "stale body")
+
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            provider = kwargs.get("provider") or "openai"
+            model = kwargs.get("model") or "model-a"
+            return AppConfig(
+                workspace=Path(kwargs["workspace"]).resolve(),
+                provider=ProviderConfig(
+                    provider,
+                    "test-key",
+                    "https://example.test",
+                    model,
+                ),
+                audit_dir=audit_dir,
+            )
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            config_loader=config_loader,
+            provider_factory=lambda _config, _timeout: object(),  # type: ignore[arg-type]
+            agent_factory=lambda _provider, _tools, **_kwargs: FakeAgent("openai"),
+        )
+        spill = runtime.current.tools.context.spill_store  # type: ignore[union-attr]
+        self.assertIsNotNone(spill)
+        assert spill is not None
+        self.assertTrue(spill.root.is_relative_to(self.store.database_path.parent))
+        self.assertFalse(spill.root.is_relative_to(self.workspace))
+        with self.assertRaisesRegex(OSError, "引用"):
+            stale_store.preview(stale_record.reference)
+        record = spill.persist("call-a", "temporary body")
+
+        runtime.clear_current()
+
+        with self.assertRaisesRegex(OSError, "引用"):
+            spill.preview(record.reference)
+
     def test_failed_clear_keeps_clear_intent_for_retry(self) -> None:
         """防止清空写入失败后重试错误保存清空前摘要或丢失文件元数据。"""
         wrapped_store = FailingMemoryStore(self.store)
@@ -1160,6 +1509,43 @@ class SessionRuntimeTests(unittest.TestCase):
         persisted = self.store.load_memory(self.first.id)
         self.assertEqual("", persisted.summary)
         self.assertEqual(files, persisted.modified_files)
+
+    def test_failed_clear_still_removes_spilled_tool_results(self) -> None:
+        """即使 SQLite 暂时不可写，/clear 也必须立即销毁临时工具正文。"""
+        wrapped_store = FailingMemoryStore(self.store)
+        audit_dir = (self.root / "audit").resolve()
+
+        def config_loader(**kwargs):  # type: ignore[no-untyped-def]
+            return AppConfig(
+                workspace=Path(kwargs["workspace"]).resolve(),
+                provider=ProviderConfig(
+                    kwargs.get("provider") or "openai",
+                    "test-key",
+                    "https://example.test",
+                    kwargs.get("model") or "model-a",
+                ),
+                audit_dir=audit_dir,
+            )
+
+        runtime = SessionRuntime(
+            wrapped_store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            config_loader=config_loader,
+            provider_factory=lambda _config, _timeout: object(),  # type: ignore[arg-type]
+            agent_factory=lambda _provider, _tools, **_kwargs: FakeAgent("openai"),
+        )
+        spill = runtime.current.tools.context.spill_store  # type: ignore[union-attr]
+        assert spill is not None
+        runtime.run_task("先写入一段可清空的会话摘要")
+        record = spill.persist("call-a", "temporary body")
+        wrapped_store.fail_writes = True
+
+        with self.assertRaises(SessionRuntimeError):
+            runtime.clear_current()
+
+        with self.assertRaisesRegex(OSError, "引用"):
+            spill.preview(record.reference)
 
     def test_model_failure_keeps_original_session_and_metadata(self) -> None:
         """防止缺失 Provider 配置时提前写入会话模型或替换当前 Agent。"""
@@ -1266,6 +1652,37 @@ class SessionRuntimeTests(unittest.TestCase):
         with self.assertRaises(SessionRuntimeError):
             self.runtime.set_permission("admin")
 
+    def test_mcp_server_start_always_uses_human_approval(self) -> None:
+        """MCP server 拥有进程权限，strict/relaxed/fullaccess 均不得自动放行。"""
+        approvals: list[tuple[str, str]] = []
+
+        def reject(action: str, detail: str) -> bool:
+            approvals.append((action, detail))
+            return False
+
+        runtime = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=FakeBuilder(set()),
+            approver=reject,
+        )
+
+        for level in ("strict", "relaxed", "fullaccess"):
+            with self.subTest(level=level):
+                runtime.set_permission(level)
+                self.assertFalse(
+                    runtime._effective_approver(
+                        "dangerous_mcp_server_start",
+                        "server",
+                    )
+                )
+
+        self.assertEqual(3, len(approvals))
+        self.assertTrue(
+            all(action == "dangerous_mcp_server_start" for action, _ in approvals)
+        )
+
     def test_permission_persists_to_session_memory(self) -> None:
         """权限级别随会话记忆持久化并可恢复。"""
         self.assertEqual("strict", self.runtime.permission_level)
@@ -1353,6 +1770,65 @@ class SessionRuntimeTests(unittest.TestCase):
         # 释放后可正常操作
         self.runtime.set_permission("relaxed")
         self.assertEqual("relaxed", self.runtime.permission_level)
+
+    def test_cancel_current_signals_running_task_without_taking_task_lock(self) -> None:
+        """防止 UI 取消被运行任务持有的状态锁阻塞。"""
+        agent = BlockingCancellableAgent()
+        self.runtime.current = replace(self.runtime.current, agent=agent)
+        self.runtime._cache_current()
+        results: list[RunResult] = []
+
+        worker = threading.Thread(target=lambda: results.append(self.runtime.run_task("task")))
+        worker.start()
+        self.assertTrue(agent.started.wait(timeout=2))
+
+        self.assertTrue(self.runtime.cancel_current())
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(agent.cancelled.is_set())
+        self.assertFalse(results[0].ok)
+        self.assertFalse(self.runtime.cancel_current())
+
+    def test_cancel_current_cannot_miss_task_during_token_publication(self) -> None:
+        """任务已声明活动但令牌尚未发布时，取消调用必须等待并命中新任务。"""
+        constructing = threading.Event()
+        allow_construction = threading.Event()
+
+        class SlowToken(CancellationToken):
+            def __init__(self) -> None:
+                constructing.set()
+                if not allow_construction.wait(timeout=2):
+                    raise TimeoutError("测试未允许令牌构造")
+                super().__init__()
+
+        agent = BlockingCancellableAgent()
+        self.runtime.current = replace(self.runtime.current, agent=agent)
+        self.runtime._cache_current()
+        results: list[RunResult] = []
+        cancellation_results: list[bool] = []
+
+        with mock.patch("tricoder.session_runtime.CancellationToken", SlowToken):
+            worker = threading.Thread(
+                target=lambda: results.append(self.runtime.run_task("task"))
+            )
+            worker.start()
+            self.assertTrue(constructing.wait(timeout=2))
+            canceller = threading.Thread(
+                target=lambda: cancellation_results.append(
+                    self.runtime.cancel_current()
+                )
+            )
+            canceller.start()
+            time.sleep(0.05)
+            allow_construction.set()
+            canceller.join(timeout=2)
+            worker.join(timeout=2)
+
+        self.assertFalse(canceller.is_alive())
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([True], cancellation_results)
+        self.assertFalse(results[0].ok)
 
 
 if __name__ == "__main__":

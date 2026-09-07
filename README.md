@@ -7,16 +7,22 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 
 ## 核心亮点
 
-- **统一 Provider 边界**：OpenAI、DeepSeek、GLM 响应统一归一化为内部 `ProviderResponse` 与 `ToolCall`。
+- **统一 Provider 边界**：OpenAI、DeepSeek、GLM 的 OpenAI-compatible SSE 流统一归一化为类型化文本、工具、usage 与完成事件；同步 `complete()` 仍保持兼容。
 - **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
 - **可控本地执行**：读取、检索（`search_text` 支持正则、基础 `.gitignore` 常用语义（尾随 `/` 目录规则按任意层级匹配）与二进制/超大文件跳过，正则长度与单行长度受限以防灾难性回溯；`glob_files` 按相对模式定位文件，pattern 长度、`**` 数量与扫描结果规模均受限）、编辑、创建文件和运行受限命令；`git_diff` 只读展示工作区未提交变更统计；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；`--read-only` 禁止 `edit_file`、`create_file`、`apply_patch` 等写入；写操作与命令执行需要人工审批。
 - **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态。
 - **本地斜杠命令**：`/session`、`/model`、`/status`、`/clear` 等命令不会发送给 Provider。
 - **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。
+- **异步与可取消**：异步 Agent 是规范执行路径；取消信号可停止 Provider 读取、重试退避、后续工具和运行中的受管命令，且不会执行尚未完整生成的工具调用。
+- **token-aware 上下文**：优先使用 Provider 的真实 usage 作为前缀锚点，缺失时按 UTF-8 字节保守估算；压缩始终以完整任务块和工具回合为单位。
+- **大型结果安全暂存**：超过内联上限的工具输出写入 Session 隔离的 TriCoder 运行目录，模型只接收有界预览和不含本机路径的引用。
+- **统一 Extension Host**：扩展以安全 descriptor 和显式工具来源接入；生命周期失败隔离、名称冲突双方拒绝、内置工具优先，真实扩展默认关闭。
 
 ## Provider 用量与 KV Cache 指标
 
 每次 Provider 响应完成后，只有当服务商 `usage` 至少包含一个有效用量字段时，CLI 才显示该轮的输入、缓存和输出 token 用量行；同一任务的累计用量由各轮已返回的指标相加得到。TriCoder 只归一化并展示/审计这些服务商返回的用量数据，不会在本地保存或管理 KV Cache。
+
+Context Manager 会把同时存在的 `input_tokens` 与 `output_tokens` 绑定到该次请求的精确消息前缀；下一次请求只估算锚点后的新增消息。缺少 `input_tokens`、锚点不再匹配或尚未收到 usage 时，不会把未知值当作零，而是回退到 UTF-8 字节估算。压缩视图中的系统说明不会写入 Session 原始消息，因此固定 prompt 前缀和现有会话持久化边界保持不变。
 
 缓存相关字段是观测值，不是本地缓存状态：单个用量字段缺失或无效时，界面会显示 `-`，不会将未知值当作 `0`；整个 `usage` 缺失、无效或所有字段均无效时，本轮不显示用量行。缓存命中率仅在服务商同时返回可计算的输入和缓存 token 时显示。
 
@@ -48,6 +54,7 @@ flowchart LR
     A <--> P["Provider Adapter"]
     P <--> API["OpenAI / DeepSeek / GLM"]
     A <--> T["Tool Runtime"]
+    E["Extension Host"] --> T
     T --> W["目标工作区"]
     T --> J["JSONL 审计"]
 ```
@@ -105,7 +112,103 @@ plan = true
 
 [providers.glm]
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+[extensions]
+enabled = false
+
+[mcp]
+enabled = false
+
+[skills]
+enabled = false
+project_dir = ".tricoder/skills"
+
+[hooks]
+enabled = false
+
+[worktree]
+enabled = false
+
+[agents]
+enabled = false
+max_depth = 1
+max_concurrency = 1
+default_read_only = true
 ```
+
+## MCP：默认关闭的本地 stdio 扩展
+
+MCP 只支持在项目配置中明确启用的本地 `stdio` server；不支持远程 MCP、自动
+下载或安装 server。MCP server 是本地代码执行，不是 OS 沙盒：获批后，它以当前
+TriCoder 进程用户的权限运行。下列配置可直接保存在本仓库的 `.tricoder.toml`；
+默认仍是关闭状态，且不会启动任何 server：
+
+```toml
+[extensions]
+enabled = false
+
+[mcp]
+enabled = false
+```
+
+本地开发时，可用仓库内不访问网络、环境变量或用户文件的测试 fixture 验证
+stdio 接线。先激活项目的 Python 环境，再将下例改为显式启用；它不会安装任何
+软件，也不应改用公共 server 命令：
+
+```toml
+[extensions]
+enabled = true
+
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+id = "local_test"
+transport = "stdio"
+command = "python"
+args = ["tests/fixtures/fake_mcp_server.py"]
+enabled = true
+credential_env = []
+```
+
+每个 Coding Task 都会重新启动每台已启用 server，并再次请求启动审批；不会跨
+任务或 Session 复用连接。每个 MCP 工具固定为 `dangerous`，即使权限为
+`fullaccess` 也必须逐次获得人工审批。`--read-only` 会在审批前拒绝它们。
+
+生产本地 stdio 使用 TriCoder 自持的 transport：直接持有 server 进程句柄，并分别
+记录进程退出和自持资源关闭证据。成功停止证明**直接 server 进程已退出**，且
+TriCoder 自持的流与任务已关闭；不证明所有脱离进程组或后台化的后代都已消失。
+原始 SDK 日志只在任务局部、精确匹配 logger 名称和 SDK 源文件路径的适配器作用域
+内过滤，不按消息正文识别或脱敏，也不静音其他来源的同名日志。
+
+该适配器绑定 `mcp==2.1.1`；升级必须重新审查能力接口、日志来源、生命周期和
+依赖安全。本地 Windows 离线测试及仓库 fake server 不是跨平台证明，真实外部
+MCP server 与真实 Provider 兼容性仍未验证；远程 MCP、自动安装和 OS 沙盒均不支持。
+
+如 server 确实需要凭据，`.tricoder.toml` 中的 `credential_env` 只能写环境变量
+**名称**。名称还必须由启动 TriCoder 的可信进程环境中的
+`TRICODER_EXTENSION_ENV_ALLOWLIST` 明确授权；凭据值永远不得写入 TOML、示例、
+日志或审计。配置或 server 给出的不受支持 JSON Schema 会被显式拒绝，绝不会在
+缺少验证时执行。
+
+## Extension Host 与配置信任
+
+所有扩展家族默认关闭；项目配置中的未知安全字段、非布尔开关、非法/重复 ID、
+非 `stdio` transport、越界 Skill 路径、负预算和明文凭据字段都会直接导致配置
+失败，不会回退到更宽松状态。
+
+动态工具必须携带来源 ID 和 `read`、`write`、`process`、`network` 或
+`dangerous` 风险声明，并绑定当前 `ToolContext`。注册时会冻结并校验 JSON Schema；
+内置工具名不可覆盖，两个扩展声明同名工具时双方都不注册。非只读动态工具继续
+经过统一审批；`--read-only` 会在审批前拒绝它们，`dangerous` 即使在
+`fullaccess` 下仍要求人工确认。扩展异常只返回固定安全分类，不回显原始异常。
+
+`.tricoder.toml` 只能用 `credential_env` 保存环境变量名。仅写变量名不等于授权：
+用户还必须在启动 TriCoder 的可信**进程环境**中设置逗号分隔的
+`TRICODER_EXTENSION_ENV_ALLOWLIST`。该 allowlist 从工作区 `.env.local` 读取时
+不会生效，防止项目配置自行选择并外传已有凭据。`doctor` 只显示扩展 ID、类型、
+有效启用状态、`project` 信任级别和凭据的“无需/未授权/缺失/已设置”状态，不显示
+命令参数、凭据值或底层异常。
 
 ## 执行前规划（Planner-Executor）
 
@@ -163,7 +266,7 @@ tricoder chat --provider deepseek --workspace D:\path\to\project
 python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 ```
 
-`tui` 与 `chat` 接受相同选项；`Ctrl+Q` 保存记忆并退出，`Ctrl+C` 清空输入，写操作与命令执行在模态中明确确认。TUI 中 `/permission`、`/session`、`/model` 不带参数时会弹出方向键选择列表（↑/↓ 选择 · Enter 确认 · Esc 取消）。每轮工具调用折叠为一个可展开块（标题含工具摘要），避免长任务刷屏。
+`tui` 与 `chat` 接受相同选项；空闲时 `Ctrl+C` 清空输入，任务运行时 `Ctrl+C` 请求取消；活动任务中按 `Ctrl+Q` 会先发出取消并以非零码退出，空闲退出才重试保存记忆。写操作与命令执行仍在模态中明确确认。TUI 中 `/permission`、`/session`、`/model` 不带参数时会弹出方向键选择列表（↑/↓ 选择 · Enter 确认 · Esc 取消）。每轮工具调用折叠为一个可展开块（标题含工具摘要），避免长任务刷屏。
 
 ## 交互命令与 Session
 
@@ -189,7 +292,7 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 
 `/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先构建并验证目标配置、策略、工具和 Agent；任何一步失败都会保留原 Session 和原工作区。
 
-`/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据和审计记录；它只清除当前会话的消息历史和可持久化摘要。
+`/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据和审计记录；它会清除当前会话的消息历史、可持久化摘要，以及该 Session 的临时大型工具结果。
 
 ## 任务级变更预览与撤销
 
@@ -209,6 +312,8 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 会话持久化只保存受控结构化元数据，不保存任何用户任务或模型 `RunResult.summary` 的自由文本原文。无论内容是空白、中英文自然语言、源码、命令、工具输出、Provider 原始响应、动作 JSON、认证信息还是完整消息历史，SQLite 中的 `requirements_summary` 都只保存长度占位；运行结果只保存固定格式的成功/失败、修改文件数量和规范化验证状态。成功编辑或创建的文件路径由工作区策略解析后以规范相对路径保存，不会保存原始绝对路径或 `..` 形式。这个策略不依赖“看起来像代码或命令”的启发式判断。
 
 完整消息上下文仅保留在当前进程的 Session 中，CLI 仍会在当前轮显示 `RunResult.summary`；重启后只能恢复上述结构化元数据和长度占位。该边界仍需配合工作区权限和本地存储权限管理。
+
+大型工具结果不进入 SQLite。默认暂存目录与数据库位于同一状态根下的 `runtime/tool-results/session_<hash>/`，不位于目标源码工作区；文件名与引用均由系统生成。模型可用 `read_tool_result` 按引用和字符偏移分段回读当前 Session 的结果，不能传入文件路径。单项默认最多 2 MB、单 Session 默认最多 10 MB；启动时会清理上次进程遗留内容，`/clear` 只清理当前 Session。JSONL 审计只记录引用、字节数和 SHA-256，不记录正文或绝对路径。
 
 如果数据库无法安全初始化，交互入口会以配置错误退出（退出码 `2`），不会改用其他工作区。运行中持久化失败时，当前内存会话可继续使用，但界面会提示“本次记忆未持久化”；`/exit` 会再尝试保存，仍失败时以非零退出码结束。
 
@@ -233,7 +338,7 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 每次 `run` 会写入 JSONL 审计文件。默认目录：Windows 为 `%LOCALAPPDATA%\TriCoder\runs`，其他系统为 `$XDG_STATE_HOME/tricoder/runs`；可用 `--audit-dir` 覆盖。只读模式下，审计目录不能位于目标工作区中。
 
-`--max-context-chars` 限制每次发送给模型的上下文大小。固定 system/user 消息会保留，历史按完整交互轮次截断，避免保留半个工具回合。
+`--max-context-chars` 仍保留旧版字符硬上限，同时其数值也作为 token 安全上限供 Context Manager 使用。Provider usage 可用时优先按真实 token 锚点判断；不可用时采用保守估算。固定 system 与当前 task、当前任务的完整工具回合不会被拆分，即使它们自身超限；旧历史按完整任务块截断，避免出现孤立 call/result。当前实现不生成语义摘要。
 
 `run` 的退出码：`0` 表示任务满足完成条件，`1` 表示任务未完成或最后验证失败，`2` 表示配置或运行前审计准备失败。
 
@@ -296,7 +401,7 @@ python -m tricoder run "只读检查 smoke_demo.py，并说明 add 函数的行�
 
 ## 路线
 
-以下方向尚未实现：Session 删除与导出、命令插件/自动补全、可选检索记忆、演示 GIF。
+以下方向尚未实现或尚未验证：真实外部/用户 MCP server 验证、Skills/项目指令加载、Hooks、Worktree、子 Agent、Session 删除与导出、命令插件/自动补全、可选检索记忆、演示 GIF。本地 stdio MCP 已实现并由仓库内 fake server 覆盖；它不等同于外部 server 的兼容性证明。
 
 ## 开源参考
 

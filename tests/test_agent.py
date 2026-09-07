@@ -174,6 +174,30 @@ class PublicToolRegistry:
         return self._registry.execute(name, arguments)
 
 
+class CallIdRecordingRegistry(ToolRegistry):
+    """记录 Agent 交给工具网关的 Provider call id。"""
+
+    def __init__(self, context: ToolContext) -> None:
+        super().__init__(context)
+        self.call_ids: list[str | None] = []
+
+    async def execute_async(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        *,
+        cancellation=None,  # type: ignore[no-untyped-def]
+        call_id: str | None = None,
+    ) -> ToolResult:
+        self.call_ids.append(call_id)
+        return await super().execute_async(
+            name,
+            arguments,
+            cancellation=cancellation,
+            call_id=call_id,
+        )
+
+
 class MultiPathToolRegistry(PublicToolRegistry):
     """模拟一次成功写入多个路径的未来工具。"""
 
@@ -331,6 +355,53 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertEqual("tool", tool.role)
         self.assertEqual("call-read", tool.tool_call_id)
         self.assertIn('"tool": "read_file"', tool.content or "")
+
+    def test_agent_passes_provider_call_id_to_the_tool_gateway(self) -> None:
+        """spill 文件归属必须使用已完成的 Provider call id，而非工具参数。"""
+        registry = CallIdRecordingRegistry(self.tools.context)
+        provider = StructuredScriptedProvider(
+            [self.response("call-finish", "finish", {"summary": "完成"})]
+        )
+
+        CodingAgent(provider, registry, max_rounds=1, plan_enabled=False).run("完成")
+
+        self.assertEqual(["call-finish"], registry.call_ids)
+
+    def test_provider_usage_drives_next_task_context_budget(self) -> None:
+        """真实 token 用量超限时，新任务必须丢弃旧完整任务块而非只看字符数。"""
+        provider = StructuredScriptedProvider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall("call-read", "read_file", {"path": "sample.py"}),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(input_tokens=5_000, output_tokens=20),
+                ),
+                ProviderResponse(
+                    tool_calls=(ToolCall("call-finish", "finish", {"summary": "完成"}),),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(input_tokens=5_100, output_tokens=10),
+                ),
+                self.response("call-next", "finish", {"summary": "继续完成"}),
+            ]
+        )
+        agent = CodingAgent(
+            provider,
+            self.tools,
+            max_rounds=2,
+            max_context_chars=2_000,
+            plan_enabled=False,
+        )
+
+        first = agent.run_with_context("读取示例", SessionContext())
+        agent.run_with_context("继续任务", first.context)
+
+        next_task_request = provider.histories[2]
+        self.assertFalse(any(message.tool_call_id == "call-read" for message in next_task_request))
+        self.assertTrue(
+            any(message.content == CONTEXT_COMPACTION_NOTICE for message in next_task_request)
+        )
 
     def test_provider_usage_is_observed_aggregated_and_kept_out_of_history(self) -> None:
         """Removing response usage handling must lose the public event and total."""

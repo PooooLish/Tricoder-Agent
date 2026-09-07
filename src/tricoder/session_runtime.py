@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from functools import wraps
@@ -18,6 +20,9 @@ from tricoder.changes import (
     UndoPreview,
     render_change_set_diff,
 )
+from tricoder.core.cancellation import CancellationToken
+from tricoder.core.events import EventSink
+from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
 from tricoder.models import (
     ProviderConfig,
@@ -26,6 +31,7 @@ from tricoder.models import (
     SessionMemory,
     SessionRecord,
 )
+from tricoder.mcp.security import MCP_START_APPROVAL_ACTION
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
 from tricoder.sessions import (
@@ -67,7 +73,9 @@ def _idle_runtime_change(
 # fullaccess 级别下仍要求人工审批的“明确危险”工具。
 # 当前工具集无删除/重命名能力；未来新增 delete_file、rename_file 等
 # 破坏性工具时应加入此集合，fullaccess 下它们仍需审批。
-_DANGEROUS_TOOLS: frozenset[str] = frozenset()
+_DANGEROUS_TOOLS: frozenset[str] = frozenset(
+    {"dangerous_extension_tool", MCP_START_APPROVAL_ACTION}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +121,25 @@ class RuntimeStatus:
 class ContextAgent(Protocol):
     """运行时只依赖可复用上下文的 Agent 接口，方便注入假实现。"""
 
-    def run_with_context(self, task: str, context: SessionContext):  # type: ignore[no-untyped-def]
+    def run_with_context(
+        self,
+        task: str,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+        event_sink: EventSink | None = None,
+    ):  # type: ignore[no-untyped-def]
         """运行任务并返回结果与更新后的上下文。"""
+
+    async def run_with_context_async(
+        self,
+        task: str,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+        event_sink: EventSink | None = None,
+    ):  # type: ignore[no-untyped-def]
+        """在调用方事件循环内运行任务。"""
 
 
 ActiveSessionFactory = Callable[[SessionRecord, SessionMemory, RuntimeOptions], ActiveSession]
@@ -162,6 +187,7 @@ class SessionRuntime:
         audit_factory: Callable[[Path], AuditLogger] = AuditLogger,
         approver: Callable[[str, str], bool] | None = None,
         observer: AgentObserver | None = None,
+        mcp_manager_factory: Callable[..., object] | None = None,
     ) -> None:
         self.store = store
         self.options = options or RuntimeOptions()
@@ -176,15 +202,21 @@ class SessionRuntime:
         self._audit_factory = audit_factory
         self._approver = approver or (lambda _action, _detail: False)
         self._observer = observer
+        self._mcp_manager_factory = mcp_manager_factory
         self._unsaved_memory = False
         self._warning = ""
         self._memory_dirty = False
         self._session_cache: dict[str, ActiveSession] = {}
+        # 每个会话首次在当前进程装配时清理上次进程遗留的临时正文；
+        # 同进程内重建模型则保留仍可能被消息引用的结果。
+        self._prepared_spill_sessions: set[str] = set()
         # 并发控制：同一时刻只允许一个 Agent 任务，运行期间禁止切换会话/模型/权限。
         self._task_lock = threading.Lock()
+        self._task_state_lock = threading.Lock()
         self._task_active = False
         self._task_session_id: str | None = None
         self._task_permission: str | None = None
+        self._task_cancellation: CancellationToken | None = None
 
         resolved_workspace = Path(workspace).resolve()
         try:
@@ -309,11 +341,33 @@ class SessionRuntime:
         )
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
+        persistence_error: SessionError | OSError | None = None
         try:
             if not self._persist_current():
                 raise OSError("会话记忆清除未持久化")
         except (SessionError, OSError) as exc:
-            raise SessionRuntimeError("会话记忆清除未持久化") from exc
+            # 即使 SQLite 暂时不可写，也继续销毁用户明确要求清除的临时正文。
+            # 内存中的清空状态与 dirty 标记会保留，供 retry_persist 后续重试。
+            persistence_error = exc
+        spill_store = (
+            original.tools.context.spill_store
+            if original.tools is not None
+            else None
+        )
+        cleanup_error: SpillError | None = None
+        if spill_store is not None:
+            try:
+                spill_store.cleanup()
+            except SpillError as exc:
+                cleanup_error = exc
+        if persistence_error is not None and cleanup_error is not None:
+            raise SessionRuntimeError(
+                "会话记忆清除未持久化，且大型工具结果清理失败"
+            ) from persistence_error
+        if persistence_error is not None:
+            raise SessionRuntimeError("会话记忆清除未持久化") from persistence_error
+        if cleanup_error is not None:
+            raise SessionRuntimeError("会话已清空，但大型工具结果清理失败") from cleanup_error
 
     @_idle_runtime_change
     def change_model(self, provider: str) -> ActiveSession:
@@ -361,7 +415,11 @@ class SessionRuntime:
             self._task_lock.release()
             raise SessionRuntimeError("已有 Agent 任务正在运行")
         try:
-            self._task_active = True
+            # 令牌与活动标志作为一个快照发布，避免取消线程观察到
+            # ``active=True`` 但令牌仍为空的短暂窗口。
+            with self._task_state_lock:
+                self._task_cancellation = CancellationToken()
+                self._task_active = True
             self._task_session_id = self.current.record.id
             self._task_permission = self.current.memory.permission_level
             try:
@@ -372,10 +430,21 @@ class SessionRuntime:
                         "任务运行期间会话被切换，拒绝更新该会话"
                     )
         finally:
-            self._task_active = False
+            with self._task_state_lock:
+                self._task_active = False
+                self._task_cancellation = None
             self._task_session_id = None
             self._task_permission = None
             self._task_lock.release()
+
+    def cancel_current(self) -> bool:
+        """无须获取任务锁即可线程安全地请求取消当前任务。"""
+
+        with self._task_state_lock:
+            token = self._task_cancellation
+            if not self._task_active or token is None:
+                return False
+            return token.cancel()
 
     def _run_task_locked(self, task: str) -> RunResult:
         original = self.current
@@ -384,8 +453,65 @@ class SessionRuntime:
             original.context.verification,
         )
         try:
-            turn = original.agent.run_with_context(task, original.context)
-        except Exception:
+            if self._mcp_effectively_enabled(original.config):
+                if original.tools is None:
+                    raise SessionRuntimeError("启用 MCP 的会话缺少工具注册表")
+                # 动态工具仅注册到本任务的新容器；ToolContext 仍是当前会话的
+                # 同一安全对象，因此账本、spill、审批快照和审计边界不会漂移。
+                task_tools = self._tool_registry_factory(original.tools.context)
+                task_agent = self._create_agent(
+                    original.config,
+                    task_tools,
+                    original.audit,
+                )
+
+                async def operation(_active_tools: ToolRegistry):
+                    return await task_agent.run_with_context_async(
+                        task,
+                        original.context,
+                        cancellation=self._task_cancellation,
+                        event_sink=self._observer if callable(self._observer) else None,
+                    )
+
+                from tricoder.mcp.runtime import run_mcp_task_sync
+
+                scope_kwargs: dict[str, object] = {}
+                if self._mcp_manager_factory is not None:
+                    scope_kwargs["manager_factory"] = self._mcp_manager_factory
+                turn = run_mcp_task_sync(
+                    original.config,
+                    task_tools,
+                    source_env=(
+                        self.options.environ
+                        if self.options.environ is not None
+                        else os.environ
+                    ),
+                    audit=original.audit,
+                    cancellation=self._task_cancellation or CancellationToken(),
+                    operation=operation,
+                    **scope_kwargs,
+                )
+            else:
+                # MCP 未启用时保留原有 Agent 对象与同步调用路径。
+                run_method = original.agent.run_with_context
+                parameters = inspect.signature(run_method).parameters
+                accepts_keywords = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                kwargs = {}
+                if "cancellation" in parameters or accepts_keywords:
+                    kwargs["cancellation"] = self._task_cancellation
+                if (
+                    ("event_sink" in parameters or accepts_keywords)
+                    and callable(self._observer)
+                ):
+                    kwargs["event_sink"] = self._observer
+                turn = run_method(task, original.context, **kwargs)
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+                if self._task_cancellation is not None:
+                    self._task_cancellation.cancel()
             try:
                 original.journal.seal_task(
                     tuple(original.context.modified_files),
@@ -415,6 +541,16 @@ class SessionRuntime:
         self._memory_dirty = memory != self._persisted_memory
         self._persist_current()
         return result
+
+    @staticmethod
+    def _mcp_effectively_enabled(config: AppConfig) -> bool:
+        """只有总开关与至少一个 server 同时启用时才创建任务作用域。"""
+
+        return (
+            config.extensions.enabled
+            and config.mcp.enabled
+            and any(server.enabled for server in config.mcp.servers)
+        )
 
     def diff_latest(self) -> str | None:
         """返回当前 Session 最近一次非空任务的正向差异。"""
@@ -720,9 +856,15 @@ class SessionRuntime:
                 journal=active_journal,
             )
         loaded = config or self._load_config(record.workspace, record.provider, record.model)
-        provider = self._provider_factory(loaded.provider, loaded.timeout)
         workspace_policy = self._workspace_policy_factory(loaded.workspace)
         active_journal = journal or ChangeJournal()
+        spill_store = ToolResultSpillStore(
+            self.store.database_path.parent / "runtime" / "tool-results",
+            record.id,
+        )
+        if record.id not in self._prepared_spill_sessions:
+            spill_store.cleanup()
+            self._prepared_spill_sessions.add(record.id)
         tools = self._tool_registry_factory(
             ToolContext(
                 workspace_policy=workspace_policy,
@@ -732,30 +874,14 @@ class SessionRuntime:
                 read_only=loaded.read_only,
                 timeout=loaded.timeout,
                 change_journal=active_journal,
+                spill_store=spill_store,
             )
         )
         if loaded.audit_dir is None:
             raise SessionRuntimeError("运行配置缺少审计目录")
         audit = self._audit_factory(loaded.audit_dir / f"session-{record.id}.jsonl")
         audit.prepare()
-        agent_kwargs = {
-            "max_rounds": loaded.max_rounds,
-            "max_context_chars": loaded.max_context_chars,
-            "audit": audit,
-            "observer": self._observer,
-        }
-        agent_parameters = inspect.signature(self._agent_factory).parameters
-        if "tool_protocol" in agent_parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in agent_parameters.values()
-        ):
-            agent_kwargs["tool_protocol"] = loaded.tool_protocol
-        if "plan_enabled" in agent_parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in agent_parameters.values()
-        ):
-            agent_kwargs["plan_enabled"] = loaded.plan_enabled
-        agent = self._agent_factory(provider, tools, **agent_kwargs)
+        agent = self._create_agent(loaded, tools, audit)
         return ActiveSession(
             record,
             memory,
@@ -770,6 +896,34 @@ class SessionRuntime:
             active_journal,
             audit,
         )
+
+    def _create_agent(
+        self,
+        config: AppConfig,
+        tools: ToolRegistry,
+        audit: AuditLogger | None,
+    ) -> ContextAgent:
+        """按同一 Provider 配置构造长期或任务级 Agent。"""
+
+        provider = self._provider_factory(config.provider, config.timeout)
+        agent_kwargs = {
+            "max_rounds": config.max_rounds,
+            "max_context_chars": config.max_context_chars,
+            "audit": audit,
+            "observer": self._observer,
+        }
+        agent_parameters = inspect.signature(self._agent_factory).parameters
+        if "tool_protocol" in agent_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in agent_parameters.values()
+        ):
+            agent_kwargs["tool_protocol"] = config.tool_protocol
+        if "plan_enabled" in agent_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in agent_parameters.values()
+        ):
+            agent_kwargs["plan_enabled"] = config.plan_enabled
+        return self._agent_factory(provider, tools, **agent_kwargs)
 
     def _load_config(self, workspace: Path, provider: str, model: str | None) -> AppConfig:
         """集中传递启动选项，避免切换时遗漏只读、审计或资源限制。"""

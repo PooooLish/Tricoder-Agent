@@ -30,6 +30,7 @@ from textual.widgets import (
 
 from tricoder.agent import AgentObserver
 from tricoder.commands import CommandError, is_slash_command, list_commands, parse_command
+from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 from tricoder.session_runtime import SessionRuntime, SessionRuntimeError
 
@@ -125,6 +126,11 @@ class TuiObserver(AgentObserver):
     def __init__(self, app: "TricoderApp") -> None:
         self._app = app
 
+    def __call__(self, event: AgentEvent) -> None:
+        """只把可公开文本增量送入 RichLog；动态内容始终按纯文本处理。"""
+        if isinstance(event, TextDelta):
+            self._app.round_line(Text(event.text))
+
     def on_round_start(self, round_number: int, max_rounds: int) -> None:
         self._app.begin_round(round_number, max_rounds)
 
@@ -165,7 +171,7 @@ class TricoderApp(App[None]):
 
     BINDINGS = [
         ("ctrl+q", "quit", "退出"),
-        ("ctrl+c", "cancel", "清空输入"),
+        ("ctrl+c", "cancel", "取消任务/清空输入"),
     ]
 
     CSS = """
@@ -781,10 +787,18 @@ class TricoderApp(App[None]):
     # ---- 退出 ----
 
     def action_cancel(self) -> None:
+        if self.runtime is not None and self.runtime.cancel_current():
+            self.log_line(Text("正在取消当前任务……", style="yellow"))
+            return
         self.query_one(Input).value = ""
 
     def action_quit(self) -> None:
         code = 1
         if self.runtime is not None:
+            if self.runtime.cancel_current():
+                # 活动任务持有 Runtime 状态锁；先发取消信号并以非零码退出，
+                # 避免退出路径与任务收尾并发持久化同一份 Session 状态。
+                self.exit(1)
+                return
             code = 0 if self.runtime.retry_persist() else 1
         self.exit(code)

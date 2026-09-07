@@ -9,11 +9,12 @@ from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Input, Static
 
 from tricoder.agent import PLANNING_PROMPT
+from tricoder.core.events import TextDelta
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
 from tricoder.providers import ProviderError
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime
 from tricoder.sessions import SessionStore
-from tricoder.tui import ApprovalScreen, OptionListScreen, TricoderApp
+from tricoder.tui import ApprovalScreen, OptionListScreen, TricoderApp, TuiObserver
 
 
 class FakeProvider:
@@ -50,6 +51,70 @@ def _provider_factory(responses: list[ProviderResponse]):
 
 
 class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tui_observer_forwards_streaming_text_as_literal_text(self) -> None:
+        """类型化增量通过线程安全桥进入 TUI，且保留 Rich 标记字面值。"""
+
+        class RecordingApp:
+            def __init__(self) -> None:
+                self.lines: list[object] = []
+
+            def round_line(self, value: object) -> None:
+                self.lines.append(value)
+
+        app = RecordingApp()
+        observer = TuiObserver(app)  # type: ignore[arg-type]
+
+        observer(TextDelta("[conceal]secret[/conceal]"))
+
+        self.assertEqual(1, len(app.lines))
+        self.assertEqual("[conceal]secret[/conceal]", app.lines[0].plain)
+
+    async def test_cancel_action_signals_active_runtime(self) -> None:
+        """Ctrl+C 在任务活动时必须取消任务，而不只是清空输入框。"""
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with mock.patch.object(
+                app.runtime, "cancel_current", return_value=True
+            ) as cancel:
+                app.action_cancel()
+                await pilot.pause()
+
+            cancel.assert_called_once_with()
+            self.assertTrue(any("正在取消" in line for line in app._lines))
+
+    async def test_quit_action_cancels_active_runtime_before_exit(self) -> None:
+        """退出活动任务时先发取消信号，且不得并发进入持久化临界区。"""
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancelled = False
+                self.persisted = False
+
+            def cancel_current(self) -> bool:
+                self.cancelled = True
+                return True
+
+            def retry_persist(self) -> bool:
+                self.persisted = True
+                return True
+
+        class App:
+            def __init__(self) -> None:
+                self.runtime = Runtime()
+                self.exit_code: int | None = None
+
+            def exit(self, code: int) -> None:
+                self.exit_code = code
+
+        app = App()
+
+        TricoderApp.action_quit(app)  # type: ignore[arg-type]
+
+        self.assertTrue(app.runtime.cancelled)
+        self.assertFalse(app.runtime.persisted)
+        self.assertEqual(1, app.exit_code)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name) / "workspace"

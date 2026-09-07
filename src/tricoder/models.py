@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -146,9 +146,71 @@ class ProviderConfig:
     """单个模型服务的连接配置。"""
 
     name: str
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionsConfig:
+    """所有真实扩展的总开关，默认关闭。"""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MCPServerConfig:
+    """单个 MCP 声明；只保存环境变量名和存在性，不保存凭据值。"""
+
+    id: str
+    transport: str
+    command: str
+    args: tuple[str, ...] = ()
+    enabled: bool = False
+    trust: str = "project"
+    credential_env: tuple[str, ...] = ()
+    credentials_authorized: bool = True
+    credentials_present: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MCPConfig:
+    """MCP 家族总开关与严格解析后的服务器声明。"""
+
+    enabled: bool = False
+    servers: tuple[MCPServerConfig, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SkillsConfig:
+    """项目 Skill 发现配置；加载器将在 Phase 6 实现。"""
+
+    enabled: bool = False
+    project_dir: str = ".tricoder/skills"
+
+
+@dataclass(frozen=True, slots=True)
+class HooksConfig:
+    """Hook 总开关；执行引擎将在 Phase 7 实现。"""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeConfig:
+    """Worktree 能力开关，默认关闭。"""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AgentsConfig:
+    """子 Agent 安全默认值；协调器将在后续阶段实现。"""
+
+    enabled: bool = False
+    max_depth: int = 1
+    max_concurrency: int = 1
+    default_read_only: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +228,12 @@ class AppConfig:
     max_context_chars: int = 80_000
     tool_protocol: str = "native"
     plan_enabled: bool = True
+    extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
+    hooks: HooksConfig = field(default_factory=HooksConfig)
+    worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    agents: AgentsConfig = field(default_factory=AgentsConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +258,10 @@ class ToolResult:
     # None 表示该工具不产生验证结论；True/False 仅由认可的测试/编译/
     # 静态检查命令设置，git 只读与普通脚本不改变验证状态。
     verification_passed: bool | None = None
+    # 大型输出落盘后只公开不可猜引用和审计元数据；绝不包含本机路径。
+    spill_reference: str | None = None
+    spill_bytes: int = 0
+    spill_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

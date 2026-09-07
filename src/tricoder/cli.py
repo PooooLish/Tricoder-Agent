@@ -14,8 +14,11 @@ from rich.console import Console
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.config import ConfigError, load_config, provider_key_env
+from tricoder.context.spill import SpillError, ToolResultSpillStore
+from tricoder.core.cancellation import CancellationToken
 from tricoder.evals.service import run_eval_command
-from tricoder.models import ProviderConfig
+from tricoder.mcp.sdk import MCPDependencyError
+from tricoder.models import AppConfig, ProviderConfig, RunResult, SessionContext
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime, SessionRuntimeError
@@ -28,6 +31,7 @@ from tricoder.ui import TerminalUI
 ProviderFactory = Callable[[ProviderConfig, float], ModelProvider]
 SessionStoreFactory = Callable[[Path], SessionStore]
 ShellFactory = Callable[..., InteractiveShell]
+MCP_SDK_MISSING_GUIDANCE = "MCP SDK 未安装；请按 requirements.lock 安装项目锁定依赖"
 
 
 class ConsoleApprover:
@@ -245,6 +249,15 @@ def main(
         ui.show_error("配置错误", "无法准备可写的审计日志")
         return 2
 
+    spill_store = None
+    if _mcp_effectively_enabled(config):
+        try:
+            spill_store = ToolResultSpillStore(
+                config.audit_dir / "runtime" / "tool-results", run_id,
+            )
+        except SpillError:
+            ui.show_error("配置错误", "无法准备安全的大型工具结果暂存目录")
+            return 2
     ui.show_start(args.task, config)
     provider = provider_factory(config.provider, config.timeout)
     tools = ToolRegistry(
@@ -254,6 +267,7 @@ def main(
             approver=ui.approve,
             read_only=config.read_only,
             timeout=config.timeout,
+            spill_store=spill_store,
         )
     )
     agent = CodingAgent(
@@ -265,9 +279,97 @@ def main(
         observer=ui,
         tool_protocol=config.tool_protocol,
     )
-    result = agent.run(args.task)
+    cancellation = CancellationToken()
+    spill_cleanup_failed = False
+    try:
+        result = _run_once_with_config(
+            config,
+            agent,
+            tools,
+            args.task,
+            source_env=env,
+            audit=audit,
+            cancellation=cancellation,
+            event_sink=ui,
+        )
+    except MCPDependencyError:
+        cancellation.cancel()
+        ui.finish_stream()
+        ui.show_error("配置错误", MCP_SDK_MISSING_GUIDANCE)
+        return 2
+    except KeyboardInterrupt:
+        cancellation.cancel()
+        ui.finish_stream()
+        ui.show_error("任务已取消", "已停止当前任务")
+        return 130
+    finally:
+        if spill_store is not None:
+            try:
+                spill_store.cleanup()
+            except SpillError:
+                # 清理失败不能覆盖已有主异常，也不能让成功路径继续显示“完成”。
+                spill_cleanup_failed = True
+                ui.show_error("清理失败", "大型工具结果暂存未能安全清理")
+    if spill_cleanup_failed:
+        return 1
     ui.show_complete(result, audit_path)
     return 0 if result.ok else 1
+
+
+def _mcp_effectively_enabled(config: AppConfig) -> bool:
+    """避免总开关开启但没有有效 server 时改变旧执行路径。"""
+
+    return (
+        config.extensions.enabled
+        and config.mcp.enabled
+        and any(server.enabled for server in config.mcp.servers)
+    )
+
+
+def _run_once_with_config(
+    config: AppConfig,
+    agent: CodingAgent,
+    tools: ToolRegistry,
+    task: str,
+    *,
+    source_env: Mapping[str, str],
+    audit: AuditLogger | None,
+    cancellation: CancellationToken,
+    event_sink: AgentObserver | None,
+    mcp_manager_factory: Callable[..., object] | None = None,
+) -> RunResult:
+    """只装配一次性任务执行；MCP 与交互运行时共用同一作用域。"""
+
+    if not _mcp_effectively_enabled(config):
+        return agent.run(
+            task,
+            cancellation=cancellation,
+            event_sink=event_sink,
+        )
+
+    async def operation(_active_tools: ToolRegistry) -> RunResult:
+        turn = await agent.run_with_context_async(
+            task,
+            SessionContext(),
+            cancellation=cancellation,
+            event_sink=event_sink,
+        )
+        return turn.result
+
+    from tricoder.mcp.runtime import run_mcp_task_sync
+
+    scope_kwargs: dict[str, object] = {}
+    if mcp_manager_factory is not None:
+        scope_kwargs["manager_factory"] = mcp_manager_factory
+    return run_mcp_task_sync(
+        config,
+        tools,
+        source_env=source_env,
+        audit=audit,
+        cancellation=cancellation,
+        operation=operation,
+        **scope_kwargs,
+    )
 
 
 def _run_chat(

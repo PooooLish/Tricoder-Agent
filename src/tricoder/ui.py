@@ -15,6 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from tricoder.commands import list_commands
+from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import AppConfig, RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 
 _PROVIDER_LABELS = {
@@ -67,6 +68,21 @@ class TerminalUI:
         self.console = console
         self.input_fn = input_fn
         self._status: Status | None = None
+        self._stream_active = False
+
+    def __call__(self, event: AgentEvent) -> None:
+        """批量 CLI 的类型化事件入口；只展示可公开的文本增量。"""
+        if not isinstance(event, TextDelta):
+            return
+        self._stop_status()
+        self.console.print(Text(event.text), end="")
+        self._stream_active = True
+
+    def finish_stream(self) -> None:
+        """在结构化状态行之前结束当前增量行。"""
+        if self._stream_active:
+            self.console.print()
+            self._stream_active = False
 
     def show_start(self, task: str, config: AppConfig) -> None:
         table = Table.grid(padding=(0, 2))
@@ -109,10 +125,54 @@ class TerminalUI:
             Text(_safe_base_url(config.provider.base_url)),
             "[green]HTTPS[/green]",
         )
-        table.add_row(Text(key_name), "••••••••", "[green]已设置[/green]")
+        table.add_row(Text(key_name), "********", "[green]已设置[/green]")
         table.add_row("密钥来源", Text(config.key_source), "[green]已确认[/green]")
         table.add_row("网络请求", "doctor 不访问网络", "[dim]未发送[/dim]")
         self.console.print(table)
+        extensions = Table(
+            title="扩展检查",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            show_lines=False,
+        )
+        for heading in ("ID", "类型", "启用", "信任", "凭据"):
+            extensions.add_column(heading)
+        rows = 0
+        for server in config.mcp.servers:
+            effective_enabled = (
+                config.extensions.enabled and config.mcp.enabled and server.enabled
+            )
+            credential_status = (
+                "无需"
+                if not server.credential_env
+                else "未授权"
+                if not server.credentials_authorized
+                else "已设置"
+                if server.credentials_present
+                else "缺失"
+            )
+            extensions.add_row(
+                Text(server.id),
+                Text("mcp"),
+                Text("是" if effective_enabled else "否"),
+                Text(server.trust),
+                Text(credential_status),
+            )
+            rows += 1
+        for extension_id, kind, enabled in (
+            ("project-skills", "skill", config.skills.enabled),
+            ("project-hooks", "hook", config.hooks.enabled),
+        ):
+            extensions.add_row(
+                Text(extension_id),
+                Text(kind),
+                Text("是" if config.extensions.enabled and enabled else "否"),
+                Text("project"),
+                Text("无需"),
+            )
+            rows += 1
+        if rows:
+            self.console.print(extensions)
 
     def show_shell_start(self, record: SessionRecord) -> None:
         """显示当前本地 Session，不暴露密钥或原始上下文。"""
@@ -284,6 +344,7 @@ class TerminalUI:
         )
 
     def show_complete(self, result: RunResult, audit_path: Path) -> None:
+        self.finish_stream()
         self._stop_status()
         table = Table.grid(padding=(0, 2))
         table.add_column(style="dim", no_wrap=True)
@@ -355,6 +416,7 @@ class TerminalUI:
         self.console.print(Text(f"第 {round_number} 轮用量 · {_format_token_usage(usage)}", style="cyan"))
 
     def on_action(self, action: ToolAction) -> None:
+        self.finish_stream()
         self._stop_status()
         line = Text()
         line.append("● ", style="cyan")

@@ -2,19 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import time
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
 from tricoder.audit import AuditLogger
+from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.core.events import (
+    AgentEvent,
+    ApprovalRequested,
+    ContextCompacted,
+    EventSink,
+    PlanningCompleted,
+    ProviderCompleted,
+    RoundStarted,
+    RuntimeCompleted,
+    RuntimeFailed,
+    TextDelta,
+    ThinkingDelta,
+    ToolCallCompleted,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
+    UsageReported,
+)
+from tricoder.context import (
+    CONTEXT_COMPACTION_NOTICE,
+    ContextBudget,
+    ContextManager,
+)
+from tricoder.extensions.models import ToolOrigin
 from tricoder.models import (
     Message,
+    ProviderResponse,
     RunResult,
     SessionContext,
     SessionTurnResult,
     TokenUsage,
     ToolAction,
+    ToolCall,
+    ToolDefinition,
     ToolResult,
 )
 from tricoder.policy import PolicyError
@@ -33,7 +62,6 @@ from tricoder.protocols import (
 from tricoder.tools import ToolRegistry
 
 
-CONTEXT_COMPACTION_NOTICE = "较早的消息已被压缩，以保留最新上下文。"
 AUDIT_FAILURE_MESSAGE = "无法写入审计日志，运行已安全停止"
 PROVIDER_FAILURE_MESSAGE = "模型请求失败，运行已安全停止"
 PLANNING_PROMPT = """在开始执行前，请先输出一份简短的分步执行计划。
@@ -44,12 +72,6 @@ PLANNING_PROMPT = """在开始执行前，请先输出一份简短的分步执�
 
 # 规划阶段审计失败时的终止哨兵。
 _PLAN_ABORT = object()
-
-
-def _message_chars(message: Message) -> int:
-    """按上下文预算规则计算单条消息的字符数。"""
-
-    return message.character_budget()
 
 
 def _is_complete_tool_round(
@@ -117,77 +139,15 @@ def _complete_round_tail(
 
 
 def compact_messages(messages: list[Message], max_chars: int) -> list[Message]:
-    """按完整工具交互回合压缩，并始终保留前两条固定消息。"""
+    """字符预算兼容代理；具体回合压缩由 ``ContextManager`` 负责。"""
 
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
         raise ValueError("max_context_chars 必须大于 0")
-
-    copied_messages = list(messages)
-    fixed_messages = copied_messages[:2]
-    later_messages = copied_messages[2:]
-
-    rounds: list[list[Message]] = []
-    index = 0
-    while index < len(later_messages):
-        end = _complete_round_tail(later_messages, index)
-        if end is not None:
-            rounds.append(later_messages[index:end])
-            index = end
-        else:
-            # 非法或孤立消息不构成可保留回合；继续寻找下一组合法边界。
-            index += 1
-
-    complete_round_history = sum(len(round) for round in rounds) == len(later_messages)
-    if (
-        complete_round_history
-        and sum(_message_chars(message) for message in copied_messages) <= max_chars
-    ):
-        return copied_messages
-    if not later_messages:
-        return fixed_messages
-
-    notice = Message("system", CONTEXT_COMPACTION_NOTICE)
-    remaining_chars = max_chars - sum(
-        _message_chars(message) for message in [*fixed_messages, notice]
+    manager = ContextManager(
+        ContextBudget(max_chars=max_chars),
+        tuple(_PROTOCOLS.values()),
     )
-
-    retained_reversed: list[list[Message]] = []
-    for round_messages in reversed(rounds):
-        interaction_chars = sum(
-            _message_chars(message) for message in round_messages
-        )
-        if interaction_chars > remaining_chars:
-            break
-        retained_reversed.append(round_messages)
-        remaining_chars -= interaction_chars
-
-    retained = [
-        message
-        for round_messages in reversed(retained_reversed)
-        for message in round_messages
-    ]
-    return [*fixed_messages, notice, *retained]
-
-
-def _normalize_history_task_block(
-    block: list[Message],
-    tool_protocol: str,
-) -> list[Message]:
-    """剔除旧任务纠错噪音，只返回任务和其中完整的动作/结果回合。"""
-
-    if not block or block[0].kind != "task":
-        return []
-
-    retained: list[Message] = []
-    index = 1
-    while index < len(block):
-        end = _complete_round_tail(block, index, tool_protocol)
-        if end is not None:
-            retained.extend(block[index:end])
-            index = end
-        else:
-            index += 1
-    return [block[0], *retained] if retained else []
+    return list(manager.prepare_generic(messages).messages)
 
 
 def compact_session_messages(
@@ -195,50 +155,13 @@ def compact_session_messages(
     max_chars: int,
     tool_protocol: str,
 ) -> list[Message]:
-    """先丢弃残缺旧任务，再按完整用户任务块压缩历史。"""
+    """字符预算兼容代理；保持旧调用点和保留顺序。"""
 
-    copied_messages = list(messages)
-    task_indexes = [
-        index for index, message in enumerate(copied_messages) if message.kind == "task"
-    ]
-    if not task_indexes:
-        return copied_messages
-
-    fixed_messages = copied_messages[: task_indexes[0]]
-    task_blocks = [
-        copied_messages[start:end]
-        for start, end in zip(task_indexes, [*task_indexes[1:], len(copied_messages)])
-    ]
-    latest_block = task_blocks[-1]
-    complete_history_blocks = [
-        normalized
-        for block in task_blocks[:-1]
-        if (normalized := _normalize_history_task_block(block, tool_protocol))
-    ]
-    normalized_messages = [
-        *fixed_messages,
-        *(message for block in complete_history_blocks for message in block),
-        *latest_block,
-    ]
-    if sum(_message_chars(message) for message in normalized_messages) <= max_chars:
-        return normalized_messages
-
-    notice = Message("system", CONTEXT_COMPACTION_NOTICE)
-    remaining_chars = max_chars - sum(
-        _message_chars(message)
-        for message in [*fixed_messages, notice, *latest_block]
+    manager = ContextManager(
+        ContextBudget(max_chars=max_chars),
+        _PROTOCOLS[tool_protocol],
     )
-
-    retained_reversed: list[list[Message]] = []
-    for block in reversed(complete_history_blocks):
-        block_chars = sum(_message_chars(message) for message in block)
-        if block_chars > remaining_chars:
-            break
-        retained_reversed.append(block)
-        remaining_chars -= block_chars
-
-    retained = [message for block in reversed(retained_reversed) for message in block]
-    return [*fixed_messages, notice, *retained, *latest_block]
+    return list(manager.prepare(messages).messages)
 
 
 @runtime_checkable
@@ -330,21 +253,71 @@ class CodingAgent:
         self.tool_protocol = tool_protocol
         self.plan_enabled = plan_enabled
         self._protocol: ActionProtocol = _PROTOCOLS[tool_protocol]
+        # 旧配置仍以字符数命名，因此同时保留字符硬上限；同值 token 上限
+        # 让 Provider usage 可在字符估算明显偏低时触发完整回合压缩。
+        self.context_manager = ContextManager(
+            ContextBudget(
+                max_tokens=max_context_chars,
+                max_chars=max_context_chars,
+            ),
+            self._protocol,
+        )
 
-    def run(self, task: str) -> RunResult:
+    def run(
+        self,
+        task: str,
+        *,
+        cancellation: CancellationToken | None = None,
+        event_sink: EventSink | None = None,
+    ) -> RunResult:
         """保持一次性运行接口的返回类型不变。"""
 
-        return self.run_with_context(task, SessionContext()).result
+        return self.run_with_context(
+            task,
+            SessionContext(),
+            cancellation=cancellation,
+            event_sink=event_sink,
+        ).result
 
     def run_with_context(
         self,
         task: str,
         context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+        event_sink: EventSink | None = None,
     ) -> SessionTurnResult:
-        """在不可变会话上下文上执行一个任务，并返回新的快照。"""
+        """同步兼容入口；已有事件循环中必须调用异步接口。"""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.run_with_context_async(
+                    task,
+                    context,
+                    cancellation=cancellation,
+                    event_sink=event_sink,
+                )
+            )
+        raise RuntimeError("同步 Agent 入口不能在已运行的事件循环中调用")
+
+    async def run_with_context_async(
+        self,
+        task: str,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+        event_sink: EventSink | None = None,
+    ) -> SessionTurnResult:
+        """在不可变会话上下文上异步执行任务，并发布类型化事件。"""
+
+        cancellation = cancellation or CancellationToken()
 
         if not task.strip():
-            return SessionTurnResult(RunResult(False, "任务描述不能为空", 0), context)
+            result = RunResult(False, "任务描述不能为空", 0)
+            self._emit(event_sink, RuntimeFailed("input", result.summary))
+            return SessionTurnResult(result, context)
         system_prompt = self._protocol.system_prompt
         messages = [Message("system", system_prompt)]
         if context.persisted_summary:
@@ -381,7 +354,7 @@ class CodingAgent:
             *,
             rollback_task: bool = False,
         ) -> SessionTurnResult:
-            return SessionTurnResult(
+            turn = SessionTurnResult(
                 replace(result, usage=accumulated_usage),
                 SessionContext(
                     messages=(
@@ -394,6 +367,12 @@ class CodingAgent:
                     verification=verification,
                 ),
             )
+            if result.ok:
+                self._emit(event_sink, RuntimeCompleted(turn.result))
+            else:
+                category = "cancelled" if result.summary == "任务已取消" else "runtime"
+                self._emit(event_sink, RuntimeFailed(category, result.summary))
+            return turn
 
         if self.audit is not None:
             try:
@@ -405,9 +384,27 @@ class CodingAgent:
                 )
 
         if self.plan_enabled:
-            plan_usage = self._planning_round(
-                messages, tool_calls, modified_files, verification
-            )
+            try:
+                plan_usage = await self._planning_round_async(
+                    messages,
+                    tool_calls,
+                    modified_files,
+                    verification,
+                    cancellation,
+                    event_sink,
+                )
+            except CancellationError:
+                return turn_result(
+                    RunResult(
+                        False,
+                        "任务已取消",
+                        0,
+                        tool_calls,
+                        tuple(modified_files),
+                        verification,
+                    ),
+                    rollback_task=True,
+                )
             if plan_usage is _PLAN_ABORT:
                 return turn_result(
                     self._audit_failure_result(
@@ -423,18 +420,39 @@ class CodingAgent:
                 )
 
         for round_number in range(1, self.max_rounds + 1):
+            if cancellation.is_cancelled:
+                return turn_result(
+                    RunResult(False, "任务已取消", round_number - 1, tool_calls, tuple(modified_files), verification),
+                    rollback_task=True,
+                )
             self.observer.on_round_start(round_number, self.max_rounds)
+            self._emit(event_sink, RoundStarted(round_number, self.max_rounds))
             started = time.perf_counter()
-            request_messages = compact_session_messages(
-                messages,
-                self.max_context_chars,
-                self.tool_protocol,
-            )
+            context_snapshot = self.context_manager.prepare(messages)
+            request_messages = list(context_snapshot.messages)
+            if context_snapshot.compacted:
+                self._emit(
+                    event_sink,
+                    ContextCompacted(
+                        before_chars=sum(message.character_budget() for message in messages),
+                        after_chars=context_snapshot.character_count,
+                    ),
+                )
             provider_tools = (
                 self.tools.definitions if self._protocol.tools_enabled else ()
             )
             try:
-                response = self.provider.complete(request_messages, provider_tools)
+                response = await self._request_provider_async(
+                    request_messages,
+                    provider_tools,
+                    cancellation,
+                    event_sink,
+                )
+            except CancellationError:
+                return turn_result(
+                    RunResult(False, "任务已取消", round_number, tool_calls, tuple(modified_files), verification),
+                    rollback_task=True,
+                )
             except ProviderProtocolError as exc:
                 self.observer.on_error(PROTOCOL_FEEDBACK)
                 if not self._log(
@@ -510,6 +528,11 @@ class CodingAgent:
 
             resolved = self._protocol.resolve_action(response)
             messages.extend(resolved.assistant_messages)
+            if response.usage is not None:
+                self.context_manager.record_usage(
+                    response.usage,
+                    [*request_messages, *resolved.assistant_messages],
+                )
             if not resolved.actions:
                 feedback = resolved.feedback or Message(
                     "user", PROTOCOL_FEEDBACK, kind="protocol_feedback"
@@ -540,6 +563,21 @@ class CodingAgent:
             for action_index, (action, tool_call_id) in enumerate(
                 zip(resolved.actions, resolved.tool_call_ids)
             ):
+                if cancellation.is_cancelled:
+                    for later_action, later_id in zip(
+                        resolved.actions[action_index:],
+                        resolved.tool_call_ids[action_index:],
+                    ):
+                        messages.append(
+                            self._protocol.tool_result_message(
+                                later_action,
+                                ToolResult(False, "任务已取消，该动作未执行"),
+                                later_id,
+                            )
+                        )
+                    return turn_result(
+                        RunResult(False, "任务已取消", round_number, tool_calls, tuple(modified_files), verification)
+                    )
                 if not action.reason:
                     definition = self.tools.describe(action.tool)
                     action = replace(
@@ -551,9 +589,70 @@ class CodingAgent:
                         ),
                     )
                 self.observer.on_action(action)
+                requires_approval = getattr(self.tools, "requires_approval", None)
+                if callable(requires_approval) and requires_approval(action.tool):
+                    self._emit(event_sink, ApprovalRequested(
+                        ToolCall(tool_call_id or f"legacy-{round_number}-{action_index}", action.tool, action.arguments),
+                        action.reason,
+                    ))
+                event_call = ToolCall(
+                    tool_call_id or f"legacy-{round_number}-{action_index}",
+                    action.tool,
+                    action.arguments,
+                )
+                self._emit(event_sink, ToolExecutionStarted(event_call))
                 tool_calls += 1
                 action_started = time.perf_counter()
-                result = self.tools.execute(action.tool, action.arguments)
+                try:
+                    execute_async = getattr(self.tools, "execute_async", None)
+                    if callable(execute_async):
+                        execute_parameters = inspect.signature(execute_async).parameters
+                        execute_kwargs: dict[str, Any] = {"cancellation": cancellation}
+                        if "call_id" in execute_parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in execute_parameters.values()
+                        ):
+                            execute_kwargs["call_id"] = event_call.id
+                        result = await execute_async(
+                            action.tool,
+                            action.arguments,
+                            **execute_kwargs,
+                        )
+                    else:
+                        cancellation.raise_if_cancelled()
+                        execute_parameters = inspect.signature(self.tools.execute).parameters
+                        execute_kwargs = {}
+                        if "call_id" in execute_parameters or any(
+                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in execute_parameters.values()
+                        ):
+                            execute_kwargs["call_id"] = event_call.id
+                        result = await asyncio.to_thread(
+                            self.tools.execute,
+                            action.tool,
+                            action.arguments,
+                            **execute_kwargs,
+                        )
+                except CancellationError:
+                    result = ToolResult(False, "任务已取消，该动作未完成")
+                    messages.append(
+                        self._protocol.tool_result_message(action, result, tool_call_id)
+                    )
+                    for later_action, later_id in zip(
+                        resolved.actions[action_index + 1 :],
+                        resolved.tool_call_ids[action_index + 1 :],
+                    ):
+                        messages.append(
+                            self._protocol.tool_result_message(
+                                later_action,
+                                ToolResult(False, "任务已取消，该动作未执行"),
+                                later_id,
+                            )
+                        )
+                    self._emit(event_sink, ToolExecutionCompleted(event_call.id, result))
+                    return turn_result(
+                        RunResult(False, "任务已取消", round_number, tool_calls, tuple(modified_files), verification)
+                    )
                 # 只消费工具在文件安全边界内确认的规范路径，不回读模型原始参数。
                 changed_paths = tuple(
                     dict.fromkeys(
@@ -578,24 +677,42 @@ class CodingAgent:
                         verification = "通过"
                 duration_ms = self._elapsed_ms(action_started)
                 self.observer.on_tool_result(action, result, duration_ms)
+                self._emit(event_sink, ToolExecutionCompleted(event_call.id, result))
                 messages.append(
                     self._protocol.tool_result_message(action, result, tool_call_id)
                 )
-                if not self._log(
-                    {
-                        "round": round_number,
-                        "status": "ok" if result.ok else "tool_error",
-                        "tool": (
-                            action.tool
-                            if self.tools.contains(action.tool)
-                            else "unknown"
-                        ),
-                        "reason_chars": len(action.reason),
-                        "arguments": self._audit_arguments(action, result),
-                        "output_chars": len(result.output),
-                        "duration_ms": duration_ms,
+                tool_event: dict[str, Any] = {
+                    "round": round_number,
+                    "status": "ok" if result.ok else "tool_error",
+                    "tool": (
+                        action.tool
+                        if self.tools.contains(action.tool)
+                        else "unknown"
+                    ),
+                    "reason_chars": len(action.reason),
+                    "arguments": self._audit_arguments(action, result),
+                    "output_chars": len(result.output),
+                    "duration_ms": duration_ms,
+                }
+                origin_resolver = getattr(self.tools, "origin", None)
+                if callable(origin_resolver) and self.tools.contains(action.tool):
+                    try:
+                        origin = origin_resolver(action.tool)
+                    except (TypeError, ValueError):
+                        origin = None
+                    if isinstance(origin, ToolOrigin):
+                        tool_event["origin"] = {
+                            "kind": origin.kind,
+                            "id": origin.id,
+                            "risk": origin.risk,
+                        }
+                if result.spill_reference is not None:
+                    tool_event["spill"] = {
+                        "reference": result.spill_reference,
+                        "bytes": result.spill_bytes,
+                        "sha256": result.spill_sha256,
                     }
-                ):
+                if not self._log(tool_event):
                     return turn_result(
                         self._audit_failure_result(
                             round_number,
@@ -647,12 +764,14 @@ class CodingAgent:
             )
         )
 
-    def _planning_round(
+    async def _planning_round_async(
         self,
         messages: list[Message],
         tool_calls: int,
         modified_files: list[str],
         verification: str,
+        cancellation: CancellationToken,
+        event_sink: EventSink | None,
     ) -> object:
         """任务执行前的规划阶段（round 0）：生成并注入分步计划。
 
@@ -662,9 +781,14 @@ class CodingAgent:
 
         started = time.perf_counter()
         try:
-            response = self.provider.complete(
-                [*messages, Message("user", PLANNING_PROMPT)], ()
+            response = await self._request_provider_async(
+                [*messages, Message("user", PLANNING_PROMPT)],
+                (),
+                cancellation,
+                event_sink,
             )
+        except CancellationError:
+            raise
         except ProviderError as exc:
             self.observer.on_error("规划失败，将直接执行")
             if not self._log(
@@ -688,6 +812,7 @@ class CodingAgent:
         plan = self._parse_plan(raw)
         if plan is not None:
             messages.append(Message("system", f"执行计划：\n{plan}"))
+            self._emit(event_sink, PlanningCompleted(plan))
             if not self._log(
                 {
                     "round": 0,
@@ -710,6 +835,65 @@ class CodingAgent:
             ):
                 return _PLAN_ABORT
         return response.usage
+
+    async def _request_provider_async(
+        self,
+        messages: list[Message],
+        tools: tuple[ToolDefinition, ...] | list[ToolDefinition],
+        cancellation: CancellationToken,
+        event_sink: EventSink | None,
+    ) -> ProviderResponse:
+        """消费流式 Provider；旧 fake/实现通过 complete 保持兼容。"""
+
+        stream = getattr(self.provider, "stream", None)
+        if not callable(stream):
+            cancellation.raise_if_cancelled()
+            response = await asyncio.to_thread(self.provider.complete, messages, tools)
+            for event in self._response_events(response):
+                self._emit(event_sink, event)
+            return response
+
+        content_parts: list[str] = []
+        calls: list[ToolCall] = []
+        usage: TokenUsage | None = None
+        finish_reason: str | None = None
+        completed = False
+        async for event in stream(messages, tools, cancellation=cancellation):
+            cancellation.raise_if_cancelled()
+            self._emit(event_sink, event)
+            if isinstance(event, TextDelta):
+                content_parts.append(event.text)
+            elif isinstance(event, ToolCallCompleted):
+                calls.append(event.call)
+            elif isinstance(event, UsageReported):
+                usage = event.usage if usage is None else usage.merge(event.usage)
+            elif isinstance(event, ProviderCompleted):
+                finish_reason = event.finish_reason
+                completed = True
+        if not completed:
+            raise ProviderProtocolError("模型服务流缺少完成事件")
+        content = "".join(content_parts) or None
+        if content is None and not calls:
+            raise ProviderProtocolError("模型服务流没有可用响应")
+        return ProviderResponse(content, tuple(calls), finish_reason, usage)
+
+    @staticmethod
+    def _response_events(response: ProviderResponse) -> tuple[AgentEvent, ...]:
+        """把仅支持 complete 的旧实现转换成等价类型化事件。"""
+
+        events: list[AgentEvent] = []
+        if response.content:
+            events.append(TextDelta(response.content))
+        events.extend(ToolCallCompleted(call) for call in response.tool_calls)
+        if response.usage is not None:
+            events.append(UsageReported(response.usage))
+        events.append(ProviderCompleted(response.finish_reason))
+        return tuple(events)
+
+    @staticmethod
+    def _emit(event_sink: EventSink | None, event: AgentEvent) -> None:
+        if event_sink is not None:
+            event_sink(event)
 
     @staticmethod
     def _parse_plan(raw: str) -> str | None:
@@ -793,6 +977,11 @@ class CodingAgent:
         arguments = action.arguments
         if action.tool in {"list_files", "read_file"}:
             return {"path": arguments.get("path", ".")}
+        if action.tool == "read_tool_result":
+            return {
+                "reference": arguments.get("reference"),
+                "offset": arguments.get("offset", 0),
+            }
         if action.tool == "search_text":
             query = arguments.get("query", "")
             return {

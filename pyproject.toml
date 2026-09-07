@@ -6,8 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "tricoder-cli"
 version = "0.1.0"
 description = "支持多模型与安全审批的轻量 Coding Agent"
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
+    "mcp==2.1.1",
     "rich>=15.0.0,<16",
     "textual>=8.0.0,<9",
 ]

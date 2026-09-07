@@ -6,10 +6,10 @@ active
 
 ## Goal
 
-Maintain the tricoder CLI as a safe, multi-provider local coding agent per its
-README, pyproject metadata, tests, and design documentation. Current milestone:
-harden command-policy boundaries, decouple the tool registry and
-provider-action protocols, and bound retrieval resources.
+Evolve the tricoder CLI from a safe, multi-provider local coding agent into a
+complete Agent platform while preserving its permission, audit, workspace,
+change-journal, and minimal-persistence boundaries. Current milestone: migrate
+Hcode capabilities through the approved native-adaptation roadmap.
 
 ## Scope
 
@@ -20,8 +20,11 @@ provider-action protocols, and bound retrieval resources.
 
 ## Non-goals
 
-- No OS-level sandboxing; human approval plus policy remain the primary boundary.
-- No third-party runtime dependencies beyond `rich`; no new external binaries.
+- No OS-level sandbox implementation in the current migration; human approval
+  plus policy remain the primary boundary.
+- No Hcode Remote/WebSocket server or full free-text conversation persistence.
+- No dependency addition, external binary, or source-code reuse before its
+  explicit approval and dependency/license gate.
 
 ## Constraints
 
@@ -31,7 +34,8 @@ provider-action protocols, and bound retrieval resources.
 
 ## Acceptance Criteria
 
-- `python -m unittest discover -s tests` passes (456 tests, 2 platform skips).
+- `python -m unittest discover -s tests` passes under the declared Python 3.11+
+  runtime; historical test counts remain recorded below and are not current evidence.
 - `python -m compileall -q src tests` passes.
 - `workspace.py doctor tricoder-cli` reports no findings for this project.
 - CommandPolicy rejects qualified executable paths, direct `pytest`/`ruff`/`mypy`
@@ -43,6 +47,30 @@ provider-action protocols, and bound retrieval resources.
 
 ## Decisions
 
+- 2026-09-07 已批准 verified-stdio 补救：生产本地 stdio 使用 TriCoder 自持
+  transport 和 direct process handle，结构化记录进程退出与自持流/任务关闭证据。
+  成功不代表任意后台化/脱离进程组后代已消失，不是 OS 沙盒。
+- SDK 日志仅在 task-local、来源验证的精确 logger + 词法绝对 pathname 作用域
+  过滤；lifecycle、请求和延迟清理 helper 各自持有租约。适配器绑定 `mcp==2.1.1`；
+  升级必须重做能力、日志、生命周期及依赖安全评审。remote/auto-install 不支持，
+  Windows 离线证据不代表真实外部 MCP/Provider 或跨平台兼容性。
+
+- Hcode migration uses native adaptation: TriCoder remains the architecture and
+  security authority; Hcode is a read-only source of designs, algorithms, and
+  test scenarios. Approved design and staged execution live in
+  docs/superpowers/specs/2026-09-03-hcode-capability-migration-design.md and
+  docs/superpowers/plans/2026-09-03-hcode-capability-migration.md.
+- The user selected MIT for TriCoder on 2026-09-03. Root `LICENSE`, `NOTICE`,
+  and package metadata now record that decision. Later Hcode adapt/copy work
+  must update `NOTICE` with concrete source and target files.
+- Phase 0 dependency research recommends official `mcp>=2.1.1,<2.2` and
+  `PyYAML>=6.0.3,<7` only as `approve-with-conditions` candidates for their
+  later phases. That was the Phase 0 decision; Phase 5 subsequently received
+  explicit approval and installed `mcp==2.1.1` on 2026-09-04, including its
+  manifest/lock changes. PyYAML remains subject to separate Phase 6 approval.
+- The migration includes streaming/runtime foundations, context management,
+  MCP, Skills, Hooks, Worktree, and child Agents. Remote and OS sandboxing are
+  explicitly excluded from this migration.
 - `tools.py` split into a `tools/` package (binding, gitignore, undo, handlers,
   filesystem, search, write, command) aggregated by `ToolRegistry`.
 - Provider action parsing extracted into `protocols.py` with an
@@ -59,9 +87,124 @@ provider-action protocols, and bound retrieval resources.
 - Search/glob are bounded: pattern length, `**` count, scan cap, regex length,
   and per-line length limits; `.gitignore` supports common basename/directory
   rules and is documented as a subset, not full Git semantics.
+- Phase 3 Context Manager keeps system/current-task boundaries and complete
+  tool rounds, anchors estimates to Provider usage when available, and falls
+  back to a conservative UTF-8 estimator without adding a tokenizer package.
+- Large tool results live under the Session state root, or for one-shot MCP
+  runs under the configured audit directory's `runtime/tool-results/`, with opaque
+  references, per-entry/session quotas, link/junction rejection, bounded
+  preview reads, metadata-only audit, startup cleanup, and `/clear` cleanup.
+- Phase 4 Extension Host owns only provider lifecycle, failure isolation and
+  aggregation. ToolRegistry remains the sole execution gateway and freezes
+  dynamic schemas with explicit origin/risk metadata and current-context binding.
+- Project extension configuration cannot authorize access to process secrets:
+  `credential_env` names require a second, process-only
+  `TRICODER_EXTENSION_ENV_ALLOWLIST` grant. Real extensions remain inactive.
 
 ## Progress
 
+- 2026-09-07 verified-stdio remediation：Task 1/2 已通过控制器独立复审；Task 3
+  精确日志隔离、文档与最终离线门禁已完成，最终验收仍由控制器独立复审。
+  本轮仅修改 SDK/client 日志边界、测试与文档；未改 manifest/lock/.venv，未提交。
+  完整证据与遗留风险见
+  `runtime/sdd/2026-09-07-tricoder-verified-stdio-remediation/task-3-report.md`。
+
+- Hcode migration Phase 5 implementation and Task 9 review completed on
+  2026-09-06; the final whole-feature fix round still awaits controller review
+  and fresh complete-suite verification. MCP is an explicitly
+  enabled, task-local local-stdio integration. Each Coding Task rebuilds and
+  re-approves its servers; every MCP tool is `dangerous`, stays behind the
+  asynchronous ToolRegistry gateway, and is removed during deterministic
+  cleanup. Remote MCP and automatic server installation remain unsupported.
+  Unsupported Schema, malformed output, timeout/cancellation and SDK failures
+  fail closed. The repository-local fake server uses only the official API and
+  does not access network, environment values, user directories or files.
+- Phase 5 changed files: added `src/tricoder/mcp/{__init__,client,manager,
+  models,runtime,schema,sdk,security,tool_adapter}.py`,
+  `tests/fixtures/fake_mcp_server.py`, and
+  `tests/test_mcp_{client,dependency_boundary,integration,manager,runtime,
+  schema,security,tool_adapter}.py`; modified `pyproject.toml`,
+  `requirements.lock`, `src/tricoder/{config,cli,session_runtime,ui}.py`,
+  `src/tricoder/tools/{__init__,command,handlers}.py`,
+  `src/tricoder/extensions/host.py`, `tests/test_{config,cli,session_runtime,
+  tools,extension_host,ui,context_spill}.py`, `README.md`, `project.md`,
+  `docs/framework/mcp-integration.md`,
+  `docs/open-source-assessment.md`, and the two MCP/migration plans under
+  `docs/superpowers/`. `NOTICE` is unchanged: this phase did not materially
+  copy third-party implementation code; the fake fixture only invokes the
+  official MCP API.
+- The approved direct dependency is `mcp==2.1.1`. `requirements.lock` records
+  only the observed Windows / Python 3.11.6 resolution; it is not proof of
+  Linux/macOS, Python 3.12, hash-pinned, or universal reproducibility. The
+  local stdio transport/pipe retains a residual risk for very large single-line
+  messages: bounded result handling cannot prove an end-to-end memory bound
+  before line buffering and JSON parsing.
+- Historical Phase 5 verification before the final fix round on Windows /
+  Python 3.11.6: MCP suite passed 110 tests
+  in 27.767s with 1 skip; complete suite passed 762 tests in 235.060s with 5
+  skips. The run emitted non-fatal asyncio/Textual slow-callback diagnostics
+  in fake-stdio and TUI paths; they were retained in the task report rather
+  than suppressed.
+- Final-fix focused verification on 2026-09-06: 121 MCP tests (1 existing
+  Windows permission skip) and 274 adjacent CLI/Session/tool/cancellation/
+  Shell/TUI tests passed; compileall and `git diff --check` exited 0. These
+  are scoped results, not a fresh complete-suite claim. The controller owns
+  final review and complete-suite verification.
+- Doctor output is additionally verified on Windows-compatible CP936 and UTF-8
+  streams with an explicit empty offline env file and a process-scoped
+  synthetic Key: both exit 0 without a network request or Key disclosure.
+- Hcode migration Phase 4 completed on 2026-09-03: added the Extension
+  descriptor/provider/host contract, collision-safe lifecycle aggregation,
+  cleanup and retry for partially started providers,
+  dynamic ToolRegistry registration with immutable schemas and origin-aware
+  audit, strict default-off extension configuration, and a secret-safe doctor
+  view. No real extension or dependency was enabled. Evidence is in
+  `docs/migration/phase-4-verification.md`.
+- Hcode migration Phase 3 completed on 2026-09-03: `ContextManager` now owns
+  token/character request preparation while the old compaction helpers remain
+  compatibility proxies. `ToolResultSpillStore` provides Session-isolated,
+  bounded large-result storage and `read_tool_result` supplies path-free chunked
+  access. SQLite retains only minimal Session data. Evidence is in
+  `docs/migration/phase-3-verification.md`.
+- Hcode migration Phase 2 completed on 2026-09-03: OpenAI-compatible
+  Providers now expose a bounded SSE stream over the existing urllib transport;
+  fragmented tool calls become executable only at a complete response boundary,
+  and final usage is delivered before completion. `run_with_context_async()` is
+  the normative Agent loop while synchronous callers retain a guarded wrapper.
+  Cancellation reaches Provider reads/backoff, tool boundaries, managed command
+  process trees, SessionRuntime, one-shot CLI, and TUI. Evidence is in
+  `docs/migration/phase-2-verification.md`.
+- Hcode migration Phase 1 completed on 2026-09-03: added immutable typed
+  Provider/Agent events with secret-safe repr boundaries, a thread-safe
+  parent-to-child cancellation token, and an atomic multi-dimensional execution
+  budget under `src/tricoder/core/`. The 12 new contract tests were developed
+  red-green; no existing Agent behavior or third-party dependency changed.
+  Evidence is in `docs/migration/phase-1-verification.md`.
+- Phase 0 partially completed on 2026-09-03: created the 17-capability Hcode
+  source/target/security/test map, verified Hcode provenance and MIT license,
+  and completed current MCP/YAML dependency candidate research. Detailed
+  evidence is in `docs/migration/hcode-capability-map.md`,
+  `docs/migration/phase-0-verification.md`, and
+  `docs/open-source-assessment.md`.
+- Phase 0 license gate resolved on 2026-09-03: the user selected MIT; no Hcode
+  implementation has yet been copied or substantially adapted.
+- Phase 0 environment repaired with explicit user approval: the Python 3.10
+  `.venv` was preserved under `runtime/env-backups/venv-py310-20260903/`, a
+  Python 3.11.6 `.venv` was created, and only existing declared dependencies
+  were installed. Current exact baseline is green: 545 tests pass (4 skips),
+  compileall passes, and all 3 smoke Eval cases validate in dry-run.
+- Phase 0 self-review completed: after explicit user approval, the one
+  pre-existing extra EOF blank line in `test/README.md` was removed and the
+  whole-repository `git diff --check` now passes.
+- Initial Phase 0 baseline before the authorized environment repair: project
+  `.venv` was Python 3.10.16 although
+  `pyproject.toml` requires Python 3.11+. Exact unittest ran 452 tests and ended
+  with 9 import errors plus 2 skips; all 9 errors and Eval dry-run failure share
+  the confirmed missing-`tomllib` environment cause. `compileall` passed. No
+  code or environment change was made.
+- Completed: read-only Hcode/TriCoder architecture comparison and approved the
+  native-adaptation target architecture, end-to-end data flow, security
+  invariants, phased gates, rollback rules, and cross-session handoff plan.
 - Completed: policy P0/P1 hardening + regression tests; launcher junction
   escape check + test; protocol delegation + `test_protocols.py`; glob/search
   resource bounds + gitignore basename fix + test fixes; README updates.
@@ -140,11 +283,19 @@ provider-action protocols, and bound retrieval resources.
 
 ## Next Action
 
+- 先完成 verified-stdio remediation Task 3 的控制器独立复审（离线门禁已通过）；
+  本轮证据见 `runtime/sdd/2026-09-07-tricoder-verified-stdio-remediation/task-3-report.md`。
+- Phase 5 最终验收后进入 Phase 6：Skills 与项目指令。先重新读取项目规则、Phase 6 设计/计划和当前
+  Git 状态，确认 YAML 依赖、解析范围与写入边界；不得把本轮 Windows 本地结果
+  当作跨平台、真实 Provider 或真实外部 MCP server 的验证。
+
+## Later Roadmap
+
 - Confirm the full CI matrix (Linux/Windows, Python 3.11/3.12) once pushed.
 - Consider stage-two provider registry consolidation (key_env/base_url/model/
   label/choices in one place) to cut the 5-touchpoint provider onboarding.
 - TUI roadmap: `/session` cross-workspace switching, command-output paging,
-  worker cancellation on exit.
+  and coalescing very small streaming chunks into fewer RichLog entries.
 - Planner-Executor roadmap: planning with read-only exploration tools;
   per-task plan persistence for `/diff`/`/undo` context.
 - Round-budget roadmap: remaining-rounds prompt injection; stagnation
@@ -152,8 +303,8 @@ provider-action protocols, and bound retrieval resources.
 
 ## Blockers
 
-- None for tricoder-cli. Workspace check failures in another project are out of
-  scope.
+- Phase 5 依赖安装与 manifest/lock 变更已经获批并完成，不再是阻塞项；
+  当前等待 verified-stdio 补救的控制器复核。Phase 6 的新依赖仍须另行批准。
 
 ## Eval
 
@@ -170,6 +321,76 @@ provider-action protocols, and bound retrieval resources.
 
 ## Verification
 
+- 2026-09-07 verified-stdio remediation 历史门禁（Task 3 fix 前），Windows / Python 3.11.6 / `mcp==2.1.1`：
+  - MCP 全套：`Ran 172 tests in 41.827s`，exit 0，1 项既有权限 skip。
+  - 全项目：`Ran 828 tests in 123.703s`，exit 0，5 skips；没有真实 Provider 或外部 MCP。
+  - compileall、`git diff --check` 均 exit 0；pycache 仅写入 remediation runtime。
+  - CP936/UTF-8 doctor 使用显式合成 env 文件与进程局部 placeholder，均 exit 0，
+    输出不含 placeholder；不发送模型请求。smoke Eval 只 dry-run，3/3 validated；
+    `workspace.py doctor tricoder-cli` exit 0、0 findings。
+  - 原始测试与命令输出保存在同一 remediation runtime；慢回调诊断未隐藏。
+    此后 Task 3 fix 修改 sdk.py 与两项日志测试，仅重跑 73 项 focused，不能把
+    上述 172/828 当作 fix 后证据；见 remediation runtime 的 Task 3 fix report。
+
+- 2026-09-07 verified-stdio 最终修复新鲜门禁（最后代码/测试修改之后）：
+  - I1–I5 的最终修复与 M1 证据更正已实施，等待控制器独立复审；不认领可提交或发布。
+  - focused：113 tests / 32.468s，exit 0、无 skips；MCP 全套：202 tests / 48.040s，
+    exit 0、1 项既有符号链接权限 skip；完整项目：858 tests / 131.336s，exit 0、5 项
+    既有符号链接权限 skips。完整项目另有 6 条 TUI slow-callback 诊断（0.109–0.110s）。
+  - compileall（pycache 写入 remediation runtime）、`git diff --check`、CP936/UTF-8
+    离线 doctor 均 exit 0；显式使用本轮 `offline-doctor.env` 假值且输出不含 placeholder。
+    CP936 捕获显示替代字符仍是展示限制，不作编码或跨平台完备证明。
+  - eval dry-run 3/3 validated；workspace doctor exit 0、0 findings。没有联网、真实
+    Provider/外部 MCP、依赖变化、暂存或 commits；HEAD 仍为 `72a501f1`、分支 `main`。
+  - 证据及边界见 `runtime/sdd/2026-09-07-tricoder-verified-stdio-remediation/final-fix-report.md`；
+    `final-fix-focused.log`、`final-fix-mcp.log`、`final-fix-full.log` 为原始测试记录。
+    后续改动仅为本证据文档与报告，不改变以上已验证代码或测试。
+
+- 2026-09-03 Phase 4 verification under Python 3.11.6:
+  - focused Host/Registry/Config/doctor/Agent/Runtime suite → exit 0,
+    `Ran 387 tests in 23.309s`, OK.
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -q` → exit 0,
+    `Ran 631 tests in 95.451s`, OK, 4 skipped.
+  - compileall → exit 0; smoke Eval dry-run → exit 0, 3/3 validated;
+    workspace doctor → exit 0, 0 findings; `git diff --check` → exit 0.
+- 2026-09-03 Phase 3 verification under Python 3.11.6:
+  - focused Context/spill/Agent/Tool/Runtime/Session/Protocol/Provider suite →
+    exit 0, `Ran 309 tests`, OK.
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -q` → exit 0,
+    `Ran 606 tests in 82.877s`, OK, 4 skipped.
+  - compileall → exit 0; smoke Eval dry-run → exit 0, 3/3 validated;
+    workspace doctor → exit 0, 0 findings; `git diff --check` → exit 0.
+- 2026-09-03 Phase 2 verification under Python 3.11.6:
+  - focused Provider/Agent/Session/subprocess suite → exit 0, `Ran 100 tests`, OK.
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests` → exit 0,
+    `Ran 581 tests in 252.453s`, OK, 4 skipped.
+  - `.\.venv\Scripts\python.exe -B -m compileall -q src tests` → exit 0.
+  - smoke Eval dry-run → exit 0, 3/3 cases validated.
+  - workspace doctor → exit 0, 0 findings; `git diff --check` → exit 0.
+- 2026-09-03 Phase 1 verification under Python 3.11.6:
+  - focused red run exited 1 with the expected three missing `tricoder.core`
+    import errors; the green run passed all 12 new contract tests.
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests` → exit 0,
+    `Ran 557 tests in 76.192s`, OK, 4 skipped.
+  - `.\.venv\Scripts\python.exe -B -m compileall -q src tests` → exit 0.
+  - `.\.venv\Scripts\python.exe -B -m tricoder eval evals\smoke --dry-run --no-color`
+    → exit 0, 3/3 cases validated.
+  - isolated core import boundary check → exit 0; no Hcode, TUI, Session,
+    Tools, Provider implementation or Provider SDK import.
+- 2026-09-03 refreshed Python 3.11.6 baseline after the authorized environment
+  rebuild:
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests` → exit 0,
+    `Ran 545 tests in 72.607s`, OK, 4 skipped.
+  - `.\.venv\Scripts\python.exe -B -m compileall -q src tests` → exit 0.
+  - `.\.venv\Scripts\python.exe -B -m tricoder eval evals\smoke --dry-run --no-color`
+    → exit 0, 3/3 cases validated.
+- 2026-09-03 initial failing evidence retained for diagnosis history:
+  - `.\.venv\Scripts\python.exe -B -m unittest discover -s tests` → exit 1,
+    `Ran 452 tests`, 9 import errors, 2 skips; confirmed cause is Python 3.10
+    lacking `tomllib` while the project requires 3.11+.
+  - `.\.venv\Scripts\python.exe -B -m compileall -q src tests` → exit 0.
+  - `.\.venv\Scripts\python.exe -B -m tricoder eval evals\smoke --dry-run --no-color`
+    → exit 1 at the same missing-`tomllib` import boundary.
 - `.venv\Scripts\python -m unittest discover -s tests` → Ran 459, OK (2 skips:
   Windows cannot create symlinks).
 - `.venv\Scripts\python -m compileall -q src tests` → OK.

@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Any
 
+from tricoder.core.cancellation import CancellationError, CancellationToken
+
 
 _READ_CHUNK_BYTES = 8192
 _WAIT_SLICE_SECONDS = 0.02
@@ -36,11 +38,14 @@ def run_bounded_process(
     env: Mapping[str, str],
     timeout: float,
     max_output_bytes: int,
+    cancellation: CancellationToken | None = None,
 ) -> BoundedProcessResult:
     """Run without a shell while retaining at most ``max_output_bytes`` total."""
 
     if max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     popen_options: dict[str, object] = {}
     if os.name == "nt":
         popen_options["creationflags"] = getattr(
@@ -71,6 +76,7 @@ def run_bounded_process(
             timeout=timeout,
             max_output_bytes=max_output_bytes,
             windows_job=windows_job,
+            cancellation=cancellation,
         )
     except BaseException:
         _terminate_process_tree(process, env, windows_job)
@@ -84,6 +90,7 @@ def _collect_bounded_process(
     timeout: float,
     max_output_bytes: int,
     windows_job: "_WindowsJob | None",
+    cancellation: CancellationToken | None = None,
 ) -> BoundedProcessResult:
     assert process.stdout is not None
     assert process.stderr is not None
@@ -124,7 +131,11 @@ def _collect_bounded_process(
 
     deadline = time.monotonic() + timeout
     timed_out = False
+    cancelled = False
     while process.poll() is None:
+        if cancellation is not None and cancellation.is_cancelled:
+            cancelled = True
+            break
         if exceeded.is_set():
             break
         remaining = deadline - time.monotonic()
@@ -136,7 +147,7 @@ def _collect_bounded_process(
         except subprocess.TimeoutExpired:
             continue
 
-    if not exceeded.is_set() and not timed_out:
+    if not exceeded.is_set() and not timed_out and not cancelled:
         process.wait()
     cleanup_failed = not _terminate_process_tree(process, env, windows_job)
 
@@ -144,6 +155,11 @@ def _collect_bounded_process(
         reader.join(timeout=_CLEANUP_TIMEOUT_SECONDS)
         if reader.is_alive():
             cleanup_failed = True
+
+    if cancelled:
+        if cleanup_failed:
+            raise OSError("取消后无法确认进程树已终止")
+        raise CancellationError("操作已取消")
 
     return BoundedProcessResult(
         returncode=process.returncode,
