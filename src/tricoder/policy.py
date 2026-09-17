@@ -300,7 +300,9 @@ class CommandPolicy:
     @classmethod
     def _canonical_executable(cls, raw: str) -> str:
         """把可信解析后的解释器文件名归一化为稳定的审计分类。"""
-        executable = Path(raw).name.lower().removesuffix(".exe")
+        # ``Path`` 只理解宿主平台的分隔符；审计/测试可能接收另一平台已经
+        # 审批过的绝对 argv，因此同时识别 ``/`` 与 ``\\``。
+        executable = re.split(r"[\\/]", raw)[-1].lower().removesuffix(".exe")
         if cls._VERSIONED_PYTHON.fullmatch(executable):
             return "python"
         return executable
@@ -453,7 +455,7 @@ class CommandPolicy:
     @classmethod
     def is_relaxed_git_metadata_command(cls, args: list[str]) -> bool:
         """判断命令是否只返回工作区 Git 元数据，可在 relaxed 下自动执行。"""
-        if not args or Path(args[0]).name.lower().removesuffix(".exe") != "git":
+        if not args or cls._canonical_executable(args[0]) != "git":
             return False
         index = 1
         while index < len(args) and args[index] in cls._GIT_ALLOWED_PREFIX:
@@ -532,19 +534,20 @@ class CommandPolicy:
         for token in params:
             if token.startswith("-"):
                 continue
+            # 先按两类平台语法做词法拒绝。否则 POSIX 会把 ``C:\\outside``
+            # 当作工作区内含冒号/反斜杠的普通文件名，反之亦然。
+            if (
+                self._ABSOLUTE_PATH_PREFIX.match(token)
+                or token.startswith(("/", "\\"))
+                or ".." in re.split(r"[\\/]", token)
+            ):
+                raise PolicyError(f"{label} 不接受绝对或越界路径参数：{token}")
             if self._workspace_policy is not None:
                 try:
                     self._workspace_policy.resolve_path(token, must_exist=False)
                 except PolicyError:
                     raise PolicyError(f"{label} 路径不在工作区内：{token}")
                 continue
-            if (
-                self._ABSOLUTE_PATH_PREFIX.match(token)
-                or token.startswith(("/", "\\"))
-            ):
-                raise PolicyError(f"{label} 不接受绝对路径参数：{token}")
-            if ".." in token.split("/") or ".." in token.split("\\"):
-                raise PolicyError(f"{label} 不接受越界路径参数：{token}")
 
     def _reject_path_like_value(self, value: str, label: str) -> None:
         """`--opt=value` 的 value 不允许是外部路径或越界片段。"""

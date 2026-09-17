@@ -182,8 +182,27 @@ class SnapshotTests(WorkspaceCase):
             values["st_file_attributes"] = 0x400
             return SimpleNamespace(**values)
 
-        with patch.object(Path, "lstat", reparse):
-            self.assertFalse(self.capture().complete)
+        if os.name == "nt":
+            with patch.object(Path, "lstat", reparse):
+                self.assertFalse(self.capture().complete)
+        else:
+            real_stat = os.stat
+
+            def reparse_at(path, *args, **kwargs):
+                metadata = real_stat(path, *args, **kwargs)
+                if os.fspath(path) != "app.py" or kwargs.get("follow_symlinks") is not False:
+                    return metadata
+                from types import SimpleNamespace
+                values = {
+                    name: getattr(metadata, name)
+                    for name in dir(metadata)
+                    if name.startswith("st_")
+                }
+                values["st_mode"] = stat.S_IFLNK | 0o777
+                return SimpleNamespace(**values)
+
+            with patch.object(api.os, "stat", side_effect=reparse_at):
+                self.assertFalse(self.capture().complete)
 
     def test_symlink_is_not_followed(self):
         link = self.root / "link"
