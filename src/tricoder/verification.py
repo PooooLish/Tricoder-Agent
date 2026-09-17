@@ -16,7 +16,10 @@ from typing import Iterator
 from tricoder.policy import WorkspacePolicy, is_sensitive_workspace_path
 
 
-_SCOPE_VERSION = "workspace-v1:git,venv,pycache,pytest-cache;owned-audit-files"
+_SCOPE_VERSION = (
+    "workspace-v2:git,venv,pycache,pytest-cache;canonical-owned-audit-files;"
+    "stable-object-metadata"
+)
 _CACHE_DIRECTORIES = frozenset({".git", ".venv", "__pycache__", ".pytest_cache"})
 _CHUNK = 64 * 1024
 
@@ -195,6 +198,11 @@ class _IncompleteScan(OSError):
     pass
 
 
+def _canonical_path_key(path: Path) -> str:
+    """生成宿主文件系统语义下的路径键，合并大小写与短/长路径别名。"""
+    return os.path.normcase(os.path.normpath(str(path.resolve(strict=False))))
+
+
 def capture_workspace(
     policy: WorkspacePolicy, *, scope_id: str, max_files: int = 10000,
     max_total_bytes: int = 104857600, max_file_bytes: int = 8388608,
@@ -205,9 +213,17 @@ def capture_workspace(
     限时为协作式预算（系统调用可能阻塞）；快照返回后仍有 TOCTOU 窗口。
     """
     root = policy.workspace
-    excluded = tuple(sorted(str(path.absolute()) for path in _audit_files))
+    root_key = _canonical_path_key(root)
+    excluded = tuple(sorted(_canonical_path_key(path) for path in _audit_files))
+    excluded_relatives: set[str] = set()
+    for path_key in excluded:
+        try:
+            excluded_relatives.add(Path(path_key).relative_to(Path(root_key)).as_posix())
+        except ValueError:
+            # 工作区外的审计路径不会扩大扫描排除范围。
+            continue
     scope = hashlib.sha256(json.dumps(
-        [_SCOPE_VERSION, os.path.normcase(str(root)), scope_id, excluded],
+        [_SCOPE_VERSION, root_key, scope_id, excluded],
         ensure_ascii=True, separators=(",", ":"),
     ).encode()).hexdigest()
     digest = hashlib.sha256()
@@ -249,7 +265,7 @@ def capture_workspace(
                             raise _IncompleteScan("link-or-type")
                         if stat.S_ISDIR(item.st_mode) and entry.name.lower() in _CACHE_DIRECTORIES:
                             continue
-                        if str(path.absolute()) in excluded and stat.S_ISREG(item.st_mode):
+                        if relative in excluded_relatives and stat.S_ISREG(item.st_mode):
                             continue
                         if is_sensitive_workspace_path(relative):
                             limitations.add("sensitive")

@@ -1,7 +1,7 @@
 """最终审查反例：真实边界、内存资源及固定线程调度，不启动外部进程。"""
 
 import asyncio
-import dis
+import inspect
 import importlib
 import io
 import logging
@@ -505,20 +505,28 @@ class FinalLoggingTests(unittest.TestCase):
         reached, resume = threading.Event(), threading.Event()
         errors = []
         code = isolate_sdk_logs.__wrapped__.__code__
-        offsets = {instruction.offset for instruction in dis.get_instructions(code)
-                   if instruction.opname == "STORE_ATTR" and instruction.argval == "filters"}
-        stores = 0
+        lines, first_line = inspect.getsourcelines(isolate_sdk_logs.__wrapped__)
+        assignment_lines = [
+            first_line + index
+            for index, line in enumerate(lines)
+            if "logger.filters =" in line
+        ]
+        self.assertEqual(2, len(assignment_lines))
+        target_line = assignment_lines[0 if install else 1]
+        paused = False
 
         def trace(frame, event, arg):
-            nonlocal stores
-            if frame.f_code is code:
-                frame.f_trace_opcodes = True
-                if event == "opcode" and frame.f_lasti in offsets:
-                    stores += 1
-                    if stores == (1 if install else 2):
-                        reached.set()
-                        if not resume.wait(10):
-                            raise AssertionError("synthetic scheduler timeout")
+            nonlocal paused
+            if (
+                not paused
+                and frame.f_code is code
+                and event == "line"
+                and frame.f_lineno == target_line
+            ):
+                paused = True
+                reached.set()
+                if not resume.wait(10):
+                    raise AssertionError("synthetic scheduler timeout")
             return trace
 
         def worker():

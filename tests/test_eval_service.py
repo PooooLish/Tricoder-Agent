@@ -95,6 +95,13 @@ class EvalServiceTests(unittest.TestCase):
             (case_dir / "workspace" / "app.py").write_text(
                 "value = 1\n", encoding="utf-8"
             )
+            (case_dir / "workspace" / "test_smoke.py").write_text(
+                "import unittest\n\n"
+                "class SmokeTest(unittest.TestCase):\n"
+                "    def test_workspace_is_runnable(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
             (case_dir / "verifier" / "test_hidden.py").write_text(
                 "import unittest\nfrom pathlib import Path\n\n"
                 "class HiddenTest(unittest.TestCase):\n"

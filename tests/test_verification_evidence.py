@@ -299,6 +299,25 @@ class SnapshotTests(WorkspaceCase):
         (audit.parent / "ordinary.txt").write_text("not an owned log", encoding="utf-8")
         self.assertFalse(evidence.is_valid_for(self.tools.context.verification_scope.capture(self.policy)))
 
+    def test_owned_audit_alias_is_canonicalized_before_exclusion(self):
+        """同一审计文件的 ``..``/短长路径别名不能污染验证快照。"""
+        alias_parent = self.root / "alias"
+        alias_parent.mkdir()
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        audit_alias = alias_parent / ".." / "runtime" / "task.jsonl"
+        audit_alias.write_text("first\n", encoding="utf-8")
+        scope = self.api().VerificationScope(audit_files=(audit_alias,))
+
+        before = scope.capture(self.policy)
+        with audit_alias.open("a", encoding="utf-8") as stream:
+            stream.write("second\n")
+        after = scope.capture(self.policy)
+
+        self.assertTrue(before.complete, before.limitations)
+        self.assertTrue(after.complete, after.limitations)
+        self.assertEqual(before.digest, after.digest)
+
 
 class CommandEvidenceTests(WorkspaceCase):
     def test_shared_transition_is_idempotent_and_keeps_same_version_failure(self):
@@ -344,7 +363,13 @@ class CommandEvidenceTests(WorkspaceCase):
 
     def test_check_modifying_source_is_unknown_not_trusted_success(self):
         (self.root / "test_mutate.py").write_text(
-            "from pathlib import Path\nPath('app.py').write_text('x = 9\\n')\n", encoding="utf-8")
+            "import unittest\n"
+            "from pathlib import Path\n\n"
+            "class MutatingTest(unittest.TestCase):\n"
+            "    def test_mutate(self):\n"
+            "        Path('app.py').write_text('x = 9\\n')\n",
+            encoding="utf-8",
+        )
         result = self.tools.execute("run_command", {"command": "python -m unittest discover -q -p test_mutate.py"})
         self.assertTrue(result.ok, result.output)
         self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
