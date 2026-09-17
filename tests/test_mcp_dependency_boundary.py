@@ -204,3 +204,60 @@ class MCPProcessBindingsTests(unittest.IsolatedAsyncioTestCase):
             "command": "approved.exe", "args": ["argument"], "env": {"ONLY": "approved"},
             "cwd": "approved-cwd", "errlog": stderr,
         }, captured)
+
+
+class MCPColdImportTests(unittest.TestCase):
+    """每个导入拓扑都在全新解释器中验证，避免测试顺序掩盖循环依赖。"""
+
+    def test_supported_entry_points_import_in_fresh_processes(self):
+        # 若 tools 再次在模块顶层导入 MCPToolHandler，mcp-first 和各 MCP
+        # 子模块都会在部分初始化的 tool_adapter 上失败；tools-first 则可能假绿。
+        scripts = {
+            "mcp-first": "import tricoder.mcp.tool_adapter; import tricoder.tools",
+            "tools-first": "import tricoder.tools; import tricoder.mcp.tool_adapter",
+            "tools-reexport": (
+                "from tricoder.tools import MCPToolHandler; "
+                "from tricoder.mcp.tool_adapter import MCPToolHandler as Direct; "
+                "assert MCPToolHandler is Direct"
+            ),
+            "cli": "import tricoder.cli",
+            "agent": "from tricoder.agent import CodingAgent",
+            "session-runtime": "from tricoder.session_runtime import SessionRuntime",
+            "mcp-manager": "from tricoder.mcp.manager import MCPManager",
+        }
+        for module in (
+            "tricoder.mcp",
+            "tricoder.mcp.client",
+            "tricoder.mcp.manager",
+            "tricoder.mcp.models",
+            "tricoder.mcp.runtime",
+            "tricoder.mcp.schema",
+            "tricoder.mcp.sdk",
+            "tricoder.mcp.security",
+            "tricoder.mcp.tool_adapter",
+            "tricoder.mcp.transport",
+        ):
+            scripts[f"module:{module}"] = f"import {module}"
+
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        for name, script in scripts.items():
+            with self.subTest(topology=name):
+                completed = subprocess.run(
+                    [sys.executable, "-B", "-c", script],
+                    cwd=Path(__file__).resolve().parents[1],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertEqual(
+                    0,
+                    completed.returncode,
+                    f"fresh import failed for {name}:\n{completed.stderr}",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

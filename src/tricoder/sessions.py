@@ -123,8 +123,8 @@ class SessionStore:
             raise SessionError("会话数据库不能位于目标工作区内")
         try:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connection() as connection:
-                connection.executescript(
+            with self._transaction() as connection:
+                connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS sessions (
                         id TEXT PRIMARY KEY,
@@ -134,7 +134,11 @@ class SessionStore:
                         model TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
-                    );
+                    )
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS session_memory (
                         session_id TEXT PRIMARY KEY,
                         summary TEXT NOT NULL DEFAULT '',
@@ -143,14 +147,24 @@ class SessionStore:
                         modified_files_json TEXT NOT NULL DEFAULT '[]',
                         verification TEXT NOT NULL DEFAULT '未运行',
                         permission TEXT NOT NULL DEFAULT 'strict',
+                        unknown_effects INTEGER NOT NULL DEFAULT 0,
                         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                    );
+                    )
                     """
                 )
+                self._ensure_unknown_effects_column(connection)
                 self._ensure_permission_column(connection)
-                connection.commit()
         except (OSError, sqlite3.Error) as error:
             raise SessionError("会话数据库初始化失败") from error
+
+    @staticmethod
+    def _ensure_unknown_effects_column(connection: sqlite3.Connection) -> None:
+        """旧库只补充布尔元数据，不复制、删除记录或持久化源码。"""
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(session_memory)")}
+        if "unknown_effects" not in columns:
+            connection.execute(
+                "ALTER TABLE session_memory ADD COLUMN unknown_effects INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _ensure_permission_column(connection: sqlite3.Connection) -> None:
@@ -319,7 +333,7 @@ class SessionStore:
         row = self._fetchone(
             """
             SELECT summary, requirements_summary, last_task_summary,
-                   modified_files_json, verification, permission
+                   modified_files_json, verification, permission, unknown_effects
             FROM session_memory WHERE session_id = ?
             """,
             (session_id,),
@@ -332,6 +346,9 @@ class SessionStore:
             raise SessionError("会话记忆数据损坏") from error
         if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
             raise SessionError("会话记忆数据损坏")
+        unknown = row["unknown_effects"]
+        if type(unknown) is not int or unknown not in (0, 1):
+            raise SessionError("会话未确认状态损坏")
         return SessionMemory(
             summary=_require_text(row, "summary"),
             requirements_summary=_require_text(row, "requirements_summary"),
@@ -339,12 +356,15 @@ class SessionStore:
             modified_files=tuple(files),
             verification=_require_text(row, "verification"),
             permission_level=_require_text(row, "permission"),
+            unknown_effects=bool(unknown),
         )
 
     def save_memory(self, session_id: str, memory: SessionMemory) -> None:
         """原子保存安全摘要和结构化状态，不接受非字符串文件路径。"""
         if not all(isinstance(item, str) for item in memory.modified_files):
             raise SessionError("修改文件列表必须只包含文本路径")
+        if type(memory.unknown_effects) not in (bool, int) or memory.unknown_effects not in (0, 1):
+            raise SessionError("会话未确认状态必须为 0 或 1")
         files_json = json.dumps(list(memory.modified_files), ensure_ascii=False)
         updated_at = self._clock()
         try:
@@ -353,7 +373,7 @@ class SessionStore:
                     """
                     UPDATE session_memory
                     SET summary = ?, requirements_summary = ?, last_task_summary = ?,
-                        modified_files_json = ?, verification = ?, permission = ?
+                        modified_files_json = ?, verification = ?, permission = ?, unknown_effects = ?
                     WHERE session_id = ?
                     """,
                     (
@@ -363,6 +383,7 @@ class SessionStore:
                         files_json,
                         memory.verification,
                         memory.permission_level,
+                        int(memory.unknown_effects),
                         session_id,
                     ),
                 )

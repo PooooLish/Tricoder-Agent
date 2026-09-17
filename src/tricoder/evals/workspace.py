@@ -18,6 +18,7 @@ from .models import EvalCase
 
 RESERVED_VERIFIER_DIR = ".tricoder_eval_verifier"
 _HIDDEN_PROCESS_HELPER = "_tricoder_bounded_process.py"
+_HIDDEN_RUNTIME_PACKAGE = "tricoder"
 
 
 class WorkspaceSafetyError(ValueError):
@@ -91,10 +92,50 @@ def install_verifier(case: EvalCase, workspace: Path) -> Path:
         raise WorkspaceSafetyError("保留 verifier 目录已存在")
     verifier.mkdir()
     _copy_tree(case.verifier_dir, verifier, root)
-    helper_source = Path(subprocess_control.__file__).resolve(strict=True)
-    helper_destination = _within_root(verifier / _HIDDEN_PROCESS_HELPER, root)
-    shutil.copyfile(helper_source, helper_destination)
+    _install_bounded_process_runtime(verifier, root)
     return verifier
+
+
+def _install_bounded_process_runtime(verifier: Path, root: Path) -> None:
+    """只复制隐藏进程 helper 的最小本地依赖闭包，避免依赖开发环境。"""
+
+    process_source = Path(subprocess_control.__file__)
+    _reject_link_or_reparse_path(process_source)
+    source_root = process_source.resolve(strict=True).parent
+    runtime_package = _within_root(verifier / _HIDDEN_RUNTIME_PACKAGE, root)
+    runtime_core = _within_root(runtime_package / "core", root)
+    runtime_package.mkdir()
+    runtime_core.mkdir()
+
+    # 空包标记避免工作区中同名恶意包或机器上已安装版本抢先参与导入。
+    for marker in (runtime_package / "__init__.py", runtime_core / "__init__.py"):
+        destination = _within_root(marker, root)
+        destination.write_text("", encoding="utf-8")
+
+    sources = (
+        (source_root / "subprocess_control.py", verifier / _HIDDEN_PROCESS_HELPER),
+        (source_root / "task_cleanup.py", runtime_package / "task_cleanup.py"),
+        (source_root / "core" / "cancellation.py", runtime_core / "cancellation.py"),
+    )
+    for source, destination in sources:
+        _copy_framework_file(source, destination, root)
+
+
+def _copy_framework_file(source: Path, destination: Path, root: Path) -> None:
+    """把一个普通框架文件复制到已核对的 verifier 保留目录。"""
+
+    # 先核对词法目标本身，再解析并复核最终对象；不能让源文件链接借 resolve
+    # 悄悄变成一个看似普通的目标文件。
+    _reject_link_or_reparse_path(source)
+    source = source.resolve(strict=True)
+    _reject_link_or_reparse_path(source)
+    if not stat.S_ISREG(source.lstat().st_mode):
+        raise WorkspaceSafetyError("隐藏验证 helper 源必须是普通文件")
+    destination = _within_root(destination, root)
+    if os.path.lexists(destination):
+        raise WorkspaceSafetyError("隐藏验证 helper 目标已存在")
+    _ensure_directory(destination.parent)
+    shutil.copyfile(source, destination)
 
 
 def remove_verifier(workspace: Path) -> None:

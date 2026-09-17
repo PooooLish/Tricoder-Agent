@@ -213,7 +213,8 @@ class TerminalUI:
         table.add_row("模型", Text(record.model))
         table.add_row("模式", "只读" if config.read_only else "可编辑 · 人工审批")
         memory = getattr(active, "memory", None)
-        table.add_row("验证", Text(getattr(memory, "verification", "未运行")))
+        table.add_row("上次文件状态检查", Text(getattr(memory, "verification", "未运行")))
+        table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("上下文消息", str(len(getattr(context, "messages", ()))))
         if status.unsaved_memory:  # type: ignore[attr-defined]
             table.add_row("记忆", Text(status.warning or "本次记忆未持久化", style="yellow"))  # type: ignore[attr-defined]
@@ -329,7 +330,8 @@ class TerminalUI:
         table.add_row("状态", "成功" if result.ok else "未完成")
         table.add_row("摘要", Text(result.summary))
         table.add_row("修改文件", str(len(result.modified_files)))
-        table.add_row("验证结果", Text(result.verification))
+        table.add_row("文件状态检查", Text(result.verification))
+        table.add_row("检查边界", "受覆盖文件，非业务验收")
         if result.usage is not None:
             table.add_row("累计用量", Text(_format_token_usage(result.usage)))
         color = "green" if result.ok else "red"
@@ -353,7 +355,8 @@ class TerminalUI:
         table.add_row("摘要", Text(result.summary))
         table.add_row("工具调用", str(result.tool_calls))
         table.add_row("修改文件", str(len(result.modified_files)))
-        table.add_row("验证结果", result.verification)
+        table.add_row("文件状态检查", Text(result.verification))
+        table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("模型轮数", str(result.rounds))
         if result.usage is not None:
             table.add_row("累计用量", Text(_format_token_usage(result.usage)))
@@ -433,9 +436,11 @@ class TerminalUI:
         icon = "✓" if result.ok else "✗"
         style = "green" if result.ok else "red"
         state = "完成" if result.ok else "失败"
+        error_label = (f" · {result.error.code.value} / {result.error.recovery.value}"
+                       if result.error is not None else "")
         self.console.print(
             Text(
-                f"  {icon} {state} · {len(result.output):,} 字符 · {duration_ms} ms",
+                f"  {icon} {state} · {len(result.output):,} 字符 · {duration_ms} ms{error_label}",
                 style=style,
             )
         )

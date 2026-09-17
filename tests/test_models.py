@@ -18,6 +18,14 @@ from tricoder.models import (
 
 
 class StructuredModelTests(unittest.TestCase):
+    def test_cleanup_failure_downgrades_success_and_preserves_legacy_positions(self):
+        result = RunResult(True, "done", 1, 2, (), "未运行", None, False)
+        self.assertFalse(getattr(result, "cleanup_failed", None), "RunResult 缺少 cleanup_failed 默认值")
+        self.assertTrue(hasattr(result, "cleanup_failed"), "RunResult 缺少 cleanup_failed")
+        failed = RunResult(True, "done", 1, cleanup_failed=True)
+        self.assertFalse(failed.ok)
+        self.assertTrue(failed.cleanup_failed)
+
     def test_tool_result_keeps_legacy_and_multi_file_paths(self) -> None:
         result = ToolResult(True, "ok", "legacy.py", ("a.py", "b.py"))
 

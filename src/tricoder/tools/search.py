@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tricoder.models import ToolResult
+from tricoder.models import ToolResult, tool_failure
+from tricoder.execution_state import ErrorCode
 from tricoder.policy import PolicyError
 
 from tricoder.tools.gitignore import _GitIgnoreMatcher
@@ -39,21 +40,21 @@ class SearchTextTool(ToolHandler):
         query = self._required_str(arguments, "query")
         use_regex = arguments.get("use_regex", False)
         if not isinstance(use_regex, bool):
-            return ToolResult(False, "use_regex 必须是布尔值")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "use_regex 必须是布尔值")
         if use_regex:
             if len(query) > _MAX_REGEX_CHARS:
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    ErrorCode.INVALID_ARGUMENT,
                     f"正则表达式过长（最多 {_MAX_REGEX_CHARS} 字符），"
                     "防止灾难性回溯拖慢 Agent",
                 )
             try:
                 compiled = re.compile(query)
-            except re.error as exc:
-                return ToolResult(False, f"正则表达式无效：{exc}")
+            except re.error:
+                return tool_failure(ErrorCode.INVALID_ARGUMENT, "正则表达式无效")
         root = self.context.workspace_policy.resolve_path(str(arguments.get("path", ".")))
         if not root.is_dir():
-            return ToolResult(False, "search_text 的 path 必须是目录")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "search_text 的 path 必须是目录")
 
         workspace = self.context.workspace_policy.workspace
         ignore_matcher = _GitIgnoreMatcher(workspace)
@@ -91,7 +92,8 @@ class SearchTextTool(ToolHandler):
                     if b"\x00" in raw:
                         continue
                     text = raw.decode("utf-8")
-                except (OSError, UnicodeError, ValueError):
+                except (OSError, UnicodeError):
+                    # 仅跳过预期的单文件读取故障；执行阶段 ValueError 不能伪装成无匹配。
                     continue
                 for line_number, line in enumerate(text.splitlines(), start=1):
                     if len(line) > _MAX_SEARCH_LINE_CHARS:
@@ -122,12 +124,12 @@ class GlobFilesTool(ToolHandler):
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         root = self.context.workspace_policy.resolve_path(str(arguments.get("path", ".")))
         if not root.is_dir():
-            return ToolResult(False, "glob_files 的 path 必须是目录")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "glob_files 的 path 必须是目录")
         pattern = self._required_str(arguments, "pattern")
         try:
             self._validate_glob_pattern(pattern)
-        except ValueError as exc:
-            return ToolResult(False, str(exc))
+        except ValueError:
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "glob 模式必须是受限的工作区相对模式")
 
         workspace = self.context.workspace_policy.workspace
         matches: list[str] = []

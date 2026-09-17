@@ -7,8 +7,9 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from tricoder.core.cancellation import CancellationToken
-from tricoder.models import ToolResult
+from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.execution_state import ErrorCode
+from tricoder.models import ToolResult, tool_failure
 from tricoder.tools.handlers import ToolHandler
 
 from .models import MAX_RESULT_CHARS, MCPCallResult
@@ -53,7 +54,7 @@ class MCPToolHandler(ToolHandler):
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         """同步入口不得为 MCP 调用创建嵌套事件循环。"""
 
-        return ToolResult(False, "MCP 工具仅支持异步执行")
+        return tool_failure(ErrorCode.POLICY_DENIED, "MCP 工具仅支持异步执行")
 
     async def run_async(
         self,
@@ -65,13 +66,28 @@ class MCPToolHandler(ToolHandler):
 
         token = cancellation or CancellationToken()
         token.raise_if_cancelled()
-        result = await self._manager.call_tool(
-            self.server_id,
-            self.raw_name,
-            arguments,
-            token,
-        )
-        return ToolResult(result.ok, result.text)
+        # 只相信本地已验证的调用阶段；远端错误正文与自报错误字段都不外传。
+        from .client import MCPCleanupError, MCPTimeoutError
+        from .manager import MCPPreflightError, MCPInvalidResultError
+        try:
+            result = await self._manager.call_tool(
+                self.server_id, self.raw_name, arguments, token,
+            )
+        except CancellationError:
+            raise
+        except MCPPreflightError:
+            return tool_failure(ErrorCode.POLICY_DENIED, "MCP 调用前检查拒绝请求")
+        except MCPInvalidResultError:
+            return tool_failure(ErrorCode.INVALID_RESULT, "MCP 返回结构无效")
+        except MCPCleanupError:
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "MCP 清理结果无法确认")
+        except MCPTimeoutError:
+            return tool_failure(ErrorCode.TIMEOUT, "MCP 请求超时，执行结果无法确认")
+        except Exception:
+            return tool_failure(ErrorCode.RESULT_UNCERTAIN, "MCP 请求结果无法确认")
+        if type(result) is not MCPCallResult or not result.ok:
+            return tool_failure(ErrorCode.INVALID_RESULT, "MCP 返回了不可信失败或无效结构")
+        return ToolResult(True, result.text)
 
 
 def normalize_tool_name(server_id: str, raw_name: str) -> str:
@@ -111,10 +127,15 @@ def normalize_mcp_result(
         raise ValueError("max_chars 必须是非负整数")
     limit = min(max_chars, MAX_RESULT_CHARS)
     content = _safe_field(result, "content")
+    flags = (_safe_field(result, "isError"), _safe_field(result, "is_error"))
+    if (not isinstance(content, (list, tuple))
+            or any(flag is not None and not isinstance(flag, bool) for flag in flags)):
+        return MCPCallResult(False, "MCP 返回结构无效")
     blocks = content if isinstance(content, (list, tuple)) else ()
     parts: list[str] = []
     used = 0
     omitted: list[str] = []
+    invalid_content = False
 
     def append_text(text: str) -> None:
         nonlocal used
@@ -138,11 +159,18 @@ def normalize_mcp_result(
 
     for block in blocks:
         content_type = _safe_field(block, "type")
+        # 缺少判别字段不是“可安全忽略的未来类型”；先校验才能避免把坏结构报成成功。
+        if (not isinstance(content_type, str) or not content_type
+                or not content_type.isprintable() or content_type.strip() != content_type):
+            invalid_content = True
+            record_omitted("unknown")
+            continue
         if content_type == "text":
             text = _safe_field(block, "text")
             if isinstance(text, str):
                 append_text(text)
             else:
+                invalid_content = True
                 record_omitted("unknown")
             continue
         if content_type in _OMITTED_CONTENT_TYPES:
@@ -153,7 +181,7 @@ def normalize_mcp_result(
         record_omitted("unknown")
 
     return MCPCallResult(
-        ok=not _result_is_error(result),
+        ok=not invalid_content and not _result_is_error(result),
         text="".join(parts),
         omitted_content_types=tuple(omitted),
     )

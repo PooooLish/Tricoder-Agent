@@ -1011,7 +1011,9 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(2, len(self.approver.requests))
         self.assertEqual(f"{external_sentinel}\n", target.read_text(encoding="utf-8"))
         self.assertTrue(journal.is_tainted("src/app.py"))
-        self.assertIsNone(journal.seal_task((), "not-run"))
+        sealed = journal.seal_task((), "not-run")
+        self.assertEqual((), sealed.changes)
+        self.assertEqual(("src/app.py",), sealed.tainted_paths)
 
     def test_edit_file_rejects_post_publish_external_snapshot_without_absorbing_it(
         self,
@@ -1374,16 +1376,6 @@ class ToolTests(unittest.TestCase):
                 "_snapshot",
                 side_effect=UnicodeError(unicode_sentinel),
             ),
-            patch.object(
-                tools_module._DirectoryBinding,
-                "open",
-                side_effect=ValueError(f"{absolute_sentinel} {value_sentinel}"),
-            ),
-            patch.object(
-                tools_module._DirectoryBinding,
-                "open",
-                side_effect=TypeError(f"{temporary_sentinel} {type_sentinel}"),
-            ),
         )
 
         for failure in failures:
@@ -1404,6 +1396,14 @@ class ToolTests(unittest.TestCase):
                     result.change_chars,
                 )
         self.assertEqual([], self.approver.requests)
+
+        # 参数已通过本地预检；执行中的未知编程异常不能伪装成可重规划业务失败。
+        for primary in (ValueError(value_sentinel), TypeError(type_sentinel)):
+            with self.subTest(error_type=type(primary).__name__):
+                with patch.object(tools_module._DirectoryBinding, "open", side_effect=primary):
+                    with self.assertRaises(type(primary)) as caught:
+                        self.registry.execute("apply_patch", {"patch": patch_text})
+                self.assertIs(primary, caught.exception)
 
     def test_apply_patch_context_failure_keeps_safe_audit_metadata(self) -> None:
         """防止纯解析成功后的 hunk 失败把路径与变更字符数审计清空。"""
@@ -1586,7 +1586,8 @@ class ToolTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(first_original, first.read_text(encoding="utf-8"))
         self.assertEqual(external_sentinel, second.read_text(encoding="utf-8"))
-        self.assertIsNone(change_set)
+        self.assertEqual((), change_set.changes)
+        self.assertEqual(("src/other.py",), change_set.tainted_paths)
         self.assertNotIn(external_sentinel.strip(), result.output)
         self.assertNotIn(str(self.workspace), result.output)
 
@@ -2286,33 +2287,31 @@ class ToolTests(unittest.TestCase):
         change_set = journal.seal_task(("src/close-warning.py",), "not-run")
         self.assertEqual("src/close-warning.py", change_set.changes[0].path)
 
-    def test_create_reports_success_with_warning_when_post_commit_record_fails(
+    def test_create_preserves_primary_and_unknown_when_post_commit_record_fails(
         self,
     ) -> None:
-        """硬链接发布后的账本异常不得把已提交文件伪装成失败。"""
+        """账本编程异常必须上抛，但已发布事实仍以 UNKNOWN 保守保留。"""
         target = self.workspace / "src" / "record-warning.py"
         journal = ChangeJournal()
         journal.begin_task((), "not-run")
         self.registry.context.change_journal = journal
 
+        primary = RuntimeError("simulated post-commit record failure")
         with patch.object(
             ToolHandler,
             "_record_committed",
-            side_effect=RuntimeError("simulated post-commit record failure"),
+            side_effect=primary,
         ):
-            result = self.registry.execute(
-                "create_file",
-                {
-                    "path": "src/record-warning.py",
-                    "content": "committed = True\n",
-                },
-            )
+            with self.assertRaises(RuntimeError) as caught:
+                self.registry.execute(
+                    "create_file",
+                    {"path": "src/record-warning.py", "content": "committed = True\n"},
+                )
 
-        self.assertTrue(result.ok, result.output)
-        self.assertEqual("src/record-warning.py", result.relative_path)
-        self.assertIn("账本警告", result.output)
+        self.assertIs(primary, caught.exception)
         self.assertEqual("committed = True\n", target.read_text(encoding="utf-8"))
-        self.assertIsNone(journal.seal_task(("src/record-warning.py",), "not-run"))
+        sealed = journal.seal_task(("src/record-warning.py",), "not-run")
+        self.assertEqual(("src/record-warning.py",), sealed.tainted_paths)
 
     def test_create_file_rejects_sensitive_path(self) -> None:
         """防止创建工具绕过工作区敏感路径策略。"""

@@ -347,6 +347,286 @@ async def _sleep_ignoring_cancellation(duration):
 
 
 class MCPClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_cancellation_wins_when_second_cancel_interrupts_reaping(self):
+        from tricoder.mcp import client as implementation
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+
+        for method in ("call_tool", "list_tools"):
+            for token_first in (True, False):
+                with self.subTest(method=method, token_first=token_first):
+                    self.harness = _FakeSDKHarness()
+                    client = self.make_client(operation_timeout=2)
+                    await client.start(CancellationToken())
+                    entered, reaping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    operations, token_errors = [], []
+                    token, scope = CancellationToken(), TaskCleanup(budget=0.2)
+                    async def operation(*args):
+                        operations.append(asyncio.current_task())
+                        entered.set()
+                        while not release.is_set():
+                            try:
+                                await release.wait()
+                            except asyncio.CancelledError:
+                                pass
+                        raise ValueError("late operation failure")
+                    setattr(self.harness.session, method, operation)
+                    original_reap = implementation._reap_tasks
+                    original_monitor = implementation._wait_for_cancellation
+                    async def monitor(cancellation):
+                        try:
+                            return await original_monitor(cancellation)
+                        except CancellationError as error:
+                            token_errors.append(error)
+                            raise
+                    async def reap(tasks, *, timeout):
+                        if any(item in operations for item in tasks):
+                            reaping.set()
+                        return await original_reap(tasks, timeout=timeout)
+                    try:
+                        with cleanup_scope(scope), patch.object(implementation, "_reap_tasks", reap), \
+                             patch.object(implementation, "_wait_for_cancellation", monitor):
+                            request = client.call_tool("echo", {}, token) if method == "call_tool" else client.list_tools(token)
+                            task = asyncio.create_task(request)
+                            await asyncio.wait_for(entered.wait(), 1)
+                            token.cancel() if token_first else task.cancel("native-first")
+                            await asyncio.wait_for(reaping.wait(), 1)
+                            task.cancel("native-second") if token_first else token.cancel()
+                            try:
+                                await asyncio.wait_for(task, 1)
+                            except (CancellationError, asyncio.CancelledError) as error:
+                                if token_first:
+                                    self.assertIs(error, token_errors[0], "后到 native 取消不得替换已固定的 token 首异常")
+                                else:
+                                    self.assertIsInstance(error, asyncio.CancelledError)
+                                    self.assertEqual(("native-first",), error.args)
+                                self.assertTrue(error.cleanup_failed)
+                                self.assertIs(scope, error.cleanup_owner)
+                                self.assertFalse(scope.retry(time.monotonic() + 1))
+                            else:
+                                self.fail("取消未传播")
+                    finally:
+                        release.set()
+                        await asyncio.gather(*operations, return_exceptions=True)
+                        await client.stop()
+                    self.assertTrue(scope.retry(time.monotonic() + 1))
+
+    async def test_public_deferred_cancellation_preserves_identity_metadata_and_owner(self):
+        from contextlib import nullcontext
+        from tricoder.mcp import client as implementation
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+
+        for method in ("call_tool", "list_tools"):
+            for native in (False, True):
+                for scoped in (False, True):
+                    with self.subTest(method=method, native=native, scoped=scoped):
+                        self.harness = _FakeSDKHarness()
+                        client = self.make_client(operation_timeout=2)
+                        await client.start(CancellationToken())
+                        entered, release = asyncio.Event(), asyncio.Event()
+                        operations, errors, token_errors = [], [], []
+                        token = CancellationToken()
+                        scope = TaskCleanup(budget=0.03) if scoped else None
+
+                        async def operation(*args):
+                            operations.append(asyncio.current_task())
+                            entered.set()
+                            while not release.is_set():
+                                try:
+                                    await release.wait()
+                                except asyncio.CancelledError:
+                                    pass
+                            raise ValueError("late SDK failure must not replace cancellation")
+
+                        setattr(self.harness.session, method, operation)
+                        original = implementation._await_bounded
+                        original_monitor = implementation._wait_for_cancellation
+
+                        async def monitor(cancellation):
+                            try:
+                                return await original_monitor(cancellation)
+                            except CancellationError as error:
+                                token_errors.append(error)
+                                raise
+
+                        async def observe(*args, **kwargs):
+                            try:
+                                return await original(*args, **kwargs)
+                            except BaseException as error:
+                                errors.append(error)
+                                raise
+
+                        try:
+                            with patch.object(implementation, "_await_bounded", observe), patch.object(
+                                implementation, "_OPERATION_REAP_TIMEOUT_SECONDS", 0.03
+                            ), patch.object(implementation, "_wait_for_cancellation", monitor), \
+                                    cleanup_scope(scope) if scoped else nullcontext():
+                                request = (client.call_tool("echo", {}, token) if method == "call_tool"
+                                           else client.list_tools(token))
+                                task = asyncio.create_task(request)
+                                await asyncio.wait_for(entered.wait(), 1)
+                                task.cancel() if native else token.cancel()
+                                with self.assertRaises(asyncio.CancelledError if native else CancellationError) as caught:
+                                    await asyncio.wait_for(task, 1)
+                                error = caught.exception
+                                self.assertIs(error, errors[0], "公开接口不得重建并丢失首个取消异常")
+                                if native:
+                                    self.assertIsNot(type(error), asyncio.CancelledError,
+                                                     "foreign native 取消必须由本地结构化类型携带清理事实")
+                                    self.assertIs(type(error.primary), asyncio.CancelledError)
+                                    self.assertIs(error.__cause__, error.primary)
+                                    self.assertEqual({}, vars(error.primary), "不得给 foreign 异常动态增加属性")
+                                else:
+                                    self.assertIs(error, token_errors[0], "自有 token 主异常必须保持身份")
+                                self.assertTrue(getattr(error, "cleanup_failed", False))
+                                owner = error.cleanup_owner
+                                self.assertIsInstance(owner, TaskCleanup)
+                                if scoped:
+                                    self.assertIs(owner, scope)
+                                self.assertTrue(owner.failed)
+                                self.assertTrue(owner.has_pending)
+                                self.assertFalse(owner.retry(time.monotonic() + 1))
+                                self.assertIs(client.state, MCPServerState.FAILED)
+                        finally:
+                            release.set()
+                            await asyncio.gather(*operations, return_exceptions=True)
+                            await client.stop()
+                        self.assertTrue(owner.retry(time.monotonic() + 1))
+                        self.assertTrue(owner.failed, "后来回收成功不能改写首次失败事实")
+
+    async def test_public_mcp_cancel_reaches_agent_as_cleanup_failed_with_fallback_owner(self):
+        await self.check_public_mcp_cancel_reaches_agent(native=False)
+
+    async def test_public_native_mcp_cancel_reaches_agent_as_cleanup_failed_with_fallback_owner(self):
+        await self.check_public_mcp_cancel_reaches_agent(native=True)
+
+    async def check_public_mcp_cancel_reaches_agent(self, *, native):
+        import tempfile
+        from tricoder.agent import CodingAgent
+        from tricoder.core.events import ToolExecutionCompleted
+        from tricoder.execution_state import ErrorCode, RecoveryAction
+        from tricoder.extensions.models import ToolOrigin
+        from tricoder.mcp.tool_adapter import MCPToolHandler
+        from tricoder.models import ProviderResponse, SessionContext, ToolCall
+        from tricoder.policy import CommandPolicy, WorkspacePolicy
+        from tricoder.tools import ToolContext, ToolRegistry
+        from tests.test_agent_async import HybridProvider
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        operations = []
+        async def operation(*args):
+            operations.append(asyncio.current_task())
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+            return self.harness.session.call_result
+
+        self.harness.session.call_tool = operation
+        client = self.make_client(operation_timeout=2)
+        await client.start(CancellationToken())
+        token, events = CancellationToken(), []
+        with tempfile.TemporaryDirectory() as raw:
+            registry = ToolRegistry(ToolContext(WorkspacePolicy(Path(raw)), CommandPolicy(), lambda *_: True))
+            async def call_tool(server, name, arguments, cancellation):
+                return await client.call_tool(name, arguments, cancellation)
+            spec = MCPToolSpec("docs", "echo", "mcp__docs__echo", "echo",
+                               {"type": "object", "properties": {}, "required": [], "additionalProperties": False})
+            registry.register(MCPToolHandler(registry.context, SimpleNamespace(call_tool=call_tool), spec),
+                              origin=ToolOrigin("mcp", "docs", "read"))
+            provider = HybridProvider([ProviderResponse(tool_calls=(
+                ToolCall("mcp", spec.public_name, {}), ToolCall("finish", "finish", {"summary": "bad"}),
+            ))])
+            agent = CodingAgent(provider, registry, plan_enabled=False)
+            try:
+                with patch("tricoder.mcp.client._OPERATION_REAP_TIMEOUT_SECONDS", 0.03):
+                    task = asyncio.create_task(agent.run_with_context_async(
+                        "task", SessionContext(), cancellation=token, event_sink=events.append))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    task.cancel("native-agent-cancel") if native else token.cancel()
+                    try:
+                        turn = await asyncio.wait_for(task, 1)
+                    except asyncio.CancelledError:
+                        self.fail("带未回收资源的 native 取消必须在 Agent 边界形成稳定失败结果")
+                self.assertTrue(turn.result.cleanup_failed)
+                self.assertFalse(turn.result.ok)
+                completed = [event for event in events if isinstance(event, ToolExecutionCompleted)]
+                self.assertEqual(["mcp", "finish"], [event.call_id for event in completed])
+                self.assertIs(completed[0].result.error.code, ErrorCode.CLEANUP_FAILED)
+                self.assertIs(completed[0].result.error.recovery, RecoveryAction.STOP_TASK)
+                self.assertTrue(registry._standalone_cleanup.has_pending)
+                self.assertTrue(registry._standalone_cleanup.failed)
+            finally:
+                release.set()
+                await asyncio.gather(*operations, return_exceptions=True)
+                await client.stop()
+                registry._standalone_cleanup.retry(time.monotonic() + 1)
+
+    async def test_deferred_request_consumes_remaining_budget_and_has_task_owner(self):
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        from tricoder.mcp.client import _await_bounded
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        token = CancellationToken()
+        scope = TaskCleanup(budget=0.03)
+
+        async def operation():
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+
+        with cleanup_scope(scope):
+            task = asyncio.create_task(_await_bounded(operation(), timeout=2,
+                cancellation=token, timeout_code="synthetic_timeout", log_sources=(),
+                track_operation=lambda _: None))
+            await asyncio.wait_for(entered.wait(), 1)
+            scope.deadline()
+            token.cancel()
+            try:
+                done, _ = await asyncio.wait({task}, timeout=0.2)
+                self.assertIn(task, done, "请求收割不能在任务期限后重新等待完整 0.5 秒")
+                with self.assertRaises(CancellationError) as caught:
+                    await task
+                self.assertTrue(caught.exception.cleanup_failed)
+                self.assertTrue(scope.failed)
+                self.assertTrue(scope.has_pending)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                # 显式让被登记的旧任务完成，再由持有者重新验证；不写新任务状态。
+                await asyncio.sleep(0)
+                self.assertTrue(scope.retry(time.monotonic() + 1))
+
+    async def test_task_deadline_bounds_session_close_before_transport_exit(self):
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        scope = TaskCleanup(budget=0.05)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        class WaitingSession(_RecordingContext):
+            async def __aexit__(inner, *args):
+                entered.set()
+                await release.wait()
+                return False
+        self.harness.client_session = lambda *_: WaitingSession("session", self.harness.session, self.harness.events)
+        client = self.make_client(cleanup_timeout=2.0)
+        with cleanup_scope(scope):
+            await client.start(CancellationToken())
+            stop = asyncio.create_task(client.stop())
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                done, _ = await asyncio.wait({stop}, timeout=0.3)
+                self.assertIn(stop, done, "session 关闭重新获得 client 的完整清理预算")
+                with self.assertRaises(MCPCleanupError):
+                    await stop
+                self.assertTrue(scope.failed)
+            finally:
+                release.set()
+                await asyncio.gather(stop, return_exceptions=True)
+
     def setUp(self):
         self.harness = _FakeSDKHarness()
         self.request = MCPLaunchRequest(
@@ -826,9 +1106,15 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_caller_cancel_during_reap_tracks_and_consumes_late_operation_error(self):
         """防止收割等待者被取消后，晚到 operation 异常成为未检索异常。"""
 
+        from tricoder.mcp import client as implementation
         client = self.make_client(operation_timeout=2.0)
         await client.start(CancellationToken())
-        self.harness.session.call_gate = asyncio.Event()
+        entered, reaping = asyncio.Event(), asyncio.Event()
+        class CallGate(asyncio.Event):
+            async def wait(inner):
+                entered.set()
+                return await super().wait()
+        self.harness.session.call_gate = CallGate()
         self.harness.session.call_ignore_cancellation_for = 0.8
         self.harness.session.call_late_error = RuntimeError(
             f"late raw {FAKE_SECRET}"
@@ -838,15 +1124,20 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
         loop_errors = []
         previous_handler = loop.get_exception_handler()
         loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        original_reap = implementation._reap_tasks
+        async def reap(tasks, *, timeout):
+            if any(item in client._log_operation_tasks for item in tasks):
+                reaping.set()
+            return await original_reap(tasks, timeout=timeout)
         try:
-            call_task = asyncio.create_task(
-                client.call_tool("raw.echo", {}, token)
-            )
-            loop.call_later(0.01, token.cancel)
-            loop.call_later(0.12, call_task.cancel)
-
-            with self.assertRaises(asyncio.CancelledError):
-                await call_task
+            with patch.object(implementation, "_reap_tasks", reap):
+                call_task = asyncio.create_task(client.call_tool("raw.echo", {}, token))
+                await asyncio.wait_for(entered.wait(), 1)
+                token.cancel()
+                await asyncio.wait_for(reaping.wait(), 1)
+                call_task.cancel()
+                with self.assertRaises(CancellationError):
+                    await call_task
 
             self.assertEqual(MCPServerState.FAILED, client.state)
             with self.assertRaisesRegex(MCPClientError, r"^mcp_client_not_ready$"):
@@ -855,6 +1146,7 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for_deferred_reap_consumption(loop_errors)
             await client.stop()
         finally:
+            await self.wait_for_deferred_reap_consumption(loop_errors)
             if client._lifecycle_task is not None:
                 await client.stop()
             loop.set_exception_handler(previous_handler)

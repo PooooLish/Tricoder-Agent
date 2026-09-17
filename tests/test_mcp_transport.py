@@ -157,7 +157,188 @@ class ProcessHarness:
         )
 
 
+class _EventDrivenSDKHarness:
+    """仅供本模块端到端取消用例使用，避免反向导入另一测试模块。"""
+
+    def __init__(self, process):
+        self.process_harness = ProcessHarness(process)
+        self.session = _EventDrivenSession()
+        self.transports = []
+
+    def sdk_loader(self):
+        from tricoder.mcp.sdk import MCPSDK
+
+        return MCPSDK(
+            client_session=self.client_session,
+            stdio_server_parameters=self.stdio_server_parameters,
+            stdio_bindings=self.process_harness.bindings(),
+            log_sources=(),
+        )
+
+    @staticmethod
+    def stdio_server_parameters(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    def transport_factory(self, parameters, *, errlog, bindings):
+        transport = VerifiedStdioTransport(parameters, errlog=errlog, bindings=bindings)
+        self.transports.append(transport)
+        return transport
+
+    def client_session(self, _read_stream, _write_stream):
+        return _EventDrivenSessionContext(self.session)
+
+
+class _EventDrivenSession:
+    """协议面最小替身；具体方法可由测试替换为受控阻塞点。"""
+
+    async def initialize(self):
+        return None
+
+    async def call_tool(self, _name, _arguments):
+        return SimpleNamespace(content=[], isError=False)
+
+
+class _EventDrivenSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        return False
+
+
 class VerifiedStdioTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_command_then_mcp_share_absolute_deadline_without_cancellation(self):
+        from tricoder import subprocess_control as control
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        from unittest import mock
+        from pathlib import Path
+        for phase in ("timeout", "output_limit", "business_error"):
+            with self.subTest(phase=phase):
+                clock = ControlledClock()
+                scope = TaskCleanup()
+                budgets = []
+                process = mock.Mock(returncode=None)
+                process.poll.side_effect = lambda: process.returncode
+                process.stdout.read1.return_value = b"XX" if phase == "output_limit" else b""
+                process.stderr.read1.return_value = b""
+
+                def terminate(_process, _env, _job, *, deadline):
+                    budgets.append(deadline)
+                    clock.now += 4.0
+                    process.returncode = 0
+                    return True
+
+                def reader(*, target, args, daemon):
+                    return SimpleNamespace(start=lambda: target(*args), is_alive=lambda: False)
+
+                with patch.object(control, "time", SimpleNamespace(monotonic=clock.monotonic)), \
+                     patch("tricoder.task_cleanup.time", SimpleNamespace(monotonic=clock.monotonic)), \
+                     patch("tricoder.mcp.transport.monotonic", clock.monotonic), \
+                     patch("tricoder.mcp.transport.sleep", clock.sleep), \
+                     patch.object(control.threading, "Thread", side_effect=reader), \
+                     patch.object(control, "_terminate_process_tree", side_effect=terminate), \
+                     cleanup_scope(scope):
+                    if phase == "business_error":
+                        primary = ValueError("synthetic primary")
+                        with patch.object(control.subprocess, "Popen", return_value=process), \
+                             patch.object(control, "_create_windows_job", return_value=mock.Mock()), \
+                             patch.object(control, "_collect_bounded_process", side_effect=primary):
+                            with self.assertRaises(ValueError) as caught:
+                                control.run_bounded_process(["synthetic"], cwd=Path("."), env={},
+                                                            timeout=1, max_output_bytes=1)
+                            self.assertIs(primary, caught.exception)
+                    else:
+                        result = control._collect_bounded_process(process, env={}, timeout=0,
+                            max_output_bytes=1, windows_job=None)
+                        self.assertTrue(result.timed_out if phase == "timeout" else result.output_exceeded)
+                    transport, _ = self.make_transport(ControlledProcess())
+                    async with transport:
+                        pass
+                self.assertEqual([5.0], budgets)
+                self.assertEqual(5.0, scope.started_deadline, "非取消命令终止后 MCP 不能新领 5 秒")
+                self.assertLessEqual(clock.now, 5.0)
+
+    async def test_successful_command_cleanup_does_not_expire_a_long_running_task(self):
+        from tricoder import subprocess_control as control
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        from unittest import mock
+        clock = ControlledClock()
+        scope = TaskCleanup()
+        with patch.object(control, "time", SimpleNamespace(monotonic=clock.monotonic)), \
+             patch.object(control, "_terminate_process_tree", return_value=True), cleanup_scope(scope):
+            first = control._ProcessResources(mock.Mock(returncode=0), {})
+            self.assertTrue(first.finish(None))
+            self.assertIsNone(scope.started_deadline)
+            clock.now = 100.0
+            second = control._ProcessResources(mock.Mock(returncode=0), {})
+            self.assertTrue(second.finish(None))
+            self.assertEqual(105.0, second.deadline)
+            self.assertIsNone(scope.started_deadline)
+
+    async def test_two_transports_share_task_cleanup_deadline_and_owner(self):
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        clock = ControlledClock()
+        self.enterContext(patch("tricoder.mcp.transport.monotonic", clock.monotonic))
+        self.enterContext(patch("tricoder.mcp.transport.sleep", clock.sleep))
+        scope = TaskCleanup()
+        # 本测试注入绝对任务期限；不是让每个 transport 重新获得预算。
+        scope._deadline = 5.0
+        transports = [self.make_transport(ControlledProcess())[0] for _ in range(2)]
+        with cleanup_scope(scope):
+            for transport in transports:
+                async with transport:
+                    pass
+        self.assertLessEqual(clock.now, 5.0, "多个 MCP 资源重新获得清理预算")
+        self.assertTrue(scope.failed)
+        self.assertTrue(scope.has_pending, "未知进程必须由任务保留 exact transport")
+
+    async def test_event_driven_token_cancel_and_resource_reclamation_are_distinct(self):
+        from tricoder.core.cancellation import CancellationToken, CancellationError
+        from tricoder.mcp.client import MCPClient
+        from tricoder.mcp.security import MCPLaunchRequest
+        for phase in ("initialize", "request"):
+            with self.subTest(phase=phase):
+                harness = _EventDrivenSDKHarness(ControlledProcess(exit_on="terminate"))
+                entered = asyncio.Event()
+
+                async def blocked(*_args, **_kwargs):
+                    entered.set()
+                    await asyncio.Event().wait()
+
+                if phase == "initialize":
+                    harness.session.initialize = blocked
+                else:
+                    harness.session.call_tool = blocked
+                request = MCPLaunchRequest(command="python", args=(), cwd=".", env={}, approval_detail="synthetic")
+                client = MCPClient("docs", request, sdk_loader=harness.sdk_loader,
+                                   transport_factory=harness.transport_factory)
+                token = CancellationToken()
+                if phase == "request":
+                    await client.start(token)
+                task = asyncio.create_task(client.start(token) if phase == "initialize"
+                                           else client.call_tool("echo", {}, token))
+                await asyncio.wait_for(entered.wait(), 1)
+                # 取消发生时进程必须仍然存活；自然退出等待设为 0 后，关闭路径
+                # 会立即进入受控 terminate，并以 returncode 证明实际回收。
+                self.assertIsNone(harness.process_harness.process.returncode)
+                self.assertFalse(harness.process_harness.process.stdin.closed)
+                with patch("tricoder.mcp.transport._NATURAL_EXIT_SECONDS", 0):
+                    token.cancel()
+                    with self.assertRaises(CancellationError):
+                        await asyncio.wait_for(task, 1)
+                    await client.stop()
+                await asyncio.wait_for(harness.process_harness.termination_started.wait(), 1)
+                transport = harness.transports[0]
+                self.assertEqual(-15, harness.process_harness.process.returncode)
+                self.assertEqual(["terminate"], harness.process_harness.process.signals)
+                self.assertEqual(MCPProcessExitEvidence.VERIFIED, transport.outcome.process_exit)
+                self.assertTrue(transport.outcome.resources_closed)
+                self.assertTrue(harness.process_harness.process.stdin.closed)
+                self.assertTrue(harness.process_harness.process.stdout.closed)
+
     def setUp(self):
         clock = ControlledClock()
         self.enterContext(patch("tricoder.mcp.transport.monotonic", clock.monotonic))

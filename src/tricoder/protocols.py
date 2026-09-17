@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Protocol
 
+from tricoder.execution_state import ErrorCode, RecoveryAction, ToolError
+
 from tricoder.models import (
     Message,
     ProviderResponse,
@@ -21,6 +23,7 @@ COMMON_SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Codin
 
 NATIVE_TOOL_PROMPT = """使用 Provider 提供的原生工具调用完成任务。
 每轮可一次提交多个工具调用，Agent 会按顺序逐个执行并回填结果。
+本批首次失败后，剩余动作只回填 skipped，不执行；允许重新规划时请在下一轮重新决策。
 不要用普通文本代替工具调用；工具参数只包含当前工具定义允许的字段。
 """
 
@@ -118,6 +121,7 @@ def _tool_result_content(action: ToolAction, result: ToolResult) -> str:
                 "tool": action.tool,
                 "ok": result.ok,
                 "output": result.output,
+                **({"error": result.error.public_fields()} if result.error is not None else {}),
             }
         },
         ensure_ascii=False,
@@ -140,12 +144,20 @@ class NativeToolProtocol:
                 feedback=Message("user", NATIVE_TEXT_FEEDBACK, kind="protocol_feedback"),
                 audit_error_type="ToolCallCountError",
             )
+        # 自定义 Provider 也必须满足一对一配对；拒绝整批，不能让重复 ID
+        # 进入执行或 skipped 回填后才发现已有结果被重复使用。
+        ids = tuple(call.id for call in response.tool_calls)
+        if any(not isinstance(call_id, str) or not call_id for call_id in ids) or len(set(ids)) != len(ids):
+            return ResolvedAction(
+                assistant_messages=(),
+                feedback=Message("user", PROTOCOL_FEEDBACK, kind="protocol_feedback"),
+                audit_error_type="ToolCallIdError",
+            )
         # 一次接受多个工具调用；由 Agent 顺序执行并逐条回填。
         actions = tuple(
             ToolAction(call.name, call.arguments, "")
             for call in response.tool_calls
         )
-        ids = tuple(call.id for call in response.tool_calls)
         return ResolvedAction(
             assistant_messages=(
                 Message("assistant", response.content, tool_calls=response.tool_calls),
@@ -198,7 +210,9 @@ class LegacyJsonProtocol:
                 feedback=Message(
                     "user",
                     json.dumps(
-                        {"tool_result": {"ok": False, "output": error}},
+                        {"tool_result": {"ok": False, "output": error,
+                                         "error": ToolError(ErrorCode.INVALID_ARGUMENT,
+                                                            RecoveryAction.REPLAN).public_fields()}},
                         ensure_ascii=False,
                     ),
                     kind="tool_result",

@@ -118,7 +118,10 @@ class ToolExecutionStarted:
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionCompleted:
-    """工具执行结束并返回规范化结果。"""
+    """调用取得规范化结果；SKIPPED 仅为协议配对，不代表执行过。
+
+    SKIPPED 不伴随 ToolExecutionStarted，也不计入实际工具执行次数。
+    """
 
     call_id: str
     result: ToolResult = field(repr=False)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import stat
 from typing import TYPE_CHECKING, Any, Callable
@@ -12,9 +11,10 @@ from tricoder.changes import (
     FileChange,
     FileSnapshot,
 )
-from tricoder.core.cancellation import CancellationToken
+from tricoder.core.cancellation import CancellationToken, check_current_cancellation
 from tricoder.mcp.schema import validate_json_value
 from tricoder.models import ToolDefinition, ToolResult
+from tricoder.task_cleanup import run_in_cleanup_thread
 
 from tricoder.tools.binding import _DirectoryBinding
 
@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 
 Approver = Callable[[str, str], bool]
+
+
+class InvalidToolArgument(ValueError):
+    """仅由本地参数解析抛出，区别于执行中的未知 ValueError。"""
 
 
 class ToolHandler:
@@ -50,6 +54,12 @@ class ToolHandler:
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         raise NotImplementedError
 
+    def _approve(self, action: str, detail: str) -> bool:
+        approved = self.context.approver(action, detail)
+        # 用户批准只是 UI 决定；同步等待期间任务可已取消，提交前必须复查。
+        check_current_cancellation()
+        return approved
+
     async def run_async(
         self,
         arguments: dict[str, Any],
@@ -60,7 +70,7 @@ class ToolHandler:
 
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        return await asyncio.to_thread(self.run, arguments)
+        return await run_in_cleanup_thread(self.run, arguments)
 
     @staticmethod
     def _schema(
@@ -178,5 +188,5 @@ class ToolHandler:
     ) -> str:
         value = arguments.get(name)
         if not isinstance(value, str) or (not allow_empty and not value):
-            raise ValueError(f"{name} 必须是字符串且不能为空")
+            raise InvalidToolArgument(f"{name} 必须是字符串且不能为空")
         return value

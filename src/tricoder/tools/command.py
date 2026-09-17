@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from tricoder.core.cancellation import CancellationError, CancellationToken
-from tricoder.models import ToolResult
+from tricoder.task_cleanup import run_in_cleanup_thread
+from tricoder.models import ToolResult, tool_failure
+from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
+from tricoder.verification import stable_snapshots
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.subprocess_env import filtered_subprocess_env
-from tricoder.subprocess_control import run_bounded_process
+from tricoder.subprocess_control import ProcessExecutionUncertain, run_bounded_process
 
 from tricoder.tools.handlers import ToolHandler
 
@@ -74,7 +76,7 @@ class RunCommandTool(ToolHandler):
 
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        return await asyncio.to_thread(
+        return await run_in_cleanup_thread(
             self.run_with_cancellation,
             arguments,
             cancellation,
@@ -88,20 +90,20 @@ class RunCommandTool(ToolHandler):
         """执行受控命令，并允许运行时取消信号终止整个进程树。"""
 
         if self.context.read_only:
-            return ToolResult(False, "只读模式禁止执行命令")
+            return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止执行命令")
         command = self._required_str(arguments, "command")
         args = self.context.command_policy.validate(command)
         subprocess_env = self.context.command_policy.subprocess_environment()
         cwd = self.context.workspace_policy.resolve_path(str(arguments.get("cwd", ".")))
         if not cwd.is_dir():
-            return ToolResult(False, "命令工作目录必须是目录")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "命令工作目录必须是目录")
         executable = Path(args[0]).name.lower().removesuffix(".exe")
         if executable == "git" and _git_command_escapes_workspace(
             cwd,
             self.context.command_policy,
         ):
-            return ToolResult(
-                False,
+            return tool_failure(
+                ErrorCode.POLICY_DENIED,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
             )
         detail = (
@@ -116,7 +118,14 @@ class RunCommandTool(ToolHandler):
         )
         approved = auto_approved or self.context.approver("run_command", detail)
         if not approved:
-            return ToolResult(False, "用户拒绝了命令执行")
+            return tool_failure(ErrorCode.APPROVAL_DENIED, "用户拒绝了命令执行")
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        scope = self.context.verification_scope
+        before = scope.capture(self.context.workspace_policy) if _is_verification_command(args) else None
+        # 先记本地“可能已启动”，异常/取消不能沿旧证据恢复；仅稳定清理后的快照收窄。
+        previous_unknown = scope.unknown_effects
+        scope.unknown_effects = True
         try:
             completed = run_bounded_process(
                 args,
@@ -128,21 +137,35 @@ class RunCommandTool(ToolHandler):
             )
         except CancellationError:
             raise
+        except ProcessExecutionUncertain as exc:
+            return tool_failure(ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.RESULT_UNCERTAIN,
+                                "命令执行结果或进程树清理无法确认")
         except OSError:
-            return ToolResult(False, "命令进程无法安全启动")
+            scope.unknown_effects = previous_unknown
+            return tool_failure(ErrorCode.EXECUTION_FAILED, "命令进程无法安全启动")
         if completed.cleanup_failed:
-            return ToolResult(False, "命令进程树清理失败，结果不可信")
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "命令进程树清理失败，结果不可信")
         if completed.timed_out:
-            return ToolResult(False, f"命令执行超过 {self.context.timeout:g} 秒")
+            return tool_failure(ErrorCode.TIMEOUT, f"命令执行超过 {self.context.timeout:g} 秒")
         if completed.output_exceeded:
             captured = self._bounded(
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
             )
-            return ToolResult(
-                False,
+            return tool_failure(
+                ErrorCode.OUTPUT_LIMIT,
                 f"命令输出超过 {self.context.max_output_chars} 字符，已终止进程树\n"
                 f"{captured}",
             )
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        after = scope.capture(self.context.workspace_policy) if before is not None else None
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        stable = before is not None and after is not None and stable_snapshots(before, after)
+        if stable:
+            scope.unknown_effects = previous_unknown
+        evidence = (scope.issue(before, after, completed.returncode == 0)
+                    if before is not None and after is not None else None)
         output = (
             f"退出码：{completed.returncode}\n"
             f"stdout:\n{completed.stdout}\n"
@@ -155,10 +178,10 @@ class RunCommandTool(ToolHandler):
             verification_passed=(
                 succeeded if _is_verification_command(args) else None
             ),
+            error=None if succeeded else ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN),
+            file_effects=FileEffects(EffectState.NONE if stable else EffectState.UNKNOWN),
+            verification_evidence=evidence,
         )
-
-
-_VERIFICATION_MODULES = {"unittest", "pytest", "compileall", "ruff", "mypy"}
 
 
 def _is_verification_command(args: list[str]) -> bool:
@@ -166,13 +189,7 @@ def _is_verification_command(args: list[str]) -> bool:
 
     git 只读命令与普通脚本执行不改变验证状态。
     """
-    executable = Path(args[0]).name.lower().removesuffix(".exe")
-    return (
-        executable in {"python", "py"}
-        and len(args) >= 3
-        and args[1] == "-m"
-        and args[2].lower() in _VERIFICATION_MODULES
-    )
+    return CommandPolicy.is_verification_command(args)
 
 
 class GitDiffTool(ToolHandler):
@@ -185,14 +202,14 @@ class GitDiffTool(ToolHandler):
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         workspace = self.context.workspace_policy.workspace
         if _git_command_escapes_workspace(workspace, self.context.command_policy):
-            return ToolResult(
-                False,
+            return tool_failure(
+                ErrorCode.POLICY_DENIED,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
             )
         try:
             args = self.context.command_policy.validate("git --no-pager diff --stat")
-        except PolicyError as exc:
-            return ToolResult(False, str(exc))
+        except PolicyError:
+            return tool_failure(ErrorCode.POLICY_DENIED, "本地命令策略拒绝操作")
         try:
             completed = run_bounded_process(
                 args,
@@ -201,18 +218,23 @@ class GitDiffTool(ToolHandler):
                 timeout=self.context.timeout,
                 max_output_bytes=self.context.max_output_chars,
             )
+        except ProcessExecutionUncertain as exc:
+            return tool_failure(ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.RESULT_UNCERTAIN,
+                                "git diff 执行结果或进程树清理无法确认")
         except OSError:
-            return ToolResult(False, "git diff 进程无法安全启动")
+            return tool_failure(ErrorCode.EXECUTION_FAILED, "git diff 进程无法安全启动")
         if completed.cleanup_failed:
-            return ToolResult(False, "git diff 进程树清理失败，结果不可信")
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "git diff 进程树清理失败，结果不可信")
         if completed.timed_out:
-            return ToolResult(False, f"git diff 超过 {self.context.timeout:g} 秒")
+            return tool_failure(ErrorCode.TIMEOUT, f"git diff 超过 {self.context.timeout:g} 秒")
         if completed.output_exceeded:
-            return ToolResult(False, "git diff 输出超过限制，已终止进程树")
+            return tool_failure(ErrorCode.OUTPUT_LIMIT, "git diff 输出超过限制，已终止进程树")
         output = (completed.stdout or completed.stderr).strip()
         if not output:
             output = "工作区没有未提交变更"
-        return ToolResult(completed.returncode == 0, self._bounded(output))
+        return ToolResult(completed.returncode == 0, self._bounded(output),
+                          error=None if completed.returncode == 0 else
+                          ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN))
 
 
 class FinishTool(ToolHandler):

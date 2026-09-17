@@ -6,12 +6,15 @@ import copy
 import re
 import secrets
 import threading
-from dataclasses import dataclass, replace
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
-from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.core.cancellation import CancellationError, CancellationToken, cancellation_scope
+from tricoder.task_cleanup import TaskCleanup, current_cleanup, task_cleanup_scope
 from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.extensions.models import ToolOrigin
+from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
 from tricoder.mcp.schema import validate_mcp_schema
 from tricoder.changes import (
     ChangeBudgetError,
@@ -20,9 +23,11 @@ from tricoder.changes import (
     UndoExecution,
     UndoPreview,
 )
-from tricoder.models import ToolDefinition, ToolResult
+from tricoder.models import ToolDefinition, ToolResult, tool_failure
 from tricoder.patches import PatchError, parse_unified_diff
-from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
+from tricoder.policy import CommandPolicy, PolicyArgumentError, PolicyError, WorkspacePolicy
+from tricoder.verification import VerificationScope
+from tricoder.task_observation import current_task_observation
 from tricoder.tools.binding import (
     _DirectoryBinding,
     _PosixDirectoryBinding,
@@ -33,7 +38,7 @@ from tricoder.tools.binding import (
 from tricoder.tools.command import FinishTool, GitDiffTool, RunCommandTool
 from tricoder.tools.filesystem import ListFilesTool, ReadFileTool
 from tricoder.tools.gitignore import _GitIgnoreMatcher
-from tricoder.tools.handlers import Approver, ToolHandler
+from tricoder.tools.handlers import Approver, InvalidToolArgument, ToolHandler
 from tricoder.tools.search import GlobFilesTool, SearchTextTool
 from tricoder.tools.undo import UndoConflictError, UndoExecutor
 from tricoder.tools.write import ApplyPatchTool, CreateFileTool, EditFileTool
@@ -81,6 +86,25 @@ _BUILTIN_RISKS = {
 }
 
 
+def _mcp_handler_class() -> type[ToolHandler]:
+    """仅在执行 MCP 工具时加载适配器，避免 MCP 与 tools 冷启动循环导入。"""
+
+    from tricoder.mcp.tool_adapter import MCPToolHandler
+
+    return MCPToolHandler
+
+
+def __getattr__(name: str):
+    """按需保留旧的 MCPToolHandler 包级导出，不恢复顶层循环依赖。"""
+
+    if name == "MCPToolHandler":
+        handler_class = _mcp_handler_class()
+        # 缓存真实类，确保后续属性访问和直接适配器导入保持对象身份一致。
+        globals()[name] = handler_class
+        return handler_class
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class _InvalidToolResultError(TypeError):
     """处理器违反公开 ToolResult 返回契约。"""
 
@@ -101,6 +125,7 @@ class ToolContext:
     auto_approve_git: Callable[[list[str]], bool] | None = None
     # 大型结果只写入 Session 绑定的 TriCoder 运行目录，不写目标源码目录。
     spill_store: ToolResultSpillStore | None = None
+    verification_scope: VerificationScope = field(default_factory=VerificationScope)
 
 
 class ToolRegistry:
@@ -108,17 +133,21 @@ class ToolRegistry:
 
     def __init__(self, context: ToolContext) -> None:
         self.context = context
+        # 跨任务只保留 pending 资源；它不是任何任务/操作的 deadline scope。
+        self._standalone_cleanup = TaskCleanup()
         # 注册与按身份撤销必须在同一原子边界内完成。
         self._registration_lock = threading.RLock()
         self._handlers: dict[str, ToolHandler] = {}
         self._origins: dict[str, ToolOrigin] = {}
         self._definitions: dict[str, ToolDefinition] = {}
+        self._builtin_handlers: dict[str, ToolHandler] = {}
         for handler_class in _HANDLER_CLASSES:
             handler = handler_class(context)
             self.register(
                 handler,
                 origin=ToolOrigin("builtin", "tricoder", _BUILTIN_RISKS[handler.name]),
             )
+            self._builtin_handlers[handler.name] = handler
         if self.context.spill_store is not None:
             self._origins["read_tool_result"] = ToolOrigin(
                 "builtin", "tricoder", _BUILTIN_RISKS["read_tool_result"]
@@ -242,6 +271,14 @@ class ToolRegistry:
             origin = self._origins.get(name)
         return origin is not None and origin.risk != "read"
 
+    def retain_cleanup(self, scope: TaskCleanup) -> None:
+        """独立 task 结束后接管 exact scope；正常返回也不能丢失资源所有权。"""
+        scope.handoff_to(self._standalone_cleanup)
+
+    @property
+    def has_pending_cleanup(self) -> bool:
+        return self._standalone_cleanup.blocks(current_cleanup())
+
     def execute(
         self,
         name: str,
@@ -252,20 +289,36 @@ class ToolRegistry:
     ) -> ToolResult:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        if self.has_pending_cleanup:
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "旧任务资源清理尚未确认，禁止复用执行资源")
         if name == "read_tool_result":
             return self._read_spilled_result(arguments)
         prepared = self._prepare_execution(name, arguments)
         if isinstance(prepared, ToolResult):
             return prepared
         handler, origin = prepared
-        try:
-            if name == "run_command" and isinstance(handler, RunCommandTool):
-                result = handler.run_with_cancellation(arguments, cancellation)
-            else:
-                result = handler.run(arguments)
-            result = self._validate_execution_result(result)
-        except Exception as exc:
-            result = self._safe_execution_failure(name, arguments, origin, exc)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        with task_cleanup_scope(self.retain_cleanup, worker_owner=self._standalone_cleanup), \
+             cancellation_scope(cancellation), self._effect_scope(name, handler) as operation:
+            self._observe_dispatch(name, handler, origin, cancellation)
+            try:
+                if name == "run_command" and isinstance(handler, RunCommandTool):
+                    result = handler.run_with_cancellation(arguments, cancellation)
+                elif origin.kind == "mcp":
+                    mcp_handler_class = _mcp_handler_class()
+                    if type(handler) is mcp_handler_class:
+                        result = mcp_handler_class.run(handler, arguments)
+                    else:
+                        result = handler.run(arguments)
+                else:
+                    result = handler.run(arguments)
+                result = self._validate_execution_result(result, name, handler)
+            except Exception as exc:
+                result = self._safe_execution_failure(name, arguments, handler, exc)
+            result = self._normalize_file_effects(name, handler, result, operation)
+            result = self._normalize_error_recovery(result)
+            self._publish_result(name, handler, result)
         return self._normalize_execution_result(name, arguments, result, call_id)
 
     async def execute_async(
@@ -280,18 +333,109 @@ class ToolRegistry:
 
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        if self.has_pending_cleanup:
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "旧任务资源清理尚未确认，禁止复用执行资源")
         if name == "read_tool_result":
             return self._read_spilled_result(arguments)
         prepared = self._prepare_execution(name, arguments)
         if isinstance(prepared, ToolResult):
             return prepared
         handler, origin = prepared
-        try:
-            result = await handler.run_async(arguments, cancellation=cancellation)
-            result = self._validate_execution_result(result)
-        except Exception as exc:
-            result = self._safe_execution_failure(name, arguments, origin, exc)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        with task_cleanup_scope(self.retain_cleanup, worker_owner=self._standalone_cleanup), \
+             cancellation_scope(cancellation), self._effect_scope(name, handler) as operation:
+            self._observe_dispatch(name, handler, origin, cancellation)
+            try:
+                if origin.kind == "mcp":
+                    mcp_handler_class = _mcp_handler_class()
+                    if type(handler) is mcp_handler_class:
+                        result = await mcp_handler_class.run_async(
+                            handler, arguments, cancellation=cancellation
+                        )
+                    else:
+                        result = await handler.run_async(arguments, cancellation=cancellation)
+                else:
+                    result = await handler.run_async(arguments, cancellation=cancellation)
+                result = self._validate_execution_result(result, name, handler)
+            except Exception as exc:
+                result = self._safe_execution_failure(name, arguments, handler, exc)
+            result = self._normalize_file_effects(name, handler, result, operation)
+            result = self._normalize_error_recovery(result)
+            self._publish_result(name, handler, result)
         return self._normalize_execution_result(name, arguments, result, call_id)
+
+    def _observe_dispatch(self, name: str, handler: ToolHandler, origin: ToolOrigin,
+                          cancellation: CancellationToken | None) -> None:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        if self._builtin_handlers.get(name) is not handler and origin.risk != "read":
+            observation = current_task_observation()
+            if observation is not None:
+                # Schema/权限/审批及最后一次预取消检查之后，已交给 handler。
+                # 异步入口内部可能先检查取消；越过此交付边界仍保守视为 UNKNOWN。
+                observation.observe_effects(FileEffects(EffectState.UNKNOWN))
+
+    def _publish_result(self, name: str, handler: ToolHandler, result: ToolResult) -> None:
+        observation = current_task_observation()
+        if observation is None:
+            return
+        candidate = result.verification_evidence
+        if not (self._builtin_handlers.get(name) is handler and name == "run_command"
+                and type(handler) is RunCommandTool and self.context.verification_scope.owns(candidate)):
+            candidate = None
+        observation.observe_result(result.file_effects or FileEffects(EffectState.NONE), candidate)
+
+    def _effect_scope(
+        self, name: str, handler: ToolHandler,
+    ) -> AbstractContextManager[ChangeJournal | None]:
+        if (self._builtin_handlers.get(name) is handler
+                and type(handler) in (EditFileTool, CreateFileTool, ApplyPatchTool)):
+            return handler.collect_effects()
+        return nullcontext(None)
+
+    def _normalize_file_effects(
+        self, name: str, handler: ToolHandler, result: ToolResult,
+        operation: ChangeJournal | None,
+    ) -> ToolResult:
+        """证据仅来自本地内置对象与操作账本；扩展自报字段没有信任权限。"""
+
+        if self._builtin_handlers.get(name) is not handler:
+            # 扩展不能伪造本地审计/暂存/验证证明；真正的 spill 在后续本地预算层形成。
+            external_effects = (FileEffects(EffectState.UNKNOWN)
+                                if self._origins[name].risk != "read" else None)
+            return replace(result, file_effects=external_effects, relative_path=None, modified_paths=(),
+                           audit_paths=(), change_chars=0, verification_passed=None,
+                           verification_evidence=None,
+                           spill_reference=None, spill_bytes=0, spill_sha256=None)
+        if name == "run_command" and type(handler) is RunCommandTool:
+            evidence = result.verification_evidence
+            if not self.context.verification_scope.owns(evidence):
+                result = replace(result, verification_evidence=None)
+            # 只有本地命令路径持有的快照证据可将运行后文件影响收窄为 NONE。
+            effects = (FileEffects(EffectState.UNKNOWN) if self.context.verification_scope.unknown_effects
+                       else result.file_effects or FileEffects(EffectState.NONE))
+            return replace(result, file_effects=effects)
+        result = replace(result, verification_evidence=None, verification_passed=None)
+        effects = operation.active_effects() if operation is not None else None
+        if effects is None:
+            legacy = tuple(dict.fromkeys(
+                ((result.relative_path,) if result.relative_path else ()) + result.modified_paths
+            )) if result.ok else ()
+            effects = FileEffects(EffectState.CONFIRMED, legacy) if legacy else FileEffects(EffectState.NONE)
+        paths = []
+        uncertain = effects.state is EffectState.UNKNOWN
+        for path in effects.paths:
+            try:
+                resolved = self.context.workspace_policy.resolve_path(path, must_exist=False)
+                canonical = resolved.relative_to(self.context.workspace_policy.workspace).as_posix()
+                if canonical != path:
+                    raise ValueError("副作用路径不是规范路径")
+                paths.append(canonical)
+            except (PolicyError, OSError, ValueError):
+                uncertain = True
+        state = EffectState.UNKNOWN if uncertain else EffectState.CONFIRMED if paths else EffectState.NONE
+        return replace(result, file_effects=FileEffects(state, tuple(paths)))
 
     def _prepare_execution(
         self,
@@ -303,16 +447,22 @@ class ToolRegistry:
         with self._registration_lock:
             handler = self._handlers.get(name)
             if handler is None:
-                return ToolResult(False, f"未知工具：{name}")
+                return tool_failure(ErrorCode.UNKNOWN_TOOL, "未知工具（unknown_tool）：未注册名称")
             definition = self._definitions[name]
             origin = self._origins[name]
         try:
             ToolHandler._validate_arguments(definition.parameters, arguments)
-        except (ValueError, TypeError) as exc:
-            return ToolResult(False, str(exc))
-        if origin.kind != "builtin":
+        except (ValueError, TypeError):
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "工具参数不满足 Schema")
+        if self._builtin_handlers.get(name) is handler:
+            # NUL 是路径格式错误，不是执行阶段的未知 ValueError；必须在访问磁盘前拒绝。
+            for field in ("path", "cwd"):
+                value = arguments.get(field)
+                if isinstance(value, str) and "\x00" in value:
+                    return tool_failure(ErrorCode.INVALID_ARGUMENT, "路径格式无效")
+        if self._builtin_handlers.get(name) is not handler:
             if self.context.read_only and origin.risk != "read":
-                return ToolResult(False, "只读模式禁止执行非只读扩展工具")
+                return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止执行非只读扩展工具")
             if origin.risk != "read":
                 approval_action = (
                     "dangerous_extension_tool"
@@ -321,7 +471,7 @@ class ToolRegistry:
                 )
                 detail = f"扩展：{origin.id}\n工具：{name}\n风险：{origin.risk}"
                 if not self.context.approver(approval_action, detail):
-                    return ToolResult(False, "用户拒绝执行扩展工具")
+                    return tool_failure(ErrorCode.APPROVAL_DENIED, "用户拒绝执行扩展工具")
         return handler, origin
 
     def _normalize_execution_result(
@@ -343,45 +493,69 @@ class ToolRegistry:
             change_chars=change_chars,
         )
 
-    @staticmethod
-    def _validate_execution_result(result: object) -> ToolResult:
+    def _validate_execution_result(self, result: object, name: str, handler: ToolHandler) -> ToolResult:
         """在归一化前拒绝不符合公开 ToolResult 契约的处理器返回值。"""
 
-        if not isinstance(result, ToolResult) or not isinstance(result.output, str):
+        if (type(result) is not ToolResult or not isinstance(result.output, str)
+                or type(result.ok) is not bool):
             raise _InvalidToolResultError("工具处理器返回了无效结果")
+        if result.ok and result.error is not None:
+            raise _InvalidToolResultError("成功结果不能携带错误")
+        if self._builtin_handlers.get(name) is handler:
+            if not result.ok and result.error is None:
+                result = replace(result, error=ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN))
+            if result.error is not None and type(result.error) is not ToolError:
+                raise _InvalidToolResultError("工具错误结构无效")
+        elif not result.ok:
+            # MCP 的本地适配器直接调用受控入口；普通扩展自报同名类型没有证明力。
+            origin = self._origins.get(name)
+            if (origin is None or origin.kind != "mcp"
+                    or type(handler) is not _mcp_handler_class()
+                    or type(result.error) is not ToolError):
+                raise _InvalidToolResultError("扩展失败结构不可信")
+        return result
+
+    @staticmethod
+    def _normalize_error_recovery(result: ToolResult) -> ToolResult:
+        """先核对 T1 副作用，再收紧恢复建议，绝不清除已知路径或 UNKNOWN。"""
+        if (not result.ok and result.file_effects is not None
+                and result.file_effects.state is EffectState.UNKNOWN):
+            return replace(result, error=replace(result.error, recovery=RecoveryAction.STOP_TASK))
         return result
 
     def _safe_execution_failure(
         self,
         name: str,
         arguments: dict[str, Any],
-        origin: ToolOrigin,
+        handler: ToolHandler,
         exc: Exception,
     ) -> ToolResult:
         """保持既有预期错误语义，并对扩展未知异常执行固定脱敏。"""
 
         if isinstance(exc, CancellationError):
             raise exc
-        if isinstance(exc, _InvalidToolResultError):
-            if origin.kind == "builtin":
-                raise exc
-            return ToolResult(False, "扩展工具执行失败，已安全隔离")
-        if isinstance(exc, (PolicyError, ChangeBudgetError)):
-            return ToolResult(False, str(exc))
-        if isinstance(exc, (OSError, UnicodeError, ValueError, TypeError)):
+        if self._builtin_handlers.get(name) is not handler:
+            code = (ErrorCode.INVALID_RESULT if isinstance(exc, _InvalidToolResultError)
+                    else ErrorCode.RESULT_UNCERTAIN)
+            return tool_failure(code, "扩展工具执行失败，已安全隔离")
+        if isinstance(exc, ChangeBudgetError):
+            return tool_failure(ErrorCode.POLICY_DENIED, "变更预算不足，拒绝操作")
+        if isinstance(exc, PolicyArgumentError):
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "命令或路径格式无效")
+        if isinstance(exc, PolicyError):
+            return tool_failure(ErrorCode.POLICY_DENIED, "本地安全策略拒绝操作（路径、命令或安全目录绑定不满足要求）")
+        if isinstance(exc, InvalidToolArgument):
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "工具参数格式无效")
+        if isinstance(exc, (OSError, UnicodeError)):
             if name == "apply_patch" and not self.context.read_only:
-                return ToolResult(False, self._safe_patch_filesystem_error(arguments))
-            if isinstance(exc, (OSError, UnicodeError)):
-                return ToolResult(False, "文件系统操作失败")
-            return ToolResult(False, str(exc))
-        if origin.kind == "builtin":
-            raise exc
-        return ToolResult(False, "扩展工具执行失败，已安全隔离")
+                return tool_failure(ErrorCode.EXECUTION_FAILED, self._safe_patch_filesystem_error(arguments))
+            return tool_failure(ErrorCode.EXECUTION_FAILED, "文件系统操作失败")
+        raise exc
 
     def _read_spilled_result(self, arguments: dict[str, Any]) -> ToolResult:
         store = self.context.spill_store
         if store is None:
-            return ToolResult(False, "当前 Session 没有可回读的大型工具结果")
+            return tool_failure(ErrorCode.UNKNOWN_TOOL, "当前 Session 没有可回读的大型工具结果")
         try:
             ToolHandler._validate_arguments(
                 _READ_TOOL_RESULT_DEFINITION.parameters,
@@ -402,7 +576,7 @@ class ToolRegistry:
                 ),
             )
         except (SpillError, ValueError, TypeError):
-            return ToolResult(False, "大型工具结果引用无效或不可读取")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "大型工具结果引用无效或不可读取")
 
     def _apply_output_budget(
         self,

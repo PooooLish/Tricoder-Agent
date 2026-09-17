@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import time
 from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable, TextIO, TypeVar
 
-from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.core.cancellation import CancellationError, CancellationToken, NativeCancellationError
+from tricoder.task_cleanup import TaskCleanup, current_cleanup
 
 from .models import MCPCallResult, MCPServerState, MCPToolSpec
 from .schema import validate_mcp_schema
@@ -21,11 +23,28 @@ from .transport import MCPProcessExitEvidence, VerifiedStdioTransport
 _T = TypeVar("_T")
 _POLL_INTERVAL_SECONDS = 0.05
 _OPERATION_REAP_TIMEOUT_SECONDS = 0.5
-# 本地 transport 的最坏预算为 8.5 秒；另留 session 退出及调度余量。
+# 独立 client 兼容旧上限；任务作用域存在时 session/transport 共用其更短的期限。
 _DEFAULT_CLEANUP_TIMEOUT_SECONDS = 10.0
 # 无法强制终止吞掉 CancelledError 的 Python 协程；保留强引用并在其最终完成时
 # 消费异常，避免调用方越过墙钟预算等待，也避免 “Task exception was never retrieved”。
 _DEFERRED_REAP_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _cleanup_remaining(seconds: float, *, start: bool = True) -> float:
+    scope = current_cleanup()
+    if scope is None:
+        return seconds
+    deadline = scope.deadline() if start else scope.started_deadline
+    return seconds if deadline is None else min(seconds, max(0.0, deadline - time.monotonic()))
+
+
+class _DeferredReapResource:
+    """旧循环仍持有执行权；Runtime 只登记和观察，不在新循环复用该 task。"""
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self.task = task
+
+    def cleanup(self, deadline: float) -> bool:
+        return self.task.done()
 
 
 class MCPClientError(RuntimeError):
@@ -43,9 +62,10 @@ class MCPProtocolError(MCPClientError):
 class MCPCleanupError(MCPClientError):
     """MCP 资源无法确认已经完整回收。"""
 
-
-class _MCPDeferredCancellation(CancellationError):
-    """显式取消已发生，但被取消 operation 尚未在预算内结束。"""
+    def __init__(self, message: str = "mcp_cleanup_failed", *, cleanup_owner: TaskCleanup | None = None) -> None:
+        super().__init__(message)
+        self.cleanup_failed = True
+        self.cleanup_owner = cleanup_owner
 
 
 class MCPClient:
@@ -211,10 +231,11 @@ class MCPClient:
                     )
                 )
             return tuple(specs)
-        except _MCPDeferredCancellation:
-            # 延迟存活的请求使 session 状态不可再信任，但 Task 6 仍需识别取消。
-            self._state = MCPServerState.FAILED
-            raise CancellationError("操作已取消") from None
+        except CancellationError as cancellation_error:
+            # 延迟请求使 session 不可复用；保留同一取消异常及其 exact 清理所有者。
+            if cancellation_error.cleanup_failed:
+                self._state = MCPServerState.FAILED
+            raise
         except asyncio.CancelledError:
             # 调用者取消发生时，底层请求是否已经停止可能未知，禁止继续复用 session。
             self._state = MCPServerState.FAILED
@@ -249,9 +270,10 @@ class MCPClient:
                 track_operation=self._track_log_operation,
             )
             return normalize_mcp_result(result)
-        except _MCPDeferredCancellation:
-            self._state = MCPServerState.FAILED
-            raise CancellationError("操作已取消") from None
+        except CancellationError as cancellation_error:
+            if cancellation_error.cleanup_failed:
+                self._state = MCPServerState.FAILED
+            raise
         except asyncio.CancelledError:
             self._state = MCPServerState.FAILED
             raise
@@ -285,11 +307,12 @@ class MCPClient:
 
         self._state = MCPServerState.STOPPING
         self._stop_requested.set()
-        cleanup_deadline = asyncio.get_running_loop().time() + self._cleanup_timeout
+        remaining = _cleanup_remaining(self._cleanup_timeout)
+        cleanup_deadline = asyncio.get_running_loop().time() + remaining
         try:
             await asyncio.wait_for(
                 asyncio.shield(lifecycle_task),
-                timeout=self._cleanup_timeout,
+                timeout=remaining,
             )
         except asyncio.CancelledError as cancellation:
             # owner task 未被取消，会继续在进入上下文的同一 task 内完成清理。
@@ -327,6 +350,8 @@ class MCPClient:
             self._state = MCPServerState.FAILED
             raise MCPCleanupError("mcp_cleanup_failed") from None
         finally:
+            if self._cleanup_failed and current_cleanup() is not None:
+                current_cleanup().mark_failed()
             if lifecycle_task.done():
                 self._lifecycle_task = None
                 self._stop_requested = None
@@ -418,7 +443,7 @@ class MCPClient:
         finally:
             self._session = None
             try:
-                async with asyncio.timeout(self._cleanup_timeout):
+                async with asyncio.timeout(_cleanup_remaining(self._cleanup_timeout)):
                     await stack.aclose()
                 if transport is not None:
                     outcome = transport.outcome
@@ -437,6 +462,8 @@ class MCPClient:
                 self._cleanup_failed = True
                 cleanup_error = MCPCleanupError("mcp_cleanup_failed")
             finally:
+                if self._cleanup_failed and current_cleanup() is not None:
+                    current_cleanup().mark_failed()
                 if stderr_sink is not None:
                     stderr_sink.close()
 
@@ -483,7 +510,7 @@ class MCPClient:
         lifecycle_task.cancel()
         owner_finished = await _reap_tasks(
             {lifecycle_task},
-            timeout=self._cleanup_timeout + _OPERATION_REAP_TIMEOUT_SECONDS,
+            timeout=_cleanup_remaining(self._cleanup_timeout + _OPERATION_REAP_TIMEOUT_SECONDS),
         )
         if owner_finished:
             self._lifecycle_task = None
@@ -508,7 +535,7 @@ async def _await_bounded(
     operation_task = asyncio.create_task(_run_sdk_operation(operation, log_sources))
     track_operation(operation_task)
     cancellation_task = asyncio.create_task(_wait_for_cancellation(cancellation))
-    token_cancelled = False
+    token_cancellation: CancellationError | None = None
     caller_cancellation: asyncio.CancelledError | None = None
     try:
         done, _ = await asyncio.wait(
@@ -520,9 +547,14 @@ async def _await_bounded(
             operation_task.cancel()
             raise MCPTimeoutError(timeout_code)
         if cancellation_task in done:
-            token_cancelled = True
+            try:
+                cancellation_task.result()
+            except CancellationError as error:
+                token_cancellation = error
+            else:
+                token_cancellation = CancellationError("操作已取消")
             operation_task.cancel()
-            raise CancellationError("操作已取消")
+            raise token_cancellation
         return await operation_task
     except asyncio.CancelledError as exc:
         # SDK 请求可能先于整个任务 scope 进入 finally，同步发布协作式取消。
@@ -532,22 +564,47 @@ async def _await_bounded(
     finally:
         cancellation_task.cancel()
         if not operation_task.done():
+            if current_cleanup() is not None:
+                current_cleanup().deadline()
             operation_task.cancel()
         try:
             reaped = await _reap_tasks(
                 {operation_task, cancellation_task},
                 timeout=_OPERATION_REAP_TIMEOUT_SECONDS,
             )
-        except asyncio.CancelledError:
-            if caller_cancellation is not None:
-                raise caller_cancellation
-            raise
+        except asyncio.CancelledError as cleanup_cancellation:
+            # 收割期间的第二次取消不能覆盖已经固定的 token 或 native 首异常。
+            primary = caller_cancellation if caller_cancellation is not None else token_cancellation
+            if primary is None:
+                primary = cleanup_cancellation
+            raise _owned_pending_cancellation(primary, {operation_task, cancellation_task})
         if not reaped:
             if caller_cancellation is not None:
-                raise caller_cancellation
-            if token_cancelled:
-                raise _MCPDeferredCancellation("操作已取消") from None
+                raise _owned_pending_cancellation(caller_cancellation, {operation_task, cancellation_task})
+            if token_cancellation is not None:
+                raise _owned_pending_cancellation(token_cancellation, {operation_task, cancellation_task})
             raise MCPCleanupError("mcp_cleanup_failed") from None
+
+
+def _owned_pending_cancellation(
+    error: CancellationError | asyncio.CancelledError, tasks: set[asyncio.Task[Any]],
+) -> CancellationError | asyncio.CancelledError:
+    """只给本地类型记录清理事实；foreign 取消用带 cause 的取消子类型承载。"""
+    pending = {task for task in tasks if not task.done()}
+    if not pending:
+        return error
+    scope = current_cleanup()
+    if scope is None:
+        # 没有 Runtime/registry 时由异常持有局部 owner；旧循环全局收割仍消费异常。
+        scope = TaskCleanup()
+        for task in pending:
+            scope.retain(_DeferredReapResource(task))
+    # 有作用域时 _reap_tasks 已登记 exact task，不重复创建资源包装。
+    scope.mark_failed()
+    if isinstance(error, CancellationError):
+        error.record_cleanup_failure(scope)
+        return error
+    return NativeCancellationError(error, cleanup_owner=scope)
 
 
 async def _run_sdk_operation(
@@ -622,7 +679,8 @@ async def _reap_tasks(
     if not tasks:
         return True
     try:
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        # 正常请求只收割已完成任务/取消监视器，不提前启动整个任务的清理期限。
+        done, pending = await asyncio.wait(tasks, timeout=_cleanup_remaining(timeout, start=False))
     except asyncio.CancelledError:
         # 收割等待者本身也可能被调用方取消。此时仍须为每个 operation 安排
         # 最终异常消费，否则正常竞态会触发 “Task exception was never retrieved”。
@@ -647,6 +705,10 @@ def _track_deferred_reap(task: asyncio.Task[Any]) -> None:
         return
     if task in _DEFERRED_REAP_TASKS:
         return
+    scope = current_cleanup()
+    if scope is not None:
+        scope.mark_failed()
+        scope.retain(_DeferredReapResource(task))
     _DEFERRED_REAP_TASKS.add(task)
     task.add_done_callback(_consume_task_result)
 

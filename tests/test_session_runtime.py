@@ -459,6 +459,115 @@ class LegacyRegistryJournalFactory(RegistryJournalFactory):
 
 
 class SessionRuntimeTests(unittest.TestCase):
+    def test_active_tui_exit_retries_resources_registered_later_outside_state_lock(self):
+        from tricoder.task_cleanup import current_cleanup
+        from tricoder.tui import TricoderApp
+
+        for exit_method in ("action_quit", "on_unmount"):
+            for retry_succeeds in (False, True):
+                with self.subTest(exit_method=exit_method, retry_succeeds=retry_succeeds):
+                    runtime = SessionRuntime(self.store, self.workspace,
+                        options=RuntimeOptions(environ={}), active_session_factory=self.builder)
+                    entered, allow_cleanup = threading.Event(), threading.Event()
+                    calls, results, failures, owners = [], [], [], []
+                    ui_thread = threading.get_ident()
+
+                    class Resource:
+                        def cleanup(inner, deadline):
+                            self.assertTrue(runtime._task_state_lock.acquire(blocking=False),
+                                            "清理等待不能持有状态锁")
+                            runtime._task_state_lock.release()
+                            self.assertTrue(app._approval_lock.acquire(blocking=False),
+                                            "清理等待不能持有 UI 审批锁")
+                            app._approval_lock.release()
+                            calls.append((inner, threading.get_ident(), deadline))
+                            self.assertLessEqual(deadline, time.monotonic() + 5.01)
+                            return len(calls) > 1 and retry_succeeds
+
+                    resource = Resource()
+                    class CleanupAgent:
+                        def run_with_context(inner, task, context, *, cancellation):
+                            entered.set()
+                            if not allow_cleanup.wait(2):
+                                raise AssertionError("UI 退出没有返回")
+                            self.assertTrue(cancellation.is_cancelled)
+                            scope = current_cleanup()
+                            owners.append(scope)
+                            self.assertFalse(resource.cleanup(scope.begin_termination()))
+                            scope.mark_failed()
+                            scope.retain(resource)
+                            return SessionTurnResult(RunResult(True, "done", 1), context)
+
+                    runtime.current = replace(runtime.current, agent=CleanupAgent())
+                    runtime._cache_current()
+                    app = TricoderApp(lambda *_: runtime)
+                    app.runtime = runtime
+                    def run():
+                        try:
+                            results.append(runtime.run_task("active exit"))
+                        except BaseException as error:
+                            failures.append(error)
+                    worker = threading.Thread(target=run)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        with mock.patch.object(app, "exit") as exit_mock:
+                            getattr(app, exit_method)()
+                            if exit_method == "action_quit":
+                                exit_mock.assert_called_once_with(1)
+                        self.assertEqual([], calls, "退出先发生，此时尚没有资源登记")
+                    finally:
+                        allow_cleanup.set()
+                        worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual([], failures)
+                    self.assertEqual(2, len(calls), "任务 finally 必须消费先到达的退出请求")
+                    self.assertTrue(all(item[0] is resource and item[1] != ui_thread for item in calls))
+                    self.assertTrue(results[0].cleanup_failed)
+                    self.assertFalse(results[0].ok)
+                    self.assertTrue(owners[0].failed)
+                    self.assertEqual(not retry_succeeds, owners[0].has_pending)
+                    self.assertEqual(not retry_succeeds, bool(runtime._pending_cleanup))
+                    self.assertIsNone(runtime.current_task_cancellation())
+                    self.assertTrue(runtime._task_lock.acquire(blocking=False))
+                    runtime._task_lock.release()
+
+    def test_cleanup_failure_is_sticky_owned_and_blocks_reuse_until_reaped(self):
+        from tricoder import subprocess_control as control
+        failed = control.BoundedProcessResult(0, "", "", cleanup_failed=True)
+
+        class CleanupAgent:
+            def run_with_context(inner, task, context, **kwargs):
+                from tricoder.task_cleanup import current_cleanup
+                scope = current_cleanup()
+                self.assertIsNotNone(scope)
+                scope.retain(resource)
+                scope.mark_failed()
+                # 后续工具成功不能抹去先前清理失败。
+                return SessionTurnResult(RunResult(True, "done", 1), context)
+
+        class Resource:
+            reclaimed = False
+            def cleanup(inner, deadline):
+                return inner.reclaimed
+
+        resource = Resource()
+        self.runtime.current = replace(self.runtime.current, agent=CleanupAgent())
+        self.runtime._cache_current()
+        try:
+            result = self.runtime.run_task("first")
+        except ModuleNotFoundError:
+            self.fail("Runtime 缺少任务级清理所有权和黏着失败状态")
+        self.assertTrue(result.cleanup_failed)
+        self.assertFalse(result.ok)
+        with self.assertRaises(SessionRuntimeError):
+            self.runtime.run_task("must not reuse occupied resources")
+        self.assertFalse(self.runtime.cleanup_pending_resources())
+        resource.reclaimed = True
+        self.assertTrue(self.runtime.cleanup_pending_resources())
+        self.assertTrue(self.runtime._task_lock.acquire(blocking=False))
+        self.runtime._task_lock.release()
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -902,9 +1011,9 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertFalse((self.workspace / "src" / "created.py").exists())
         self.assertIsNone(runtime.diff_latest())
         self.assertEqual(("src/prior.py",), runtime.current.context.modified_files)
-        self.assertEqual("not-run", runtime.current.context.verification)
+        self.assertEqual("待验证", runtime.current.context.verification)
         self.assertEqual(("src/prior.py",), runtime.current.memory.modified_files)
-        self.assertEqual("not-run", runtime.current.memory.verification)
+        self.assertEqual("待验证", runtime.current.memory.verification)
         persisted = self.store.load_memory(runtime.current.record.id)
         self.assertEqual(("src/prior.py",), persisted.modified_files)
         audit_text = audit_path.read_text(encoding="utf-8")
@@ -1276,8 +1385,12 @@ class SessionRuntimeTests(unittest.TestCase):
         restored_first = self.runtime.switch(self.first.id, confirm=lambda _: True)
         restored_second = self.runtime.switch(self.second.id, confirm=lambda _: True)
 
-        self.assertEqual(first_context, restored_first.context)
-        self.assertEqual(second_context, restored_second.context)
+        self.assertEqual(first_context.messages, restored_first.context.messages)
+        self.assertEqual(second_context.messages, restored_second.context.messages)
+        self.assertEqual("待验证", restored_first.context.verification)
+        self.assertEqual("待验证", restored_second.context.verification)
+        self.assertIsNone(restored_first.context.verification_evidence)
+        self.assertIsNone(restored_second.context.verification_evidence)
         self.assertIs(first_active.agent, restored_first.agent)
         self.assertIs(second_active.agent, restored_second.agent)
         self.assertIsNot(restored_first.agent, restored_second.agent)
@@ -1493,7 +1606,6 @@ class SessionRuntimeTests(unittest.TestCase):
         )
         runtime.run_task("修改模块")
         files = runtime.current.memory.modified_files
-        verification = runtime.current.memory.verification
         wrapped_store.fail_writes = True
 
         with self.assertRaises(SessionRuntimeError):
@@ -1501,7 +1613,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
         self.assertEqual("", runtime.current.memory.summary)
         self.assertEqual(files, runtime.current.memory.modified_files)
-        self.assertEqual(verification, runtime.current.memory.verification)
+        self.assertEqual("待验证", runtime.current.memory.verification)
         self.assertTrue(runtime.status().unsaved_memory)
         wrapped_store.fail_writes = False
 
@@ -1789,6 +1901,62 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertTrue(agent.cancelled.is_set())
         self.assertFalse(results[0].ok)
         self.assertFalse(self.runtime.cancel_current())
+
+    def test_task_token_snapshot_waits_for_publication_and_old_token_is_isolated(self):
+        getter = getattr(self.runtime, "current_task_cancellation", None)
+        self.assertTrue(callable(getter), "Runtime 缺少受状态锁保护的令牌快照")
+        self.assertIsNone(getter())
+        entered = threading.Barrier(2)
+        release = threading.Event()
+
+        class PublishingToken(CancellationToken):
+            def __init__(self):
+                super().__init__()
+                entered.wait(timeout=2)
+                if not release.wait(2):
+                    raise TimeoutError("token publication not released")
+
+        agent = BlockingCancellableAgent()
+        self.runtime.current = replace(self.runtime.current, agent=agent)
+        self.runtime._cache_current()
+        tokens = []
+        read_started = threading.Event()
+
+        def read_token():
+            read_started.set()
+            tokens.append(getter())
+
+        with mock.patch("tricoder.session_runtime.CancellationToken", PublishingToken):
+            worker = threading.Thread(target=lambda: self.runtime.run_task("first"))
+            worker.start()
+            entered.wait(timeout=2)
+            reader = threading.Thread(target=read_token)
+            reader.start()
+            self.assertTrue(read_started.wait(1))
+            self.assertEqual([], tokens)
+            release.set()
+            reader.join(2)
+            self.assertTrue(agent.started.wait(2))
+            self.assertIsNotNone(tokens[0])
+            tokens[0].cancel()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(getter())
+        agent = BlockingCancellableAgent()
+        self.runtime.current = replace(self.runtime.current, agent=agent)
+        self.runtime._cache_current()
+        worker = threading.Thread(target=lambda: self.runtime.run_task("second"))
+        worker.start()
+        self.assertTrue(agent.started.wait(2))
+        current = getter()
+        self.assertIsNot(tokens[0], current)
+        tokens[0].cancel()
+        self.assertFalse(current.is_cancelled)
+        current.cancel()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(self.runtime._task_lock.acquire(blocking=False))
+        self.runtime._task_lock.release()
 
     def test_cancel_current_cannot_miss_task_during_token_publication(self) -> None:
         """任务已声明活动但令牌尚未发布时，取消调用必须等待并命中新任务。"""

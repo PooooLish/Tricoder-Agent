@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import difflib
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from tricoder.changes import (
+    ChangeJournal,
     FileChange,
     FileIdentity,
     FileSnapshot,
     render_file_diff,
 )
-from tricoder.models import ToolResult
+from tricoder.models import ToolResult, tool_failure
+from tricoder.execution_state import ErrorCode
 from tricoder.patches import (
     FilePatch,
     PatchError,
@@ -46,7 +50,46 @@ class _CommittedFilePatch:
     after: FileSnapshot
 
 
-class EditFileTool(ToolHandler):
+_operation_journal: ContextVar[ChangeJournal | None] = ContextVar(
+    "file_operation_journal", default=None,
+)
+
+
+class _FileWriteTool(ToolHandler):
+    """为一次内置文件操作单独聚合前后态，避免混入此前任务修改。"""
+
+    @contextmanager
+    def collect_effects(self) -> Iterator[ChangeJournal]:
+        journal = ChangeJournal()
+        journal.begin_task((), "未运行")
+        token = _operation_journal.set(journal)
+        try:
+            yield journal
+        finally:
+            _operation_journal.reset(token)
+
+    def _record_committed(
+        self, path: str, before: FileSnapshot | None, after: FileSnapshot | None,
+    ) -> None:
+        operation = _operation_journal.get()
+        if operation is not None:
+            operation.record_committed(path, before, after)
+        super()._record_committed(path, before, after)
+
+    def _mark_journal_tainted(self, path: str) -> None:
+        operation = _operation_journal.get()
+        if operation is not None:
+            operation.mark_tainted(path)
+        super()._mark_journal_tainted(path)
+
+    def _journal_before_is_continuous(self, path: str, before: FileSnapshot | None) -> bool:
+        continuous = super()._journal_before_is_continuous(path, before)
+        if not continuous:
+            self._mark_journal_tainted(path)
+        return continuous
+
+
+class EditFileTool(_FileWriteTool):
     name = "edit_file"
     description = "经审批后精确替换工作区内文件的一段文本。"
     parameters = ToolHandler._schema(
@@ -60,11 +103,11 @@ class EditFileTool(ToolHandler):
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         if self.context.read_only:
-            return ToolResult(False, "只读模式禁止编辑文件")
+            return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止编辑文件")
         raw_path = self._required_str(arguments, "path")
         path = self.context.workspace_policy.resolve_path(raw_path)
         if not path.is_file():
-            return ToolResult(False, "edit_file 的目标必须是文件")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "edit_file 的目标必须是文件")
         old_text = self._required_str(arguments, "old_text")
         new_text = self._required_str(arguments, "new_text", allow_empty=True)
         binding = _DirectoryBinding.open(
@@ -74,20 +117,19 @@ class EditFileTool(ToolHandler):
         temporary_name: str | None = None
         committed = False
         close_warning = False
-        journal_warning = False
         try:
             preapproved = self.context.workspace_policy.resolve_path(raw_path)
             if preapproved != path or not binding.verify_parent(preapproved.parent):
-                return ToolResult(False, "目标父目录身份发生变化，拒绝请求审批")
+                return tool_failure(ErrorCode.POLICY_DENIED, "目标父目录身份发生变化，拒绝请求审批")
             relative = path.relative_to(self.context.workspace_policy.workspace)
             relative_path = relative.as_posix()
             before = self._snapshot(binding, path.name, relative_path)
             if not self._journal_before_is_continuous(relative_path, before):
-                return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
+                return tool_failure(ErrorCode.RESULT_UNCERTAIN, f"任务内文件状态不连续：{relative_path}")
             original = before.content
             if original.count(old_text) != 1:
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    ErrorCode.EXECUTION_FAILED,
                     "old_text 必须在目标文件中恰好出现一次，请重新读取文件",
                 )
             updated = original.replace(old_text, new_text, 1)
@@ -106,15 +148,15 @@ class EditFileTool(ToolHandler):
                 before.identity,
             )
             self._reserve_change(FileChange(relative_path, before, projected_after))
-            if not self.context.approver("edit_file", diff):
-                return ToolResult(False, "用户拒绝了文件修改")
+            if not self._approve("edit_file", diff):
+                return tool_failure(ErrorCode.APPROVAL_DENIED, "用户拒绝了文件修改")
 
             verified = self.context.workspace_policy.resolve_path(raw_path)
             if not binding.verify_parent(verified.parent) or verified != path:
-                return ToolResult(False, "审批后目标父目录身份发生变化，拒绝写入")
+                return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标父目录身份发生变化，拒绝写入")
             current = self._snapshot(binding, path.name, relative_path)
             if current.identity != before.identity or current.content != original:
-                return ToolResult(False, "审批后目标文件发生变化，请重新读取并审批")
+                return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标文件发生变化，请重新读取并审批")
 
             temporary_name = binding.create_temporary(
                 path.name,
@@ -127,26 +169,30 @@ class EditFileTool(ToolHandler):
             temporary_name = None
             try:
                 after = self._snapshot(binding, path.name, relative_path)
-            except Exception:
+            except Exception as exc:
                 self._record_unverified_expected(
                     relative_path,
                     before,
                     published_after,
                 )
-                return ToolResult(
-                    False,
+                if not isinstance(exc, (OSError, UnicodeError)):
+                    raise
+                return tool_failure(
+                    ErrorCode.RESULT_UNCERTAIN,
                     f"文件发布后状态无法验证：{relative_path}",
                 )
             if after != published_after:
                 self._mark_journal_tainted(relative_path)
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    ErrorCode.RESULT_UNCERTAIN,
                     f"文件发布后状态无法验证：{relative_path}",
                 )
             try:
                 self._record_committed(relative_path, before, after)
             except Exception:
-                journal_warning = True
+                # 已发布的文件不能因账本编程异常被遗忘；先封住未知影响，再保留根因。
+                self._mark_journal_tainted(relative_path)
+                raise
         finally:
             if temporary_name is not None:
                 try:
@@ -160,14 +206,12 @@ class EditFileTool(ToolHandler):
                     raise
                 close_warning = True
         output = f"已修改 {relative}"
-        if journal_warning:
-            output += "；账本警告：提交后快照或记录失败，文件修改已提交，请在验证时检查路径"
         if close_warning:
             output += "；关闭警告：目录绑定未能正常关闭，文件修改已提交，请在验证时检查目录"
         return ToolResult(True, output, relative_path)
 
 
-class CreateFileTool(ToolHandler):
+class CreateFileTool(_FileWriteTool):
     name = "create_file"
     description = "经审批后在工作区内创建新的 UTF-8 文件。"
     parameters = ToolHandler._schema(
@@ -178,7 +222,7 @@ class CreateFileTool(ToolHandler):
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         """经审批后，以不可覆盖的原子发布方式创建 UTF-8 文件。"""
         if self.context.read_only:
-            return ToolResult(False, "只读模式禁止创建文件")
+            return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止创建文件")
         raw_path = self._required_str(arguments, "path")
         path = self.context.workspace_policy.resolve_path(
             raw_path,
@@ -186,9 +230,9 @@ class CreateFileTool(ToolHandler):
         )
         content = self._required_str(arguments, "content", allow_empty=True)
         if not path.parent.is_dir():
-            return ToolResult(False, "create_file 的父目录必须存在")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "create_file 的父目录必须存在")
         if path.exists():
-            return ToolResult(False, "create_file 的目标文件已存在，拒绝覆盖")
+            return tool_failure(ErrorCode.POLICY_DENIED, "create_file 的目标文件已存在，拒绝覆盖")
 
         relative = path.relative_to(self.context.workspace_policy.workspace)
         diff = (
@@ -216,7 +260,6 @@ class CreateFileTool(ToolHandler):
         committed = False
         cleanup_warning = False
         close_warning = False
-        journal_warning = False
         verification_failed = False
         try:
             preapproved = self.context.workspace_policy.resolve_path(
@@ -224,10 +267,10 @@ class CreateFileTool(ToolHandler):
                 must_exist=False,
             )
             if preapproved != path or not binding.verify_parent(preapproved.parent):
-                return ToolResult(False, "目标父目录身份发生变化，拒绝请求审批")
+                return tool_failure(ErrorCode.POLICY_DENIED, "目标父目录身份发生变化，拒绝请求审批")
             relative_path = relative.as_posix()
             if not self._journal_before_is_continuous(relative_path, None):
-                return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
+                return tool_failure(ErrorCode.RESULT_UNCERTAIN, f"任务内文件状态不连续：{relative_path}")
             projected_after = FileSnapshot(
                 relative_path,
                 content,
@@ -235,34 +278,36 @@ class CreateFileTool(ToolHandler):
                 FileIdentity(0, 0),
             )
             self._reserve_change(FileChange(relative_path, None, projected_after))
-            if not self.context.approver("create_file", diff):
-                return ToolResult(False, "用户拒绝了创建文件")
+            if not self._approve("create_file", diff):
+                return tool_failure(ErrorCode.APPROVAL_DENIED, "用户拒绝了创建文件")
 
             verified = self.context.workspace_policy.resolve_path(
                 raw_path,
                 must_exist=False,
             )
             if not binding.verify_parent(verified.parent) or verified != path:
-                return ToolResult(False, "审批后目标父目录身份发生变化，拒绝写入")
+                return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标父目录身份发生变化，拒绝写入")
             if binding.target_exists(path.name):
-                return ToolResult(False, "审批后目标文件已存在，拒绝覆盖")
+                return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标文件已存在，拒绝覆盖")
 
             temporary_name = binding.create_temporary(path.name, content, 0o600)
             published_after = self._snapshot(binding, temporary_name, relative_path)
             try:
                 binding.link(temporary_name, path.name)
             except OSError:
-                return ToolResult(False, "create_file 无法原子发布文件，拒绝覆盖")
+                return tool_failure(ErrorCode.EXECUTION_FAILED, "create_file 无法原子发布文件，拒绝覆盖")
             committed = True
             snapshot_failed = False
             try:
                 after = self._snapshot(binding, path.name, relative_path)
-            except Exception:
+            except Exception as exc:
                 self._record_unverified_expected(
                     relative_path,
                     None,
                     published_after,
                 )
+                if not isinstance(exc, (OSError, UnicodeError)):
+                    raise
                 snapshot_failed = True
                 verification_failed = True
             else:
@@ -273,7 +318,8 @@ class CreateFileTool(ToolHandler):
                 try:
                     self._record_committed(relative_path, None, after)
                 except Exception:
-                    journal_warning = True
+                    self._mark_journal_tainted(relative_path)
+                    raise
             try:
                 binding.unlink(temporary_name)
             except OSError:
@@ -298,10 +344,8 @@ class CreateFileTool(ToolHandler):
                 output += "；清理警告：临时链接未能删除，请验证受影响路径"
             if close_warning:
                 output += "；关闭警告：目录绑定未能正常关闭，请验证受影响路径"
-            return ToolResult(False, output)
+            return tool_failure(ErrorCode.RESULT_UNCERTAIN, output)
         output = f"已创建 {relative}"
-        if journal_warning:
-            output += "；账本警告：提交后快照或记录失败，文件创建已提交，请在验证时检查路径"
         if cleanup_warning:
             output += "；清理警告：临时链接未能删除，请在验证时检查目录"
         if close_warning:
@@ -309,7 +353,7 @@ class CreateFileTool(ToolHandler):
         return ToolResult(True, output, relative_path)
 
 
-class ApplyPatchTool(ToolHandler):
+class ApplyPatchTool(_FileWriteTool):
     name = "apply_patch"
     description = "经一次审批后原子应用受限的多文件 unified diff。"
     parameters = ToolHandler._schema({"patch": {"type": "string"}}, ["patch"])
@@ -318,12 +362,12 @@ class ApplyPatchTool(ToolHandler):
         """全量预检后，以一次审批提交受限的多文件补丁。"""
 
         if self.context.read_only:
-            return ToolResult(False, "只读模式禁止应用补丁")
+            return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止应用补丁")
         source = self._required_str(arguments, "patch")
         try:
             file_patches = parse_unified_diff(source)
-        except PatchError as exc:
-            return ToolResult(False, f"补丁无效：{exc}")
+        except PatchError:
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "补丁无效：格式不满足受限补丁契约")
 
         workspace = self.context.workspace_policy.workspace
         resolved: list[tuple[FilePatch, Path, str]] = []
@@ -335,15 +379,15 @@ class ApplyPatchTool(ToolHandler):
             )
             relative_path = path.relative_to(workspace).as_posix()
             if relative_path in seen_targets:
-                return ToolResult(False, f"补丁目标重复：{relative_path}")
+                return tool_failure(ErrorCode.INVALID_ARGUMENT, f"补丁目标重复：{relative_path}")
             seen_targets.add(relative_path)
             if not path.parent.is_dir():
-                return ToolResult(False, f"补丁目标父目录不存在：{relative_path}")
+                return tool_failure(ErrorCode.INVALID_ARGUMENT, f"补丁目标父目录不存在：{relative_path}")
             if file_patch.create:
                 if path.exists():
-                    return ToolResult(False, f"补丁创建目标已存在：{relative_path}")
+                    return tool_failure(ErrorCode.POLICY_DENIED, f"补丁创建目标已存在：{relative_path}")
             elif not path.is_file():
-                return ToolResult(False, f"补丁目标不是普通文件：{relative_path}")
+                return tool_failure(ErrorCode.INVALID_ARGUMENT, f"补丁目标不是普通文件：{relative_path}")
             resolved.append((file_patch, path, relative_path))
 
         bindings: dict[Path, _DirectoryBinding] = {}
@@ -358,10 +402,10 @@ class ApplyPatchTool(ToolHandler):
             for file_patch, path, relative_path in resolved:
                 binding = bindings[path.parent]
                 if not binding.verify_parent(path.parent):
-                    return ToolResult(False, f"补丁目标父目录身份已变化：{relative_path}")
+                    return tool_failure(ErrorCode.POLICY_DENIED, f"补丁目标父目录身份已变化：{relative_path}")
                 if file_patch.create:
                     if binding.target_exists(path.name):
-                        return ToolResult(False, f"补丁创建目标已存在：{relative_path}")
+                        return tool_failure(ErrorCode.POLICY_DENIED, f"补丁创建目标已存在：{relative_path}")
                     before = None
                     original = ""
                     mode = 0o600
@@ -370,13 +414,13 @@ class ApplyPatchTool(ToolHandler):
                     original = before.content
                     mode = before.mode
                 if not self._journal_before_is_continuous(relative_path, before):
-                    return ToolResult(False, f"任务内文件状态不连续：{relative_path}")
+                    return tool_failure(ErrorCode.RESULT_UNCERTAIN, f"任务内文件状态不连续：{relative_path}")
                 try:
                     after_content = apply_file_patch(original, file_patch)
-                except PatchError as exc:
-                    return ToolResult(False, f"补丁无法应用到 {relative_path}：{exc}")
+                except PatchError:
+                    return tool_failure(ErrorCode.EXECUTION_FAILED, f"补丁无法应用到 {relative_path}")
                 if not file_patch.create and after_content == original:
-                    return ToolResult(False, f"补丁对现有文件没有净变化：{relative_path}")
+                    return tool_failure(ErrorCode.EXECUTION_FAILED, f"补丁对现有文件没有净变化：{relative_path}")
                 prepared.append(
                     _PreparedFilePatch(
                         file_patch,
@@ -414,17 +458,17 @@ class ApplyPatchTool(ToolHandler):
             self._reserve_changes(projected)
             approval_detail = "".join(self._render_patch_diff(item) for item in prepared)
             try:
-                approved = self.context.approver("apply_patch", approval_detail)
+                approved = self._approve("apply_patch", approval_detail)
             except (OSError, ValueError, TypeError):
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    ErrorCode.POLICY_DENIED,
                     "补丁审批失败，未执行写入",
                     audit_paths=audit_paths,
                     change_chars=change_chars,
                 )
             if not approved:
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    ErrorCode.APPROVAL_DENIED,
                     "用户拒绝了多文件补丁",
                     audit_paths=audit_paths,
                     change_chars=change_chars,
@@ -437,16 +481,16 @@ class ApplyPatchTool(ToolHandler):
                 )
                 binding = bindings[item.path.parent]
                 if verified != item.path or not binding.verify_parent(verified.parent):
-                    return ToolResult(
-                        False,
+                    return tool_failure(
+                        ErrorCode.POLICY_DENIED,
                         "审批后补丁目标父目录身份发生变化，拒绝写入",
                         audit_paths=audit_paths,
                         change_chars=change_chars,
                     )
                 if item.before is None:
                     if binding.target_exists(item.path.name):
-                        return ToolResult(
-                            False,
+                        return tool_failure(
+                            ErrorCode.POLICY_DENIED,
                             "审批后补丁创建目标已存在，拒绝覆盖",
                             audit_paths=audit_paths,
                             change_chars=change_chars,
@@ -454,8 +498,8 @@ class ApplyPatchTool(ToolHandler):
                 else:
                     current = self._snapshot(binding, item.path.name, item.relative_path)
                     if current != item.before:
-                        return ToolResult(
-                            False,
+                        return tool_failure(
+                            ErrorCode.POLICY_DENIED,
                             "审批后补丁目标发生变化，拒绝全部写入",
                             audit_paths=audit_paths,
                             change_chars=change_chars,
@@ -463,6 +507,7 @@ class ApplyPatchTool(ToolHandler):
 
             committed: list[_CommittedFilePatch] = []
             failed_path = ""
+            failure_code = ErrorCode.EXECUTION_FAILED
             try:
                 for item in sorted(prepared, key=lambda value: value.relative_path):
                     failed_path = item.relative_path
@@ -480,6 +525,7 @@ class ApplyPatchTool(ToolHandler):
                     )
                     if not self._patch_target_matches_before(item, binding):
                         self._mark_journal_tainted(item.relative_path)
+                        failure_code = ErrorCode.POLICY_DENIED
                         raise PolicyError("补丁目标在逐文件发布前发生变化")
                     if item.before is None:
                         binding.link(temporary_name, item.path.name)
@@ -492,21 +538,29 @@ class ApplyPatchTool(ToolHandler):
                         after = self._snapshot(binding, item.path.name, item.relative_path)
                     except Exception:
                         self._mark_journal_tainted(item.relative_path)
+                        failure_code = ErrorCode.RESULT_UNCERTAIN
                         raise
                     if after != expected_after:
                         self._mark_journal_tainted(item.relative_path)
+                        failure_code = ErrorCode.RESULT_UNCERTAIN
                         raise PolicyError("补丁发布后目标状态不匹配预期后态")
                     self._record_committed(item.relative_path, item.before, after)
                     committed_paths.append(item.relative_path)
                     if item.before is None:
                         binding.unlink(temporary_name)
                         temporary_files.pop()
-            except Exception:
+            except Exception as exc:
                 compensation_failures = self._compensate_patch_commits(
                     committed,
                     bindings,
                     temporary_files,
                 )
+                # 补偿沿用既有事务；只有已知系统失败形成业务结果，未知异常原样上抛。
+                if not isinstance(exc, (OSError, UnicodeError)):
+                    raise
+                # PolicyError 也是 OSError；只有产生点才能区分发布前拒绝和发布后失去证明。
+                if failure_code is ErrorCode.EXECUTION_FAILED and isinstance(exc, PolicyError):
+                    failure_code = ErrorCode.POLICY_DENIED
                 affected_paths = tuple(
                     dict.fromkeys(
                         [entry.prepared.relative_path for entry in committed]
@@ -519,8 +573,8 @@ class ApplyPatchTool(ToolHandler):
                     output += f"；补偿未完成：{'、'.join(compensation_failures)}"
                 else:
                     output += "；已完成安全补偿"
-                return ToolResult(
-                    False,
+                return tool_failure(
+                    failure_code,
                     output,
                     modified_paths=tuple(compensation_failures),
                     audit_paths=audit_paths,
@@ -641,6 +695,7 @@ class ApplyPatchTool(ToolHandler):
                 else None
             )
             if actual == entry.after:
+                self._record_committed(item.relative_path, item.before, actual)
                 return
             if actual is None and item.before is None:
                 self._record_committed(item.relative_path, entry.after, None)

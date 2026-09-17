@@ -191,10 +191,10 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(runtime.current.audit)
             self.assertIsNone(runtime.diff_latest())
 
-    def test_structured_context_survives_model_and_session_switches_until_clear(
+    def test_structured_messages_survive_model_rebuild_and_session_switches(
         self,
     ) -> None:
-        """防止模型重建或会话切换串改结构化消息；清空只影响当前会话。"""
+        """模型重建保留上下文；会话切换保留消息但撤销旧核验证据。"""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             first_workspace = (root / "workspace-one").resolve()
@@ -250,12 +250,18 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertNotEqual(first_snapshot.messages, second_snapshot.messages)
 
             runtime.switch(first.id, confirm=lambda _workspace: True)
-            self.assertEqual(first_snapshot, runtime.current.context)
+            self.assertEqual(first_snapshot.messages, runtime.current.context.messages)
+            self.assertEqual("待验证", runtime.current.context.verification)
+            self.assertIsNone(runtime.current.context.verification_evidence)
+            self.assertTrue(runtime.current.context.verification_required)
             runtime.clear_current()
             self.assertEqual((), runtime.current.context.messages)
 
             runtime.switch(second.id, confirm=lambda _workspace: True)
-            self.assertEqual(second_snapshot, runtime.current.context)
+            self.assertEqual(second_snapshot.messages, runtime.current.context.messages)
+            self.assertEqual("待验证", runtime.current.context.verification)
+            self.assertIsNone(runtime.current.context.verification_evidence)
+            self.assertTrue(runtime.current.context.verification_required)
 
     def test_sqlite_persists_only_canonical_relative_paths_after_agent_writes(self) -> None:
         """防止 Agent 写入后将绝对路径或 dotdot 形式保存到 SQLite。"""

@@ -31,6 +31,14 @@ class MCPManagerError(RuntimeError):
     """manager 对外使用的固定、无底层正文错误类别。"""
 
 
+class MCPPreflightError(MCPManagerError):
+    """本地路由/参数检查尚未进入 client 调用，不依靠异常文本判阶段。"""
+
+
+class MCPInvalidResultError(MCPManagerError):
+    """client 已返回，但结构不能作为有效工具结果消费。"""
+
+
 class _MCPClientProtocol(Protocol):
     @property
     def state(self) -> MCPServerState: ...
@@ -236,7 +244,7 @@ class _MCPServerExtension:
     ) -> MCPCallResult:
         client = self._client
         if not self._ready or client is None:
-            raise MCPManagerError("mcp_server_unavailable")
+            raise MCPPreflightError("mcp_server_unavailable")
         return await client.call_tool(raw_name, arguments, cancellation)
 
     def _required_start_audit(self) -> None:
@@ -387,18 +395,18 @@ class MCPManager:
             extension.descriptor.id == server_id and extension.specs
             for extension in self._extensions
         ):
-            raise MCPManagerError("mcp_server_unavailable")
+            raise MCPPreflightError("mcp_server_unavailable")
         extension = self._routes.get((server_id, raw_name))
         if extension is None:
-            raise MCPManagerError("mcp_tool_unknown")
+            raise MCPPreflightError("mcp_tool_unknown")
         if not isinstance(arguments, dict) or not all(
             isinstance(name, str) for name in arguments
         ):
-            raise MCPManagerError("mcp_arguments_invalid")
+            raise MCPPreflightError("mcp_arguments_invalid")
         try:
             copied_arguments = copy.deepcopy(arguments)
         except Exception:
-            raise MCPManagerError("mcp_arguments_invalid") from None
+            raise MCPPreflightError("mcp_arguments_invalid") from None
 
         started = time.perf_counter()
         self._audit_tool_call(
@@ -435,7 +443,7 @@ class MCPManager:
             )
             raise MCPManagerError("mcp_tool_failed") from None
         if not isinstance(result, MCPCallResult):
-            raise MCPManagerError("mcp_tool_failed")
+            raise MCPInvalidResultError("mcp_tool_failed")
         self._audit_tool_call(
             server_id,
             raw_name,

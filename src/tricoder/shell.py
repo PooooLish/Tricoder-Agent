@@ -75,7 +75,7 @@ class RuntimeLike(Protocol):
     def rename_current(self, name: str) -> object:
         ...
 
-    def clear_current(self) -> None:
+    def clear_current(self, *, confirmed: bool = False) -> None:
         ...
 
     def change_model(self, provider: str) -> object:
@@ -201,6 +201,8 @@ class InteractiveShell:
 
     def _show_status(self) -> None:
         self.ui.show_status(self.runtime.status(), self.runtime.current)
+        if self.runtime.current.memory.unknown_effects:
+            self.ui.show_notice("文件影响未确认；请检查实际文件并通过 /clear 明确确认")
 
     def _choose_session(self) -> None:
         sessions = self.runtime.store.list_all()  # type: ignore[attr-defined]
@@ -228,10 +230,10 @@ class InteractiveShell:
         self.ui.show_notice("模型已切换")
 
     def _clear_current(self) -> None:
-        if not self.ui.confirm("清除当前会话的上下文和摘要？[y/N] "):
+        if not self.ui.confirm("清除当前会话记录（不恢复文件）；若有未确认影响，请先检查实际文件。确认？[y/N] "):
             self.ui.show_notice("已取消清除")
             return
-        self.runtime.clear_current()
+        self.runtime.clear_current(confirmed=True)
         self.ui.show_notice("当前会话记忆已清除")
 
     def _show_diff(self) -> None:

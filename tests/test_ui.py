@@ -30,6 +30,15 @@ def recording_ui(*, answers: list[str] | None = None) -> tuple[TerminalUI, Conso
 
 
 class TerminalUITests(unittest.TestCase):
+    def test_file_state_check_is_not_presented_as_business_acceptance(self) -> None:
+        ui, console = recording_ui()
+        result = RunResult(True, "完成", 1, verification="通过")
+        ui.show_run_result(result)
+        ui.show_complete(result, Path("runtime/run.jsonl"))
+        text = console.export_text()
+        self.assertGreaterEqual(text.count("文件状态检查"), 2)
+        self.assertGreaterEqual(text.count("非业务验收"), 2)
+
     def test_streaming_text_is_rendered_literally(self) -> None:
         """Provider 增量不得被 Rich 当成 markup，也不能在 chunk 间插入换行。"""
         ui, console = recording_ui()
@@ -305,7 +314,7 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("6", text)
         self.assertIn("修改文件", text)
         self.assertIn("2", text)
-        self.assertIn("验证结果", text)
+        self.assertIn("文件状态检查", text)
         self.assertIn("通过", text)
         self.assertIn("example.jsonl", text)
         self.assertNotIn("secret", text)

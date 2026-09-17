@@ -1,5 +1,7 @@
 """Textual TUI 的启动、任务流与审批模态测试。"""
 
+import asyncio
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,7 @@ from textual.widgets import Collapsible, Input, Static
 
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.core.events import TextDelta
+from tricoder.core.cancellation import CancellationToken
 from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
 from tricoder.providers import ProviderError
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime
@@ -51,6 +54,129 @@ def _provider_factory(responses: list[ProviderResponse]):
 
 
 class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
+    async def check_approval_shutdown(self, scenario):
+        app = TricoderApp(lambda *_: None)
+        token = CancellationToken()
+        app.runtime = mock.Mock()
+        app.runtime.current_task_cancellation.return_value = token
+        app.runtime.request_shutdown.return_value = True
+        app.runtime.cancel_current.side_effect = token.cancel
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        tasks = []
+        results = []
+        errors = []
+        loop = asyncio.get_running_loop()
+
+        async def screen(_screen):
+            entered.set()
+            if scenario == "screen_error":
+                raise ValueError("synthetic UI failure")
+            await release.wait()
+            return scenario != "deny"
+
+        def run_worker(ask, **_kwargs):
+            if scenario == "worker_error":
+                entered.set()
+                raise RuntimeError("synthetic worker failure")
+            task = asyncio.create_task(ask())
+            tasks.append(task)
+            task.add_done_callback(lambda item: None if item.cancelled() else item.exception())
+
+        def dispatch(callback):
+            if scenario == "dispatch_error":
+                loop.call_soon_threadsafe(entered.set)
+                raise RuntimeError("UI already stopped")
+            loop.call_soon_threadsafe(callback)
+
+        def approve():
+            try:
+                results.append(app._approver("write", "synthetic"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(app, "push_screen_wait", side_effect=screen), \
+             mock.patch.object(app, "run_worker", side_effect=run_worker), \
+             mock.patch.object(app, "call_from_thread", side_effect=dispatch), \
+             mock.patch.object(app, "exit"):
+            worker = threading.Thread(target=approve, daemon=True)
+            worker.start()
+            await asyncio.wait_for(entered.wait(), 1)
+            if scenario == "quit":
+                app.action_quit()
+            elif scenario == "unmount":
+                app.on_unmount()
+            elif scenario == "cancel":
+                token.cancel()
+            elif scenario == "deny":
+                release.set()
+            elif scenario == "worker_cancel":
+                tasks[0].cancel()
+            try:
+                await asyncio.to_thread(worker.join, 1)
+                self.assertFalse(worker.is_alive(), "审批 UI 已结束但调用线程仍无界等待")
+                self.assertEqual([], errors)
+                self.assertEqual([False], results)
+                # 已关闭后才交付批准；只能结束旧 UI，不能复活旧审批。
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self.assertEqual([False], results)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_approval_screen_error_releases_waiter(self):
+        await self.check_approval_shutdown("screen_error")
+
+    async def test_approval_dispatch_failure_denies(self):
+        await self.check_approval_shutdown("dispatch_error")
+
+    async def test_approval_worker_submission_failure_denies(self):
+        await self.check_approval_shutdown("worker_error")
+
+    async def test_quit_retries_owned_cleanup_and_reports_failure(self):
+        app = TricoderApp(lambda *_: None)
+        app.runtime = mock.Mock()
+        app.runtime.current_task_cancellation.return_value = None
+        app.runtime.request_shutdown.return_value = False
+        app.runtime.cancel_current.return_value = False
+        app.runtime.cleanup_pending_resources.return_value = False
+        app.runtime.retry_persist.return_value = True
+        with mock.patch.object(app, "exit") as exit_app:
+            app.action_quit()
+        app.runtime.cleanup_pending_resources.assert_called_once()
+        exit_app.assert_called_once_with(1)
+
+    async def test_quit_already_cancelled_active_task_does_not_persist_concurrently(self):
+        app = TricoderApp(lambda *_: None)
+        token = CancellationToken()
+        token.cancel()
+        app.runtime = mock.Mock()
+        app.runtime.current_task_cancellation.return_value = token
+        app.runtime.request_shutdown.return_value = True
+        app.runtime.cancel_current.return_value = False
+        with mock.patch.object(app, "exit") as exit_app:
+            app.action_quit()
+        app.runtime.retry_persist.assert_not_called()
+        exit_app.assert_called_once_with(1)
+
+    async def test_approval_worker_cancel_releases_waiter(self):
+        await self.check_approval_shutdown("worker_cancel")
+
+    async def test_approval_quit_closes_before_cancelling(self):
+        await self.check_approval_shutdown("quit")
+
+    async def test_approval_unmount_closes_waiter(self):
+        await self.check_approval_shutdown("unmount")
+
+    async def test_approval_token_cancel_releases_waiter(self):
+        await self.check_approval_shutdown("cancel")
+
+    async def test_approval_normal_denial_already_returns(self):
+        await self.check_approval_shutdown("deny")
+
     async def test_tui_observer_forwards_streaming_text_as_literal_text(self) -> None:
         """类型化增量通过线程安全桥进入 TUI，且保留 Rich 标记字面值。"""
 
@@ -95,6 +221,12 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
                 self.cancelled = True
                 return True
 
+            def current_task_cancellation(self):
+                return CancellationToken()
+
+            def request_shutdown(self):
+                return True
+
             def retry_persist(self) -> bool:
                 self.persisted = True
                 return True
@@ -106,6 +238,9 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
 
             def exit(self, code: int) -> None:
                 self.exit_code = code
+
+            def _close_approvals(self) -> None:
+                pass
 
         app = App()
 
@@ -210,6 +345,43 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertIn("ok done", result.summary)
 
+    async def test_unknown_tool_exception_reaches_tui_without_leaking_and_keeps_runtime_effects(self) -> None:
+        """真实写入后异常须由 Runtime 对账，最终 UI 不能把异常中的源码或凭据当文案。"""
+        sentinel = "TRICODER_FAKE_SECRET_9f31"
+        source_marker = "PRIVATE_SOURCE = fictional_value"
+        app = self._make_app([ProviderResponse(tool_calls=(
+            ToolCall("write", "create_file", {"path": "actual.txt", "content": "after\n"}),
+        ))])
+        primary = RuntimeError(f"{sentinel}\n{source_marker}")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            handler = app.runtime.current.tools._handlers["create_file"]
+            real_run = handler.run
+
+            def fail_after_publish(arguments):
+                real_run(arguments)
+                raise primary
+
+            with mock.patch.object(handler, "run", side_effect=fail_after_publish):
+                await self._submit(pilot, "create fixture")
+                await self._wait_approval(pilot)
+                await pilot.press("y")
+                for _ in range(100):
+                    await pilot.pause()
+                    if any("任务异常" in line for line in app._lines):
+                        break
+                else:
+                    self.fail("真实任务异常未到达 TUI 兜底")
+
+            self.assertEqual("after\n", (self.workspace / "actual.txt").read_text(encoding="utf-8"))
+            self.assertEqual(("actual.txt",), app.runtime.current.context.modified_files)
+            self.assertEqual("待验证", app.runtime.current.context.verification)
+            transcript = "\n".join(app._lines)
+            self.assertNotIn(sentinel, transcript)
+            self.assertNotIn(source_marker, transcript)
+            self.assertIn("execution_failed", transcript)
+            self.assertIn("stop_task", transcript)
+
     async def test_approval_screen_rejects_write(self) -> None:
         edit = ToolCall(
             "c1",
@@ -230,7 +402,10 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("n")
             result = await self._wait_result(pilot)
 
-        self.assertTrue(result.ok)
+        # 拒绝审批现在终止任务，不能靠下一轮 finish 把拒绝转成成功。
+        self.assertFalse(result.ok)
+        self.assertEqual(1, result.rounds)
+        self.assertEqual(1, result.tool_calls)
         self.assertEqual(
             "def answer():\n    return 41\n",
             (self.workspace / "src" / "app.py").read_text(encoding="utf-8"),

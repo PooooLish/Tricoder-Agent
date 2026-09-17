@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+import threading
 
 # mcp==2.1.1 将 FastMCP 重命名为 MCPServer。
 from mcp.server.mcpserver import MCPServer
@@ -69,3 +70,6 @@ mcp = MCPServer(
 if __name__ == "__main__":
     if not _EXIT_IMMEDIATELY:
         mcp.run(transport="stdio")
+        if "--ignore-eof" in sys.argv[1:]:
+            # 测试 fixture 在协议流关闭后拒绝自然退出，必须由 transport 回收。
+            threading.Event().wait()

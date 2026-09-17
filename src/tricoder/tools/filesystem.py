@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from tricoder.models import ToolResult
+from tricoder.models import ToolResult, tool_failure
+from tricoder.execution_state import ErrorCode
 from tricoder.policy import PolicyError
 
 from tricoder.tools.handlers import ToolHandler
@@ -20,7 +21,7 @@ class ListFilesTool(ToolHandler):
             str(arguments.get("path", ".")),
         )
         if not directory.is_dir():
-            return ToolResult(False, "list_files 的目标必须是目录")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "list_files 的目标必须是目录")
         entries: list[str] = []
         for child in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
             try:
@@ -40,6 +41,6 @@ class ReadFileTool(ToolHandler):
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         path = self.context.workspace_policy.resolve_path(self._required_str(arguments, "path"))
         if not path.is_file():
-            return ToolResult(False, "read_file 的目标必须是文件")
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, "read_file 的目标必须是文件")
         content = path.read_text(encoding="utf-8")
         return ToolResult(True, self._bounded(content))

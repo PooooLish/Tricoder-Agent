@@ -1235,7 +1235,8 @@ class AgentTests(unittest.TestCase):
                 WorkspacePolicy(self.workspace),
                 CommandPolicy(),
                 approver=lambda _action, _detail: True,
-                timeout=5,
+                # 本组只验证 Agent 语义，不测试进程超时；给 Windows 冷启动留余量。
+                timeout=15,
             )
         )
 
@@ -1443,7 +1444,9 @@ class AgentTests(unittest.TestCase):
 
         result = agent.run("尝试修改多个文件")
 
-        self.assertTrue(result.ok)
+        # 未分类的旧失败结果没有 REPLAN 证明；停止任务但不得污染 T1 状态。
+        self.assertFalse(result.ok)
+        self.assertEqual(1, len(provider.histories))
         self.assertEqual((), result.modified_files)
         self.assertEqual("未运行", result.verification)
 
@@ -1801,7 +1804,7 @@ class AgentTests(unittest.TestCase):
     def test_invalid_command_cwd_is_audited_without_crashing_or_leaking_text(
         self,
     ) -> None:
-        """非法 cwd 的工具失败也必须生成结构化审计并允许 Agent 安全继续。"""
+        """非法 cwd 被策略拒绝后必须安全停止，同时留下不泄露正文的审计。"""
         sentinel = "INVALID-CWD-SENTINEL-PRIVATE"
         provider = ScriptedProvider(
             [
@@ -1831,7 +1834,8 @@ class AgentTests(unittest.TestCase):
         trail = audit_path.read_text(encoding="utf-8")
         event = json.loads(trail.splitlines()[0])
 
-        self.assertTrue(result.ok)
+        self.assertFalse(result.ok)
+        self.assertEqual(1, len(provider.histories))
         self.assertNotIn(sentinel, trail)
         self.assertEqual({"valid": False, "chars": len(f"../{sentinel}")}, event["arguments"]["cwd"])
 
@@ -1977,7 +1981,8 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
-        self.assertIn("尚未运行验证命令", result.summary)
+        self.assertTrue(result.unknown_effects)
+        self.assertIn("文件影响未确认", result.summary)
 
     def test_unrelated_success_does_not_override_failed_verification(self) -> None:
         """验证失败后，无关的成功命令不得把状态覆盖为通过。"""
@@ -1999,7 +2004,8 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
-        self.assertEqual("失败", result.verification)
+        self.assertTrue(result.unknown_effects)
+        self.assertEqual("待验证", result.verification)
 
     def test_successful_verification_does_not_override_prior_failure(self) -> None:
         """同一修改版本内，后续成功的验证命令也不能掩盖先前失败。"""
@@ -2224,7 +2230,9 @@ class AgentTests(unittest.TestCase):
 
         result = agent.run("验证后尝试失败创建")
 
-        self.assertTrue(result.ok)
+        # 拒绝覆盖属于 STOP_TASK；终止不等于此前验证证据失效。
+        self.assertFalse(result.ok)
+        self.assertEqual(3, len(provider.histories))
         self.assertEqual("通过", result.verification)
         self.assertEqual(("sample.py",), result.modified_files)
         self.assertEqual("value = 2\n", (self.workspace / "sample.py").read_text(encoding="utf-8"))

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -96,6 +97,39 @@ class EvalWorkspaceTests(unittest.TestCase):
             f"{RESERVED_VERIFIER_DIR}/test_hidden.py",
             capture_snapshot(workspace),
         )
+        remove_verifier(workspace)
+        self.assertFalse(verifier.exists())
+
+    def test_installed_process_helper_has_local_runtime_dependency_closure(self) -> None:
+        """隐藏验证进程不能依赖开发环境里恰好安装的 TriCoder 包。"""
+        workspace = prepare_workspace(self.case, self.run_root / "workspaces")
+        malicious_package = workspace / "tricoder"
+        malicious_package.mkdir()
+        (malicious_package / "__init__.py").write_text(
+            "raise RuntimeError('workspace package must not be imported')\n",
+            encoding="utf-8",
+        )
+        verifier = install_verifier(self.case, workspace)
+        probe = verifier / "probe_import.py"
+        probe.write_text(
+            "from _tricoder_bounded_process import run_bounded_process\n"
+            "assert callable(run_bounded_process)\n",
+            encoding="utf-8",
+        )
+        environ = dict(os.environ)
+        environ.pop("PYTHONPATH", None)
+        environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        completed = subprocess.run(
+            [sys.executable, "-S", "-B", str(probe)],
+            cwd=workspace,
+            env=environ,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
         remove_verifier(workspace)
         self.assertFalse(verifier.exists())
 

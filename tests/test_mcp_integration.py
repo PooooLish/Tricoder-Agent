@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,6 +40,38 @@ from tricoder.tools import ToolContext, ToolRegistry
 
 class MCPStdioIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """不经 mock 的 repository-local stdio server 证明。"""
+
+    async def test_local_server_refusing_eof_is_terminated_with_process_and_stream_evidence(self):
+        from tricoder.task_cleanup import TaskCleanup, cleanup_scope
+        transports = []
+        terminated = asyncio.Event()
+
+        def transport_factory(parameters, *, errlog, bindings):
+            original_terminate = bindings.terminate_process_tree
+            async def terminate(process):
+                terminated.set()
+                await original_terminate(process)
+            transport = VerifiedStdioTransport(parameters, errlog=errlog,
+                bindings=replace(bindings, terminate_process_tree=terminate))
+            transports.append(transport)
+            return transport
+
+        client = MCPClient("local_test", self._launch_request("--ignore-eof"),
+                           transport_factory=transport_factory)
+        with cleanup_scope(TaskCleanup()):
+            try:
+                await client.start(CancellationToken())
+                result = await client.call_tool("echo", {"text": "ready"}, CancellationToken())
+                self.assertTrue(result.ok)
+            finally:
+                started = time.monotonic()
+                await asyncio.wait_for(client.stop(), 7)
+        self.assertLess(time.monotonic() - started, 7)
+        self.assertTrue(terminated.is_set(), "fixture 应拒绝自然 EOF 退出并进入受管终止路径")
+        self.assertIsNotNone(transports[0]._process.returncode)
+        self.assertEqual(MCPProcessExitEvidence.VERIFIED, transports[0].outcome.process_exit)
+        self.assertTrue(transports[0].outcome.resources_closed)
+
 
     def setUp(self) -> None:
         self.project_root = Path(__file__).resolve().parents[1]

@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from enum import Enum
 from time import monotonic
 from typing import Any, Awaitable, Callable, TextIO
+from tricoder.task_cleanup import current_cleanup
 
 
-# 最坏清理预算：flush 0.5 + 自然退出 2 + 终止 2.25 + reap 2 +
-# 并行关闭 0.5 + 任务回收 0.25 + 调度余量 1 = 8.5 秒，小于 client 的 10 秒。
+# 各阶段上限仍保留，但总等待消费任务的同一 5 秒绝对期限，不能逐阶段相加。
 _WRITER_FLUSH_SECONDS = 0.5
 _NATURAL_EXIT_SECONDS = 2.0
 _TERMINATE_SECONDS = 2.25
@@ -67,6 +67,25 @@ class VerifiedStdioTransport:
         self._entered = False
         self._faulted = False
         self._closing_resources = False
+        self._cleanup_deadline: float | None = None
+
+    def _remaining(self, seconds: float, *, reserve: float = 0.0) -> float:
+        if self._cleanup_deadline is None:
+            return seconds
+        return min(seconds, max(0.0, self._cleanup_deadline - monotonic() - reserve))
+
+    def cleanup(self, deadline: float) -> bool:
+        """Runtime 退出重试只接触 exact 旧资源，不在新事件循环复用旧 SDK。"""
+        if self._process is None:
+            return self._outcome.resources_closed
+        okay = True
+        for close in (self._bindings.close_process_job, self._bindings.close_subprocess_transport):
+            try:
+                okay = close(self._process) is True and okay
+            except Exception:
+                okay = False
+        return (okay and self._process.returncode is not None
+                and self._outcome.resources_closed and all(task.done() for task in self._tasks))
 
     @property
     def outcome(self) -> MCPTransportOutcome:
@@ -172,7 +191,8 @@ class VerifiedStdioTransport:
                 raise
 
     async def _wait_for_returncode(self, seconds: float) -> bool:
-        deadline = monotonic() + seconds
+        # 最终关闭流/收割任务保留余量，不能把全部预算耗在等待进程上。
+        deadline = monotonic() + self._remaining(seconds, reserve=_RESOURCE_CLOSE_SECONDS + _TASK_REAP_SECONDS)
         while self._process.returncode is None:
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -182,7 +202,7 @@ class VerifiedStdioTransport:
 
     async def _complete_within(self, operation: Awaitable[Any], seconds: float) -> bool:
         task = self._spawn(operation)
-        done, _ = await asyncio.wait({task}, timeout=seconds)
+        done, _ = await asyncio.wait({task}, timeout=self._remaining(seconds))
         if task not in done:
             task.cancel()
             return False
@@ -196,7 +216,8 @@ class VerifiedStdioTransport:
         try:
             # 额外限制注入 helper 的墙钟时间，不把终止信号发送成功当作退出证据。
             if not await self._complete_within(
-                self._bindings.terminate_process_tree(self._process), _TERMINATE_SECONDS
+                self._bindings.terminate_process_tree(self._process),
+                self._remaining(_TERMINATE_SECONDS, reserve=_RESOURCE_CLOSE_SECONDS + _TASK_REAP_SECONDS)
             ):
                 return MCPProcessExitEvidence.UNKNOWN
         except BaseException:
@@ -215,7 +236,7 @@ class VerifiedStdioTransport:
 
     async def _flush_writer(self) -> None:
         # 关闭生产端允许 writer 消费已接收的消息；共享一个 flush 截止时间。
-        deadline = asyncio.get_running_loop().time() + _WRITER_FLUSH_SECONDS
+        deadline = asyncio.get_running_loop().time() + self._remaining(_WRITER_FLUSH_SECONDS)
         if not await self._complete_within(self._close(self._streams[2]), _WRITER_FLUSH_SECONDS):
             self._faulted = True
         if self._writer is not None:
@@ -231,6 +252,8 @@ class VerifiedStdioTransport:
                 self._faulted = True
 
     async def _shutdown(self) -> None:
+        scope = current_cleanup()
+        self._cleanup_deadline = scope.deadline() if scope is not None else monotonic() + 5.0
         evidence = self._outcome.process_exit
         try:
             if self._process is not None:
@@ -244,6 +267,9 @@ class VerifiedStdioTransport:
             if (not closed or self._faulted) and self._process is not None:
                 evidence = MCPProcessExitEvidence.UNKNOWN
             self._outcome = MCPTransportOutcome(evidence, closed)
+            if scope is not None and (evidence is MCPProcessExitEvidence.UNKNOWN or not closed):
+                scope.mark_failed()
+                scope.retain(self)
 
     async def _close_owned_resources(self) -> bool:
         self._closing_resources = True
@@ -255,7 +281,7 @@ class VerifiedStdioTransport:
         closing = {self._spawn(self._close(resource)) for resource in resources}
         closed = True
         if closing:
-            done, pending = await asyncio.wait(closing, timeout=_RESOURCE_CLOSE_SECONDS)
+            done, pending = await asyncio.wait(closing, timeout=self._remaining(_RESOURCE_CLOSE_SECONDS))
             closed = not pending and all(task.result() for task in done)
         if self._process is not None:
             for close in (
@@ -271,7 +297,7 @@ class VerifiedStdioTransport:
             if not task.done():
                 task.cancel()
         if self._tasks:
-            _, pending = await asyncio.wait(self._tasks, timeout=_TASK_REAP_SECONDS)
+            _, pending = await asyncio.wait(self._tasks, timeout=self._remaining(_TASK_REAP_SECONDS))
             closed = closed and not pending
         return closed
 

@@ -6,12 +6,14 @@ import asyncio
 import inspect
 import os
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 from typing import Callable, Concatenate, Mapping, ParamSpec, Protocol, TypeVar
 
 from tricoder.agent import AgentObserver, CodingAgent
+from tricoder.execution_state import EffectState, ExecutionState, FileEffects
 from tricoder.audit import AuditLogger
 from tricoder.changes import (
     ChangeJournal,
@@ -20,7 +22,8 @@ from tricoder.changes import (
     UndoPreview,
     render_change_set_diff,
 )
-from tricoder.core.cancellation import CancellationToken
+from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
 from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
@@ -41,6 +44,8 @@ from tricoder.sessions import (
     validate_session_name,
 )
 from tricoder.tools import ToolContext, ToolRegistry, UndoConflictError
+from tricoder.verification import VerificationScope
+from tricoder.task_observation import current_task_observation, task_observation_scope
 
 
 class SessionRuntimeError(RuntimeError):
@@ -158,6 +163,8 @@ def _normalized_verification(value: object) -> str:
         return "failed"
     if normalized in {"not-run", "not run", "未运行"}:
         return "not-run"
+    if normalized in {"pending", "待验证"}:
+        return "待验证"
     return "unknown"
 
 
@@ -214,9 +221,12 @@ class SessionRuntime:
         self._task_lock = threading.Lock()
         self._task_state_lock = threading.Lock()
         self._task_active = False
+        self._task_accepts_cancellation = False
         self._task_session_id: str | None = None
         self._task_permission: str | None = None
         self._task_cancellation: CancellationToken | None = None
+        self._pending_cleanup: list[TaskCleanup] = []
+        self._shutdown_requested = False
 
         resolved_workspace = Path(workspace).resolve()
         try:
@@ -270,6 +280,8 @@ class SessionRuntime:
             record = self.store.insert_prepared(candidate.record)
         except (SessionError, ConfigError, OSError, ValueError) as exc:
             raise SessionRuntimeError("无法创建会话") from exc
+        self.current = self._invalidate_verification(self.current)
+        self._cache_current()
         self.current = replace(candidate, record=record)
         self._persisted_memory = self.current.memory
         self._memory_dirty = False
@@ -305,7 +317,11 @@ class SessionRuntime:
             except (SessionError, ConfigError, OSError, ValueError) as exc:
                 raise SessionRuntimeError("目标会话构建失败，当前会话未改变") from exc
             self._session_cache[record.id] = candidate
+        self.current = self._invalidate_verification(original)
+        self._cache_current()
+        candidate = self._invalidate_verification(candidate)
         self.current = candidate
+        self._cache_current()
         self._persisted_memory = candidate.memory
         self._memory_dirty = False
         self._clear_unsaved_warning()
@@ -323,12 +339,15 @@ class SessionRuntime:
         return record
 
     @_idle_runtime_change
-    def clear_current(self) -> None:
+    def clear_current(self, *, confirmed: bool = False) -> None:
         """清除消息和摘要，但保留文件路径与验证状态等结构化元数据。"""
         original = self.current
+        if (original.memory.unknown_effects or original.context.unknown_effects) and confirmed is not True:
+            raise SessionRuntimeError("文件影响未确认；请检查实际文件后明确确认 /clear；清记录不会恢复文件")
+        original = self._invalidate_verification(original)
         memory = SessionMemory(
             modified_files=original.memory.modified_files,
-            verification=original.memory.verification,
+            verification=("待验证" if original.memory.unknown_effects else original.memory.verification),
             permission_level=original.memory.permission_level,
         )
         self.current = replace(
@@ -411,47 +430,137 @@ class SessionRuntime:
         """
         if not self._task_lock.acquire(blocking=False):
             raise SessionRuntimeError("已有 Agent 任务正在运行")
+        if self._pending_cleanup:
+            self._task_lock.release()
+            raise SessionRuntimeError("旧任务资源清理尚未确认，禁止复用执行资源")
         if self._task_active:
             self._task_lock.release()
             raise SessionRuntimeError("已有 Agent 任务正在运行")
+        cleanup = TaskCleanup()
         try:
             # 令牌与活动标志作为一个快照发布，避免取消线程观察到
             # ``active=True`` 但令牌仍为空的短暂窗口。
             with self._task_state_lock:
+                if self._shutdown_requested:
+                    raise SessionRuntimeError("Runtime 正在退出，禁止启动新任务")
                 self._task_cancellation = CancellationToken()
                 self._task_active = True
+                self._task_accepts_cancellation = True
             self._task_session_id = self.current.record.id
             self._task_permission = self.current.memory.permission_level
             try:
-                return self._run_task_locked(task)
+                with cleanup_scope(cleanup), task_observation_scope():
+                    return self._run_task_locked(task)
             finally:
                 if self.current.record.id != self._task_session_id:
                     raise SessionRuntimeError(
                         "任务运行期间会话被切换，拒绝更新该会话"
                     )
         finally:
-            with self._task_state_lock:
-                self._task_active = False
-                self._task_cancellation = None
-            self._task_session_id = None
-            self._task_permission = None
-            self._task_lock.release()
+            if cleanup.has_pending:
+                self._pending_cleanup.append(cleanup)
+            self._finish_task_ownership()
+
+    def _finish_task_ownership(self) -> None:
+        """任务所有者消费退出请求；登记、退出快照与释放锁之间不能漏掉交接。"""
+        with self._task_state_lock:
+            shutdown = self._shutdown_requested
+            if not shutdown:
+                # 原子发布 idle 并释放互斥锁；之后到达的退出请求必走 idle 清理。
+                self._release_task_ownership_locked()
+        if shutdown:
+            try:
+                # 持有任务互斥锁防止资源复用，但绝不持状态/UI 锁跨清理等待。
+                self._retry_pending_cleanup_locked()
+            finally:
+                with self._task_state_lock:
+                    self._release_task_ownership_locked()
+
+    def _release_task_ownership_locked(self) -> None:
+        self._task_active = False
+        self._task_accepts_cancellation = False
+        self._task_cancellation = None
+        self._task_session_id = None
+        self._task_permission = None
+        self._task_lock.release()
+
+    def request_shutdown(self) -> bool:
+        """一次性记住退出请求，返回由活动任务负责后续清理的原子快照。"""
+        with self._task_state_lock:
+            self._shutdown_requested = True
+            return self._task_active
 
     def cancel_current(self) -> bool:
         """无须获取任务锁即可线程安全地请求取消当前任务。"""
 
         with self._task_state_lock:
             token = self._task_cancellation
-            if not self._task_active or token is None:
+            if not self._task_active or not self._task_accepts_cancellation or token is None:
                 return False
             return token.cancel()
 
+    def _commit_task_outcome(self, result: RunResult) -> RunResult:
+        """封存后、持久化前关闭取消接收；已接受的取消必须进入提交结果。"""
+        with self._task_state_lock:
+            cancelled = bool(self._task_cancellation is not None and self._task_cancellation.is_cancelled)
+            self._task_accepts_cancellation = False
+        # 状态锁只保护取消/提交决议，不跨文件扫描、账本回调或持久化 I/O。
+        if not cancelled:
+            return result
+        context = self.current.context
+        if self.current.tools is not None:
+            self.current.tools.context.verification_scope.revoke()
+        if context.verification_required or context.verification_evidence is not None or context.verification_failure is not None:
+            context = replace(context, verification_evidence=None, verification_required=True,
+                              verification="失败" if context.verification_failure is not None else "待验证")
+        result = replace(result, ok=False, verification=context.verification,
+                         summary="任务已取消" if result.ok else result.summary)
+        verification = _normalized_verification(result.verification)
+        summary = _persisted_run_summary(result, verification)
+        memory = replace(self.current.memory, summary=summary, last_task_summary=summary,
+                         verification=verification)
+        self.current = replace(self.current, context=context, memory=memory)
+        self._cache_current()
+        self._memory_dirty = memory != self._persisted_memory
+        return result
+
+    def current_task_cancellation(self) -> CancellationToken | None:
+        """只读发布当前任务令牌；调用方等待 UI 时不得继续持有状态锁。"""
+        with self._task_state_lock:
+            return self._task_cancellation if self._task_active else None
+
+    def cleanup_pending_resources(self) -> bool:
+        """退出时重试 exact 旧资源；任务互斥锁防复用，状态锁不跨清理等待。"""
+        if not self._task_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._retry_pending_cleanup_locked()
+        finally:
+            self._task_lock.release()
+
+    def _retry_pending_cleanup_locked(self) -> bool:
+        # 一次退出重试共享新预算；旧 scope 的失败事实与 exact 资源身份仍然保留。
+        deadline = time.monotonic() + 5.0
+        self._pending_cleanup = [scope for scope in self._pending_cleanup
+                                 if not scope.retry(deadline)]
+        return not self._pending_cleanup
+
     def _run_task_locked(self, task: str) -> RunResult:
         original = self.current
+        if original.memory.unknown_effects or original.context.unknown_effects:
+            return RunResult(
+                False, "文件影响未确认；请检查实际文件并通过 /clear 明确确认", 0,
+                modified_files=original.context.modified_files, verification="待验证",
+                unknown_effects=True,
+            )
         original.journal.begin_task(
             tuple(original.context.modified_files),
             original.context.verification,
         )
+        observation = current_task_observation()
+        if observation is not None:
+            observation.seed(original.context, journal_revision=original.journal.active_revision)
+        final_capture_active = False
         try:
             if self._mcp_effectively_enabled(original.config):
                 if original.tools is None:
@@ -508,24 +617,117 @@ class SessionRuntime:
                 ):
                     kwargs["event_sink"] = self._observer
                 turn = run_method(task, original.context, **kwargs)
+            observed_context = turn.context
+            if observation is not None:
+                observed_context, _ = observation.reconcile(observed_context)
+            current_snapshot = None
+            if (original.tools is not None and original.tools.context.verification_scope.owns(
+                    observed_context.verification_evidence)):
+                try:
+                    # 同步任务所有者持有 cleanup scope 到扫描返回；不创建可迟到的后台工作。
+                    final_capture_active = True
+                    current_snapshot = original.tools.context.verification_scope.capture(
+                        original.tools.context.workspace_policy)
+                    final_capture_active = False
+                except CancellationError:
+                    raise
+                except Exception:
+                    # 无法取得当前快照只撤销通过，不把扫描异常当成新文件版本。
+                    current_snapshot = None
+                    final_capture_active = False
         except BaseException as exc:
-            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, CancellationError)):
                 if self._task_cancellation is not None:
                     self._task_cancellation.cancel()
+            interrupted_context = original.context
+            observation = current_task_observation()
+            if observation is not None:
+                interrupted_context, _ = observation.reconcile(interrupted_context)
+            if original.tools is not None and original.tools.context.verification_scope.unknown_effects:
+                interrupted_context = replace(interrupted_context, unknown_effects=True, verification="待验证",
+                                              verification_evidence=None, verification_required=True)
+            reconciled = self._reconcile_effects(
+                original.journal, interrupted_context, force=True,
+                consumed_revision=observation.consumed_revision if observation is not None else None,
+            )
+            if (final_capture_active
+                    or (self._task_cancellation is not None and self._task_cancellation.is_cancelled)
+                    or (current_cleanup() is not None and current_cleanup().failed)):
+                # 事实可恢复，但取消/清理失败不能恢复可用的通过能力；首异常不变。
+                if original.tools is not None:
+                    original.tools.context.verification_scope.revoke()
+                reconciled = replace(reconciled, verification_evidence=None, verification_required=True,
+                                     verification="失败" if reconciled.verification_failure is not None else "待验证")
+            memory = replace(
+                original.memory, modified_files=reconciled.modified_files,
+                verification=reconciled.verification, unknown_effects=reconciled.unknown_effects,
+            )
+            self.current = replace(original, context=reconciled, memory=memory)
+            self._cache_current()
+            self._memory_dirty = memory != self._persisted_memory
             try:
                 original.journal.seal_task(
-                    tuple(original.context.modified_files),
-                    original.context.verification,
+                    reconciled.modified_files,
+                    reconciled.verification,
                 )
-            except Exception:
-                # Agent 主异常必须原样越过 Runtime；账本收尾异常不能替换根因。
+            except BaseException:
+                # 已有主异常：补偿封存即使被中断也不能替换根因；下方裸 raise 保留首异常。
+                pass
+            try:
+                self._persist_current()
+            except BaseException:
+                # 仅抑制补偿持久化的次级异常，保留 dirty 状态和原取消/工具异常。
                 pass
             raise
-        original.journal.seal_task(
-            tuple(turn.context.modified_files),
-            turn.context.verification,
+        observation = current_task_observation()
+        consumed_revision = observation.consumed_revision if observation is not None else None
+        reconciled = self._reconcile_effects(
+            original.journal, observed_context, force=turn.file_effects_observed is not True,
+            consumed_revision=consumed_revision,
         )
-        result = turn.result
+        if observation is not None and observation.unknown_effects:
+            reconciled = replace(reconciled, unknown_effects=True, verification="待验证",
+                                 verification_evidence=None, verification_required=True)
+        if turn.result.cleanup_failed or (current_cleanup() is not None and current_cleanup().failed):
+            if original.tools is not None:
+                original.tools.context.verification_scope.revoke()
+            if reconciled.verification_evidence is not None or reconciled.verification_required:
+                reconciled = replace(reconciled, verification="待验证", verification_evidence=None,
+                                     verification_required=True)
+        required = (reconciled.verification_required or reconciled.verification_failure is not None
+                    or reconciled.verification_evidence is not None)
+        evidence = reconciled.verification_evidence
+        trusted_pass = (reconciled.verification_failure is None
+                        and reconciled.verification in {"通过", "passed"}
+                        and original.tools is not None
+                        and original.tools.context.verification_scope.owns(evidence)
+                        and evidence.is_valid_for(current_snapshot))
+        if required and not trusted_pass:
+            reconciled = replace(reconciled, verification_evidence=None, verification_required=True,
+                                 verification="失败" if reconciled.verification_failure is not None else "待验证")
+        cancelled = bool(self._task_cancellation is not None and self._task_cancellation.is_cancelled)
+        if cancelled:
+            if original.tools is not None:
+                original.tools.context.verification_scope.revoke()
+            if required:
+                reconciled = replace(reconciled, verification_evidence=None,
+                                     verification="失败" if reconciled.verification_failure is not None else "待验证")
+        result = replace(
+            turn.result, modified_files=reconciled.modified_files,
+            summary="任务已取消" if cancelled and turn.result.ok else turn.result.summary,
+            cleanup_failed=turn.result.cleanup_failed or bool(
+                current_cleanup() is not None and current_cleanup().failed),
+            verification=reconciled.verification,
+            unknown_effects=turn.result.unknown_effects or reconciled.unknown_effects,
+            ok=(turn.result.ok and not cancelled and not reconciled.unknown_effects
+                and (not required or trusted_pass)
+                and not (reconciled.modified_files and reconciled.verification == "待验证")),
+        )
+        if result.unknown_effects:
+            unknown_notice = "文件影响未确认；请检查实际文件并通过 /clear 明确确认"
+            # UNKNOWN 是独立的文件状态事实，不能覆盖用户发起取消这一主终态。
+            summary = f"任务已取消；{unknown_notice}" if cancelled else unknown_notice
+            result = replace(result, summary=summary, ok=False)
         verification = _normalized_verification(result.verification)
         persisted_summary = _persisted_run_summary(result, verification)
         memory = SessionMemory(
@@ -535,12 +737,65 @@ class SessionRuntime:
             modified_files=tuple(result.modified_files),
             verification=verification,
             permission_level=original.memory.permission_level,
+            unknown_effects=result.unknown_effects,
         )
-        self.current = replace(original, memory=memory, context=turn.context)
+        if reconciled.unknown_effects != result.unknown_effects:
+            reconciled = replace(reconciled, unknown_effects=result.unknown_effects)
+        self.current = replace(original, memory=memory, context=reconciled)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
+        try:
+            original.journal.seal_task(reconciled.modified_files, reconciled.verification)
+        except BaseException:
+            try:
+                self._persist_current()
+            except BaseException:
+                # 正常封存已有主异常；补偿持久化中断不能覆盖它，正常持久化不在此边界。
+                pass
+            raise
+        result = self._commit_task_outcome(result)
         self._persist_current()
         return result
+
+    @staticmethod
+    def _reconcile_effects(
+        journal: ChangeJournal, context: SessionContext, *, force: bool = False,
+        consumed_revision: int | None = None,
+    ) -> SessionContext:
+        """只有显式消费证明才能保留 Agent 验证；路径或对象相同不代表已消费。"""
+        try:
+            effects = (journal.active_effects() if consumed_revision is None
+                       else journal.active_effects_since(consumed_revision))
+        except Exception:
+            effects = FileEffects(EffectState.UNKNOWN)
+        if consumed_revision is None and not force and effects.state is EffectState.CONFIRMED:
+            effects = FileEffects(EffectState.NONE)
+        state = ExecutionState(context.modified_files, context.verification, context.unknown_effects).observe(effects)
+        if effects.state is EffectState.NONE:
+            return context
+        return replace(context, modified_files=state.modified_files,
+                       verification=state.verification, unknown_effects=state.unknown_effects,
+                       verification_evidence=None,
+                       verification_failure=(None if effects.state is EffectState.CONFIRMED
+                                             else context.verification_failure),
+                       verification_required=True)
+
+    @staticmethod
+    def _invalidate_verification(active: ActiveSession, *, force: bool = False) -> ActiveSession:
+        """切会话/撤销只撤销本地能力，不把恢复旧内容解释为恢复旧证明。"""
+        context = active.context
+        required = (force or context.verification_required or bool(context.modified_files)
+                    or context.verification_evidence is not None
+                    or context.verification_failure is not None
+                    or _normalized_verification(context.verification) in {"passed", "failed", "待验证"})
+        if active.tools is not None:
+            active.tools.context.verification_scope = VerificationScope()
+        if not required:
+            return active
+        return replace(active,
+                       context=replace(context, verification="待验证", verification_evidence=None,
+                                       verification_failure=None, verification_required=True),
+                       memory=replace(active.memory, verification="待验证"))
 
     @staticmethod
     def _mcp_effectively_enabled(config: AppConfig) -> bool:
@@ -622,15 +877,16 @@ class SessionRuntime:
             return execution
 
         self.current.journal.clear_latest()
+        self.current = self._invalidate_verification(self.current, force=True)
         memory = replace(
             self.current.memory,
             modified_files=change_set.before_modified_files,
-            verification=change_set.before_verification,
+            verification="待验证",
         )
         context = replace(
             self.current.context,
             modified_files=change_set.before_modified_files,
-            verification=change_set.before_verification,
+            verification="待验证",
         )
         self.current = replace(self.current, memory=memory, context=context)
         self._cache_current()
@@ -675,6 +931,8 @@ class SessionRuntime:
 
         if self.current.config.read_only:
             raise SessionRuntimeError("只读模式禁止撤销")
+        if self.current.memory.unknown_effects or self.current.context.unknown_effects:
+            raise SessionRuntimeError("文件影响未确认，拒绝撤销；请检查实际文件并通过 /clear 明确确认")
         change_set = self.current.journal.latest()
         if change_set is None:
             raise SessionRuntimeError("当前 Session 没有可撤销的最近任务")
@@ -830,6 +1088,9 @@ class SessionRuntime:
         journal: ChangeJournal | None = None,
     ) -> ActiveSession:
         """构建完整候选对象，调用方在成功返回前不会修改 ``current``。"""
+        # SQLite 只保存展示字符串；加载时没有对应的本地文件版本证明。
+        if _normalized_verification(memory.verification) in {"passed", "failed"}:
+            memory = replace(memory, verification="待验证")
         if self._active_session_factory is not None:
             candidate = self._active_session_factory(record, memory, self.options)
             active_journal = journal if journal is not None else candidate.journal
@@ -852,6 +1113,7 @@ class SessionRuntime:
                     raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本")
             return replace(
                 candidate,
+                context=replace(candidate.context, unknown_effects=memory.unknown_effects or candidate.context.unknown_effects),
                 tools=candidate.tools or (registries[0] if registries else None),
                 journal=active_journal,
             )
@@ -889,6 +1151,7 @@ class SessionRuntime:
                 persisted_summary=memory.summary,
                 modified_files=memory.modified_files,
                 verification=memory.verification,
+                unknown_effects=memory.unknown_effects,
             ),
             loaded,
             agent,

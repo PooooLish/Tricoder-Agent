@@ -1,5 +1,23 @@
 # Project: tricoder-cli
 
+## 2026-09-14 可靠性前五项任务计划（实施完成并通过独立整体复审）
+
+- 用户要求将失败改动追踪、工具错误分类、同批失败传播、取消清理、验证绑定文件状态五项按计划实施。
+- 计划：`docs/superpowers/plans/2026-09-14-tricoder-reliability-top5.md`。
+- 实施顺序：T1→T2→T3→T4→T5；每项采用 RED→GREEN、聚焦回归、自审和独立复审。
+- 当前隔离分支：`codex/reliability-top5`；不覆盖主工作区的 `test/` 用户实验改动。
+- 当前状态：T1–T5 与 I01–I07 已完成，最终独立整体复审 PASS，Critical／Important／Minor 均为 0。整体复审后又关闭了原生 `asyncio.Task.cancel()` 迟到写、缺失路径误报策略拒绝、MCP 冷导入循环和 live-process 取消夹具四个问题；惰性包级导出保持 `MCPToolHandler` 兼容。实施前 `baseline-integration` 及整改前 `baseline-final-remediation` 均已机械复制并核对。
+- T5 关键决定：只信任内置命令对象和本地 ToolContext 能力；一般命令/MCP 的未知文件影响不因退出零而消失。证据只驻内存，数据库加载的历史通过/失败均降为待验证。
+- T5 修复裁决：只有 complete、同 scope 且 digest 明确变化或本地确认写入才能解除旧失败；每任务本地通道在通知前发布新验证事实/UNKNOWN，异常收尾仍保留失败与阻断。T1 未消费写入、T3 配对/首异常及 T4 清理所有权保留，取消/清理失败独立撤销 pass。
+- T5 第 2 轮裁决：账本真实提交/首次 taint 游标区分已消费旧写与新写；Registry 在输出处理前发布与 Agent 共用的可信纯 transition；获批后的非只读外部 dispatch 提前登记 UNKNOWN，未批准/预取消不登记。异步交付之后的取消窗口按 UNKNOWN 保守处理，不用一次普通检查替代 clear。
+- T5 第 3 轮裁决：Runtime 在任意 Agent 前 seed 原状态/游标 0，正常和异常收尾均合并可信发布；验证必须通过本地 scope authority 门禁。Agent 合成取消前刷新已发布失败；新净零提交以真实提交路径表达 CONFIRMED，立即失效证据但不制造 undo 净变更；begin/seal 与修订读取共用短锁。新增 7 项正式测试，完整证据见报告 Fix round 3。
+- T5 第 4 轮裁决：Runtime 对 scope-owned evidence 取得结束前当前快照，扫描异常/不完整不再用 evidence.after 自证；最终 token 取消独立阻断，不给纯读伪造验证需求。扫描留在已有同步任务所有权/cleanup scope 内，普通扫描异常 fail closed，Native/structured 取消沿原异常收尾并保留首异常；无新后台线程或硬超时承诺。
+- T5 第 5 轮裁决：私有取消接收标志与 cancel_current 共用状态锁，seal/current/memory 准备后、persist 前决定结果并关闭接收；已接受取消进入 result/context/memory，提交后取消返回 False 而任务所有权仍保留。final capture 本地阶段标记使 BaseException 沿既有异常对账撤销 pass、保留 failure 与首异常；不把 Agent/observer 的其他异常一概清证据。
+- T5 第 6 轮裁决：仅将 Runtime 三处“已有主异常后的补偿 seal/persist”捕获扩为 BaseException，原裸 raise 保留同一主异常及 Native cause。正常扫描/对账/持久化异常边界不扩大；失败证据撤销、dirty 与任务取消复位控制保留，不伪造补偿保存成功。
+- T5 成本与限制：合成 256 文件/4 MiB 扫描 1.401 秒；生产默认单次 3 秒仍是协作式预算，不保证阻塞系统调用硬超时。敏感条目不读正文但使覆盖不完整。Windows 离线已验，POSIX 与真实外部 Provider/MCP 未验。
+- 集成证据：I01–I07 7/7 通过；最终 Windows 完整串行 `unittest discover -s tests -q` 为 1,077 项通过、6 项平台条件跳过。最终整改定向复审及测试稳定性复审均为 PASS；详细记录见 `runtime/reliability-top5/integration-report.md` 与 `runtime/reliability-top5/final-remediation-review.md`。
+- 下一步：向用户交付工作树与证据；POSIX、Python 3.12、真实 Provider 和真实外部 MCP 仍需另行验证。不自动暂存、提交、合并或发布。
+
 ## Status
 
 active

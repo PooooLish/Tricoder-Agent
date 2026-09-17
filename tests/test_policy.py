@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 
 import tricoder.policy as policy_module
-from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
+from tricoder.policy import (
+    CommandPolicy,
+    PolicyArgumentError,
+    PolicyError,
+    WorkspacePathNotFoundError,
+    WorkspacePolicy,
+)
 
 
 class WorkspacePolicyTests(unittest.TestCase):
@@ -26,6 +32,14 @@ class WorkspacePolicyTests(unittest.TestCase):
             (self.workspace / "src" / "app.py").resolve(),
             self.policy.resolve_path("src/app.py"),
         )
+
+    def test_missing_workspace_path_uses_dedicated_argument_error(self) -> None:
+        """缺失路径可由模型修正，不应与越界或敏感路径共用权限拒绝。"""
+        with self.assertRaises(PolicyError) as raised:
+            self.policy.resolve_path("src/missing.py")
+
+        self.assertIsInstance(raised.exception, PolicyArgumentError)
+        self.assertIs(type(raised.exception), WorkspacePathNotFoundError)
 
     def test_rejects_parent_escape_and_outside_absolute_path(self) -> None:
         """防止模型通过相对或绝对路径读取工作区外文件。"""

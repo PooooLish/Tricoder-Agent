@@ -32,6 +32,8 @@ from tricoder.agent import AgentObserver
 from tricoder.commands import CommandError, is_slash_command, list_commands, parse_command
 from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
+from tricoder.approval_wait import ApprovalWait
+from tricoder.core.cancellation import CancellationToken
 from tricoder.session_runtime import SessionRuntime, SessionRuntimeError
 
 
@@ -147,8 +149,10 @@ class TuiObserver(AgentObserver):
     ) -> None:
         icon = "✓" if result.ok else "✗"
         color = "green" if result.ok else "red"
+        error_label = (f" · {result.error.code.value} / {result.error.recovery.value}"
+                       if result.error is not None else "")
         self._app.round_line(
-            f"  [{color}]{icon}[/{color}] {len(result.output):,} 字符 · {duration_ms} ms"
+            f"  [{color}]{icon}[/{color}] {len(result.output):,} 字符 · {duration_ms} ms{error_label}"
         )
         self._app.round_summary(f"{action.tool} {icon} · {duration_ms} ms")
 
@@ -246,6 +250,9 @@ class TricoderApp(App[None]):
         self._round_widgets: list[Collapsible] = []
         self._current_round_log: RichLog | None = None
         self._current_round_summary: list[str] = []
+        self._approval_lock = threading.Lock()
+        self._pending_approvals: set[ApprovalWait] = set()
+        self._approvals_closed = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -350,7 +357,7 @@ class TricoderApp(App[None]):
         content.append("\n")
         content.append(_p(self.runtime.permission_level))
         content.append("\n\n")
-        content.append("验证", style="bold")
+        content.append("上次文件状态检查（非业务验收）", style="bold")
         content.append("\n")
         content.append(_p(memory.verification))
         content.append("\n\n")
@@ -437,14 +444,10 @@ class TricoderApp(App[None]):
                 Text.assemble(("任务运行失败：", "bold red"), _p(exc))
             )
             return
-        except Exception as exc:  # 兜底：任何未预期异常都不能杀死 TUI
+        except Exception:
+            # Runtime 已完成异常对账；最终界面没有公开内部异常正文或自报类型名的权限。
             self.log_line_safe(
-                Text.assemble(
-                    ("任务异常：", "bold red"),
-                    _p(type(exc).__name__),
-                    ": ",
-                    _p(exc),
-                )
+                Text("任务异常：内部执行失败，已停止本次任务（execution_failed / stop_task）", style="bold red")
             )
             return
         self._log_result(result)
@@ -471,20 +474,58 @@ class TricoderApp(App[None]):
 
     def _approver(self, action: str, detail: str) -> bool:
         """后台线程调用；通过模态等待用户明确确认。"""
-        response: dict[str, bool] = {}
-        done = threading.Event()
+        pending = ApprovalWait()
+        token = (self.runtime.current_task_cancellation() if self.runtime else None)
+        token = token or CancellationToken()
+        # 注册与退出关闭共享锁；退出后新投递的审批也必须拒绝。
+        with self._approval_lock:
+            if self._approvals_closed:
+                return False
+            self._pending_approvals.add(pending)
 
         def request() -> None:
             async def ask() -> None:
-                value = await self.push_screen_wait(ApprovalScreen(action, detail))
-                response["ok"] = bool(value)
-                done.set()
+                try:
+                    value = await self.push_screen_wait(ApprovalScreen(action, detail))
+                    pending.resolve(bool(value))
+                except Exception:
+                    # 弹窗错误只拒绝本次审批；不回显可能含审批详情的异常。
+                    pending.close()
+                finally:
+                    pending.close()
 
-            self.run_worker(ask, thread=False, name="approval-wait")
+            try:
+                self.run_worker(ask, thread=False, name="approval-wait")
+            except Exception:
+                pending.close()
 
-        self.call_from_thread(request)
-        done.wait()
-        return response.get("ok", False)
+        try:
+            try:
+                self.call_from_thread(request)
+            except Exception:
+                pending.close()
+            return pending.wait(token)
+        finally:
+            pending.close()
+            with self._approval_lock:
+                self._pending_approvals.discard(pending)
+
+    def _close_approvals(self) -> None:
+        # 只转移请求所有权，不在锁内等待 UI、Runtime 或工作线程退出。
+        with self._approval_lock:
+            self._approvals_closed = True
+            pending = tuple(self._pending_approvals)
+            self._pending_approvals.clear()
+        for approval in pending:
+            approval.close()
+
+    def on_unmount(self) -> None:
+        self._close_approvals()
+        if self.runtime is not None:
+            active = self.runtime.request_shutdown()
+            self.runtime.cancel_current()
+            if not active:
+                self.runtime.cleanup_pending_resources()
 
     def _confirm(self, prompt: str) -> bool:
         return self._approver("确认", prompt)
@@ -529,6 +570,8 @@ class TricoderApp(App[None]):
     def _show_status(self) -> None:
         if self.runtime is None:
             return
+        if self.runtime.current.memory.unknown_effects:
+            self.log_line("文件影响未确认；请检查实际文件并通过 /clear 明确确认")
         record = self.runtime.current.record
         config = self.runtime.current.config
         memory = self.runtime.current.memory
@@ -558,7 +601,7 @@ class TricoderApp(App[None]):
                 " ",
                 _p(mode),
                 " · ",
-                ("验证", "cyan"),
+                ("上次文件状态检查（非业务验收）", "cyan"),
                 " ",
                 _p(memory.verification),
             )
@@ -574,17 +617,15 @@ class TricoderApp(App[None]):
         )
 
     def _clear_confirm_worker(self) -> None:
-        if not self._confirm("清除当前会话的上下文和摘要？"):
+        if not self._confirm("清除当前会话记录（不恢复文件）；若有未确认影响，请先检查实际文件。确认？"):
             self.log_line_safe("[dim]已取消清除[/dim]")
             return
         if self.runtime is not None:
-            self.runtime.clear_current()
+            self.runtime.clear_current(confirmed=True)
             self.log_line_safe("[yellow]当前会话记忆已清除[/yellow]")
 
     def _clear_worker(self) -> None:
-        if self.runtime is not None:
-            self.runtime.clear_current()
-            self.log_line_safe("[yellow]当前会话记忆已清除[/yellow]")
+        self._clear_confirm_worker()
 
     def _show_diff(self) -> None:
         if self.runtime is None:
@@ -793,12 +834,16 @@ class TricoderApp(App[None]):
         self.query_one(Input).value = ""
 
     def action_quit(self) -> None:
+        self._close_approvals()
         code = 1
         if self.runtime is not None:
-            if self.runtime.cancel_current():
-                # 活动任务持有 Runtime 状态锁；先发取消信号并以非零码退出，
+            active = self.runtime.request_shutdown()
+            cancelled = self.runtime.cancel_current()
+            if active or cancelled:
+                # 活动任务持有任务互斥锁；先发取消信号并以非零码退出，
                 # 避免退出路径与任务收尾并发持久化同一份 Session 状态。
                 self.exit(1)
                 return
-            code = 0 if self.runtime.retry_persist() else 1
+            cleanup_ok = self.runtime.cleanup_pending_resources()
+            code = 0 if self.runtime.retry_persist() and cleanup_ok else 1
         self.exit(code)

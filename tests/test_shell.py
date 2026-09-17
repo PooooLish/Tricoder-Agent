@@ -157,7 +157,7 @@ class FakeRuntime:
         self.current = self._active(renamed)
         return renamed
 
-    def clear_current(self) -> None:
+    def clear_current(self, *, confirmed: bool = False) -> None:
         self.clear_calls += 1
 
     def change_model(self, provider: str) -> SimpleNamespace:

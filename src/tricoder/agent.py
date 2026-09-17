@@ -10,7 +10,11 @@ from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
 from tricoder.audit import AuditLogger
-from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.execution_state import (
+    EffectState, ErrorCode, FileEffects, RecoveryAction, should_stop_task,
+)
+from tricoder.core.cancellation import CancellationError, CancellationToken, NativeCancellationError
+from tricoder.task_cleanup import TaskCleanup, current_cleanup, run_in_cleanup_thread, task_cleanup_scope
 from tricoder.core.events import (
     AgentEvent,
     ApprovalRequested,
@@ -45,8 +49,11 @@ from tricoder.models import (
     ToolCall,
     ToolDefinition,
     ToolResult,
+    tool_failure,
 )
 from tricoder.policy import PolicyError
+from tricoder.verification import VerificationScope, proves_new_file_version
+from tricoder.task_observation import apply_tool_transition, current_task_observation, task_observation_scope
 from tricoder.providers import ModelProvider, ProviderError, ProviderProtocolError
 from tricoder.protocols import (
     COMMON_SYSTEM_PROMPT,
@@ -56,6 +63,7 @@ from tricoder.protocols import (
     PROTOCOL_FEEDBACK,
     SYSTEM_PROMPT,
     ActionProtocol,
+    ResolvedAction,
     _PROTOCOLS,
     parse_action,
 )
@@ -246,6 +254,8 @@ class CodingAgent:
             raise ValueError("plan_enabled 必须是布尔值")
         self.provider = provider
         self.tools = tools
+        # 非标准 registry 没有资源交接接口时，Agent 本身仍持有旧任务 pending 资源。
+        self._cleanup_owner = TaskCleanup()
         self.max_rounds = max_rounds
         self.max_context_chars = max_context_chars
         self.audit = audit
@@ -312,6 +322,36 @@ class CodingAgent:
     ) -> SessionTurnResult:
         """在不可变会话上下文上异步执行任务，并发布类型化事件。"""
 
+        if self._cleanup_owner.blocks(current_cleanup()) or getattr(self.tools, "has_pending_cleanup", False):
+            result = RunResult(False, "旧任务资源清理尚未确认，禁止复用执行资源", 0, cleanup_failed=True)
+            self._emit(event_sink, RuntimeFailed("runtime", result.summary))
+            return SessionTurnResult(result, context)
+        # 每次调用使用独立子令牌：父级取消仍向下传播，而原生 Task.cancel 只终止
+        # 本次调用，不能反向污染由宿主持有并可能复用的父令牌。
+        call_cancellation = cancellation.create_child() if cancellation is not None else CancellationToken()
+        with task_cleanup_scope(self._retain_task_cleanup, worker_owner=self._cleanup_owner), task_observation_scope():
+            try:
+                return await self._run_with_context_owned(
+                    task, context, cancellation=call_cancellation, event_sink=event_sink,
+                )
+            except asyncio.CancelledError:
+                # 线程 worker 可能仍停在审批等同步屏障；必须在 cleanup scope 交接前
+                # 让其提交前检查看到取消，再保持调用者的原生异常身份与参数。
+                call_cancellation.cancel()
+                raise
+
+    def _retain_task_cleanup(self, scope: TaskCleanup) -> None:
+        retain = getattr(self.tools, "retain_cleanup", None)
+        if callable(retain):
+            retain(scope)
+        else:
+            scope.handoff_to(self._cleanup_owner)
+
+    async def _run_with_context_owned(
+        self, task: str, context: SessionContext, *,
+        cancellation: CancellationToken | None = None, event_sink: EventSink | None = None,
+    ) -> SessionTurnResult:
+
         cancellation = cancellation or CancellationToken()
 
         if not task.strip():
@@ -334,7 +374,56 @@ class CodingAgent:
         tool_calls = 0
         modified_files = list(context.modified_files)
         verification = context.verification
+        evidence = context.verification_evidence
+        failed_snapshot = context.verification_failure
+        verification_required = (context.verification_required or bool(modified_files)
+                                 or evidence is not None or failed_snapshot is not None
+                                 or verification in {"通过", "passed", "失败", "failed", "待验证"})
+        tool_context = getattr(self.tools, "context", None)
+        scope = getattr(tool_context, "verification_scope", None)
+        policy = getattr(tool_context, "workspace_policy", None)
+        if isinstance(scope, VerificationScope):
+            scope.begin_task()
+            # 只排除当前本地审计器的精确文件；普通 runtime 或项目 ignore 不受信任。
+            if isinstance(self.audit, AuditLogger):
+                scope.audit_files = (self.audit.path.absolute(),)
+            if evidence is not None or failed_snapshot is not None:
+                current = await run_in_cleanup_thread(scope.capture, policy)
+                if not scope.owns(evidence) or not evidence.is_valid_for(current):
+                    evidence = None
+                    verification = "待验证"
+                if failed_snapshot is not None:
+                    if proves_new_file_version(failed_snapshot, current):
+                        failed_snapshot = None
+                    else:
+                        verification = "失败"
+            elif verification_required:
+                verification = "待验证"
+        else:
+            evidence = None
+            if verification_required:
+                verification = "待验证"
+        unknown_effects = context.unknown_effects or bool(
+            isinstance(scope, VerificationScope) and scope.unknown_effects)
+        cleanup_failed = False
+        file_effects_observed = True
         accumulated_usage: TokenUsage | None = None
+        observation = current_task_observation()
+
+        def execution_context() -> SessionContext:
+            return SessionContext(
+                modified_files=tuple(modified_files), verification=verification,
+                unknown_effects=unknown_effects, verification_evidence=evidence,
+                verification_failure=failed_snapshot, verification_required=verification_required,
+            )
+
+        def publish_state() -> None:
+            if observation is not None:
+                journal = getattr(tool_context, "change_journal", None)
+                observation.publish(execution_context(), effects_observed=file_effects_observed,
+                    journal_revision=journal.active_revision if journal is not None else None)
+
+        publish_state()
 
         def current_task_has_complete_round() -> bool:
             """只在当前任务已有完整工具回合时保留其中间状态。"""
@@ -354,8 +443,20 @@ class CodingAgent:
             *,
             rollback_task: bool = False,
         ) -> SessionTurnResult:
+            nonlocal evidence, verification, verification_required
+            cleanup_bad = (result.cleanup_failed or cleanup_failed or bool(
+                current_cleanup() is not None and current_cleanup().failed))
+            if cancellation.is_cancelled or cleanup_bad:
+                if isinstance(scope, VerificationScope):
+                    scope.revoke()
+                if evidence is not None or verification_required:
+                    evidence = None
+                    verification_required = True
+                    verification = "失败" if failed_snapshot is not None else "待验证"
+            publish_state()
             turn = SessionTurnResult(
-                replace(result, usage=accumulated_usage),
+                replace(result, usage=accumulated_usage, unknown_effects=unknown_effects,
+                        verification=verification, cleanup_failed=cleanup_bad),
                 SessionContext(
                     messages=(
                         context.messages
@@ -365,14 +466,28 @@ class CodingAgent:
                     persisted_summary=context.persisted_summary,
                     modified_files=tuple(modified_files),
                     verification=verification,
+                    unknown_effects=unknown_effects,
+                    verification_evidence=evidence,
+                    verification_failure=failed_snapshot,
+                    verification_required=verification_required,
                 ),
+                file_effects_observed=file_effects_observed,
             )
-            if result.ok:
+            if turn.result.ok:
                 self._emit(event_sink, RuntimeCompleted(turn.result))
             else:
                 category = "cancelled" if result.summary == "任务已取消" else "runtime"
                 self._emit(event_sink, RuntimeFailed(category, result.summary))
             return turn
+
+        if unknown_effects:
+            verification = "待验证"
+            evidence = None
+            verification_required = True
+            return turn_result(RunResult(
+                False, "文件影响未确认；请检查实际文件并通过 /clear 明确确认", 0,
+                modified_files=tuple(modified_files), verification="待验证",
+            ))
 
         if self.audit is not None:
             try:
@@ -559,22 +674,14 @@ class CodingAgent:
                     )
                 continue
 
-            # 一次可执行多个动作：逐个顺序执行、独立审批与审计，最后统一回填。
+            # 没有依赖图，因此本批首次失败就停止后续动作；只有根结果可决定新轮次。
             for action_index, (action, tool_call_id) in enumerate(
                 zip(resolved.actions, resolved.tool_call_ids)
             ):
                 if cancellation.is_cancelled:
-                    for later_action, later_id in zip(
-                        resolved.actions[action_index:],
-                        resolved.tool_call_ids[action_index:],
-                    ):
-                        messages.append(
-                            self._protocol.tool_result_message(
-                                later_action,
-                                ToolResult(False, "任务已取消，该动作未执行"),
-                                later_id,
-                            )
-                        )
+                    self._fill_remaining_results(
+                        resolved, action_index, action_index, round_number, messages, event_sink,
+                    )
                     return turn_result(
                         RunResult(False, "任务已取消", round_number, tool_calls, tuple(modified_files), verification)
                     )
@@ -603,6 +710,11 @@ class CodingAgent:
                 self._emit(event_sink, ToolExecutionStarted(event_call))
                 tool_calls += 1
                 action_started = time.perf_counter()
+                # 执行可能先落盘再取消；只有 observe 完成后才能确认状态已消费。
+                file_effects_observed = False
+                if observation is not None:
+                    observation.begin_tool()
+                interrupted = False
                 try:
                     execute_async = getattr(self.tools, "execute_async", None)
                     if callable(execute_async):
@@ -627,32 +739,28 @@ class CodingAgent:
                             for parameter in execute_parameters.values()
                         ):
                             execute_kwargs["call_id"] = event_call.id
-                        result = await asyncio.to_thread(
+                        result = await run_in_cleanup_thread(
                             self.tools.execute,
                             action.tool,
                             action.arguments,
                             **execute_kwargs,
                         )
-                except CancellationError:
-                    result = ToolResult(False, "任务已取消，该动作未完成")
-                    messages.append(
-                        self._protocol.tool_result_message(action, result, tool_call_id)
+                except (CancellationError, NativeCancellationError) as exc:
+                    if observation is not None:
+                        # Registry 可能已发布结果而后处理尚未交付；先恢复新事实再合成取消。
+                        latest, _ = observation.reconcile(execution_context())
+                        modified_files = list(latest.modified_files)
+                        verification, unknown_effects = latest.verification, latest.unknown_effects
+                        evidence, failed_snapshot = latest.verification_evidence, latest.verification_failure
+                        verification_required = latest.verification_required
+                    cleanup_failed = cleanup_failed or exc.cleanup_failed
+                    result = tool_failure(
+                        ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.CANCELLED,
+                        "任务已取消，资源清理未确认" if exc.cleanup_failed else "任务已取消，该动作未完成",
+                        file_effects=FileEffects(EffectState.UNKNOWN) if exc.cleanup_failed else None,
                     )
-                    for later_action, later_id in zip(
-                        resolved.actions[action_index + 1 :],
-                        resolved.tool_call_ids[action_index + 1 :],
-                    ):
-                        messages.append(
-                            self._protocol.tool_result_message(
-                                later_action,
-                                ToolResult(False, "任务已取消，该动作未执行"),
-                                later_id,
-                            )
-                        )
-                    self._emit(event_sink, ToolExecutionCompleted(event_call.id, result))
-                    return turn_result(
-                        RunResult(False, "任务已取消", round_number, tool_calls, tuple(modified_files), verification)
-                    )
+                    # 网关未交付副作用证据，仍保留 T1 的未消费标记供宿主收尾。
+                    interrupted = True
                 # 只消费工具在文件安全边界内确认的规范路径，不回读模型原始参数。
                 changed_paths = tuple(
                     dict.fromkeys(
@@ -660,59 +768,94 @@ class CodingAgent:
                         + list(result.modified_paths)
                     )
                 ) if result.ok else ()
-                for changed_path in changed_paths:
-                    if changed_path not in modified_files:
-                        modified_files.append(changed_path)
-                if changed_paths:
-                    # 成功写入会使此前命令验证立即失效，必须重新验证。
-                    verification = "待验证"
-                if (
-                    action.tool == "run_command"
-                    and result.verification_passed is not None
-                ):
-                    if not result.verification_passed:
-                        verification = "失败"
-                    elif verification != "失败":
-                        # 同一修改版本内失败保持有效；新的文件修改会先重置为待验证。
-                        verification = "通过"
+                effects = result.file_effects
+                cleanup_failed = cleanup_failed or (
+                    result.error is not None and result.error.code is ErrorCode.CLEANUP_FAILED
+                )
+                if effects is None:
+                    effects = (FileEffects(EffectState.CONFIRMED, changed_paths)
+                               if changed_paths else FileEffects(EffectState.NONE))
+                if ((isinstance(scope, VerificationScope) and scope.unknown_effects)
+                        or (observation is not None and observation.unknown_effects)):
+                    effects = FileEffects(EffectState.UNKNOWN, effects.paths)
+                file_effects_observed = not interrupted
+                candidate = result.verification_evidence
+                if not (action.tool == "run_command" and isinstance(scope, VerificationScope)
+                        and scope.owns(candidate)):
+                    candidate = None
+                observed = apply_tool_transition(execution_context(), effects, candidate)
+                modified_files = list(observed.modified_files)
+                verification, unknown_effects = observed.verification, observed.unknown_effects
+                evidence, failed_snapshot = observed.verification_evidence, observed.verification_failure
+                verification_required = observed.verification_required
+                # 先提交本地事实，再进入协议构造/通知；不改变 T3 的配对与首异常顺序。
+                publish_state()
                 duration_ms = self._elapsed_ms(action_started)
-                self.observer.on_tool_result(action, result, duration_ms)
-                self._emit(event_sink, ToolExecutionCompleted(event_call.id, result))
+                # 协议记录不能依赖可抛异常的观察者、事件或审计。构造本身失败时
+                # 直接传播，不通知完成、不重试构造，也不伪造一个完整回合。
                 messages.append(
                     self._protocol.tool_result_message(action, result, tool_call_id)
                 )
-                tool_event: dict[str, Any] = {
-                    "round": round_number,
-                    "status": "ok" if result.ok else "tool_error",
-                    "tool": (
-                        action.tool
-                        if self.tools.contains(action.tool)
-                        else "unknown"
-                    ),
-                    "reason_chars": len(action.reason),
-                    "arguments": self._audit_arguments(action, result),
-                    "output_chars": len(result.output),
-                    "duration_ms": duration_ms,
-                }
-                origin_resolver = getattr(self.tools, "origin", None)
-                if callable(origin_resolver) and self.tools.contains(action.tool):
-                    try:
-                        origin = origin_resolver(action.tool)
-                    except (TypeError, ValueError):
-                        origin = None
-                    if isinstance(origin, ToolOrigin):
-                        tool_event["origin"] = {
-                            "kind": origin.kind,
-                            "id": origin.id,
-                            "risk": origin.risk,
-                        }
-                if result.spill_reference is not None:
-                    tool_event["spill"] = {
-                        "reference": result.spill_reference,
-                        "bytes": result.spill_bytes,
-                        "sha256": result.spill_sha256,
+                try:
+                    self.observer.on_tool_result(action, result, duration_ms)
+                    self._emit(event_sink, ToolExecutionCompleted(event_call.id, result))
+                    tool_event: dict[str, Any] = {
+                        "round": round_number,
+                        "status": "ok" if result.ok else "tool_error",
+                        "tool": (
+                            action.tool
+                            if self.tools.contains(action.tool)
+                            else "unknown"
+                        ),
+                        "reason_chars": len(action.reason),
+                        "arguments": self._audit_arguments(action, result),
+                        "output_chars": len(result.output),
+                        "duration_ms": duration_ms,
                     }
-                if not self._log(tool_event):
+                    if result.error is not None:
+                        tool_event["error"] = result.error.public_fields()
+                    origin_resolver = getattr(self.tools, "origin", None)
+                    if callable(origin_resolver) and self.tools.contains(action.tool):
+                        try:
+                            origin = origin_resolver(action.tool)
+                        except (TypeError, ValueError):
+                            origin = None
+                        if isinstance(origin, ToolOrigin):
+                            tool_event["origin"] = {
+                                "kind": origin.kind,
+                                "id": origin.id,
+                                "risk": origin.risk,
+                            }
+                    if result.spill_reference is not None:
+                        tool_event["spill"] = {
+                            "reference": result.spill_reference,
+                            "bytes": result.spill_bytes,
+                            "sha256": result.spill_sha256,
+                        }
+                    audit_ok = self._log(tool_event)
+                except BaseException:
+                    # 仅隔离结果取得后的通知边界，绝不捕获/吞掉工具核心异常。
+                    # 静默补齐后重抛首个异常；二次构造失败也不能覆盖原异常。
+                    try:
+                        self._fill_remaining_results(
+                            resolved, action_index + 1, action_index, round_number,
+                            messages, event_sink, notify=False,
+                        )
+                    except BaseException:
+                        pass
+                    raise
+                cancelled = (interrupted or cancellation.is_cancelled
+                             or (result.error is not None and result.error.code is ErrorCode.CANCELLED))
+                stop_task = should_stop_task(result.error, effects)
+                finished = action.tool == "finish" and result.ok
+                if not result.ok or stop_task or finished or cancelled or not audit_ok:
+                    # 当前结果先落入历史；剩余只配对，不审批、不执行、不增加调用次数。
+                    # 即使审计失败也补齐协议，再结束任务，不留下半个 assistant 回合。
+                    remaining_audit_ok = self._fill_remaining_results(
+                        resolved, action_index + 1, action_index, round_number, messages, event_sink,
+                    )
+                    audit_ok = audit_ok and remaining_audit_ok
+                if not audit_ok:
                     return turn_result(
                         self._audit_failure_result(
                             round_number,
@@ -721,25 +864,32 @@ class CodingAgent:
                             verification,
                         )
                     )
-                if action.tool == "finish":
-                    # finish 后若仍有模型声明的后续工具调用，必须为每个 tool_call
-                    # 回填“未执行”结果，保证 Provider 历史始终包含完整 tool-result。
-                    for later_action, later_id in zip(
-                        resolved.actions[action_index + 1 :],
-                        resolved.tool_call_ids[action_index + 1 :],
-                    ):
-                        messages.append(
-                            self._protocol.tool_result_message(
-                                later_action,
-                                ToolResult(False, "任务已结束，该动作未执行"),
-                                later_id,
-                            )
-                        )
-                    completed = result.ok and (not modified_files or verification == "通过")
+                if unknown_effects:
+                    return turn_result(RunResult(
+                        False, "文件影响未确认；请检查实际文件并通过 /clear 明确确认",
+                        round_number, tool_calls, tuple(modified_files), verification,
+                    ))
+                if cancelled or stop_task:
+                    return turn_result(RunResult(
+                        False, "任务已取消" if cancelled else result.output,
+                        round_number, tool_calls, tuple(modified_files), verification,
+                    ))
+                if finished:
+                    valid = False
+                    if verification_required and isinstance(scope, VerificationScope):
+                        current = await run_in_cleanup_thread(scope.capture, policy)
+                        valid = scope.owns(evidence) and evidence.is_valid_for(current)
+                        if failed_snapshot is not None and proves_new_file_version(failed_snapshot, current):
+                            failed_snapshot = None
+                        if not valid:
+                            evidence = None
+                            verification = "失败" if failed_snapshot is not None else "待验证"
+                    completed = (result.ok and not cancellation.is_cancelled and not cleanup_failed
+                                 and (not verification_required or (valid and failed_snapshot is None)))
                     summary = result.output
-                    if result.ok and modified_files and verification == "待验证":
-                        summary = f"{summary}；文件修改后尚未运行验证命令"
-                    elif result.ok and modified_files and verification == "失败":
+                    if result.ok and verification_required and verification == "待验证":
+                        summary = f"{summary}；文件修改后尚未运行验证命令，或受覆盖文件状态证据已失效"
+                    elif result.ok and verification_required and verification == "失败":
                         summary = f"{summary}；文件修改后的验证失败"
                     return turn_result(
                         RunResult(
@@ -751,6 +901,15 @@ class CodingAgent:
                             verification,
                         )
                     )
+                if not result.ok:
+                    # SKIPPED 的 REPLAN 只是“未执行”的元数据，绝不是新的决策源。
+                    # 兼容无结构化错误的旧网关也只能停止，不能猜它是否可恢复。
+                    if result.error is None or result.error.recovery is not RecoveryAction.REPLAN:
+                        return turn_result(RunResult(
+                            False, result.output, round_number, tool_calls,
+                            tuple(modified_files), verification,
+                        ))
+                    break
         summary = f"达到最大轮数 {self.max_rounds}，任务已安全停止"
         self.observer.on_error(summary)
         return turn_result(
@@ -763,6 +922,49 @@ class CodingAgent:
                 verification,
             )
         )
+
+    @staticmethod
+    def _skipped_result(blocked_by: str, known_call_ids: tuple[str, ...]) -> ToolResult:
+        """只允许本轮已知 ID；输出用序号引用来源，绝不插入模型自由文本。"""
+        if (any(not isinstance(call_id, str) or not call_id for call_id in known_call_ids)
+                or len(set(known_call_ids)) != len(known_call_ids)
+                or blocked_by not in known_call_ids):
+            raise ValueError("跳过来源必须是本轮唯一的已知调用")
+        return tool_failure(
+            ErrorCode.SKIPPED,
+            json.dumps({"status": "skipped", "blocked_by_call_index": known_call_ids.index(blocked_by)}),
+            recovery=RecoveryAction.REPLAN,
+        )
+
+    def _fill_remaining_results(
+        self, resolved: ResolvedAction, start: int, blocked_index: int,
+        round_number: int, messages: list[Message], event_sink: EventSink | None,
+        *, notify: bool = True,
+    ) -> bool:
+        """所有批次出口共用配对入口；完成事件明确 skipped，不通知执行观察者。"""
+        known_ids = tuple(call_id or f"legacy-{round_number}-{index}"
+                          for index, call_id in enumerate(resolved.tool_call_ids))
+        skipped = self._skipped_result(known_ids[blocked_index], known_ids)
+        # 整段协议先构造并记录，随后才通知；首个 skipped sink 失败也不能
+        # 截断后续配对。构造失败不重试、不通知，不声称完整回合已落入历史。
+        remaining_messages = [
+            self._protocol.tool_result_message(
+                resolved.actions[index], skipped, resolved.tool_call_ids[index],
+            )
+            for index in range(start, len(resolved.actions))
+        ]
+        messages.extend(remaining_messages)
+        if not notify:
+            return True
+        audit_ok = True
+        for index in range(start, len(resolved.actions)):
+            self._emit(event_sink, ToolExecutionCompleted(known_ids[index], skipped))
+            logged = self._log({
+                "round": round_number, "status": "skipped", "call_index": index,
+                "blocked_by_call_index": blocked_index, "error": skipped.error.public_fields(),
+            })
+            audit_ok = audit_ok and logged
+        return audit_ok
 
     async def _planning_round_async(
         self,
@@ -845,10 +1047,10 @@ class CodingAgent:
     ) -> ProviderResponse:
         """消费流式 Provider；旧 fake/实现通过 complete 保持兼容。"""
 
+        cancellation.raise_if_cancelled()
         stream = getattr(self.provider, "stream", None)
         if not callable(stream):
-            cancellation.raise_if_cancelled()
-            response = await asyncio.to_thread(self.provider.complete, messages, tools)
+            response = await run_in_cleanup_thread(self.provider.complete, messages, tools)
             for event in self._response_events(response):
                 self._emit(event_sink, event)
             return response
@@ -934,8 +1136,12 @@ class CodingAgent:
             return True
         try:
             self.audit.log(event)
-        except OSError:
-            self.observer.on_error(AUDIT_FAILURE_MESSAGE)
+        except OSError as audit_error:
+            try:
+                self.observer.on_error(AUDIT_FAILURE_MESSAGE)
+            except BaseException:
+                # 错误提示只是二次通知，不能替换首个审计失败及其对象身份。
+                raise audit_error
             return False
         return True
 
@@ -975,6 +1181,9 @@ class CodingAgent:
         """只保留审计所需元数据，避免重复保存源码和任务摘要。"""
 
         arguments = action.arguments
+        if not result.ok and action.tool not in {"run_command", "apply_patch"}:
+            # 失败不能证明原始参数已通过策略；审计仅保留数量，不回显拒绝路径。
+            return {"argument_count": len(arguments)}
         if action.tool in {"list_files", "read_file"}:
             return {"path": arguments.get("path", ".")}
         if action.tool == "read_tool_result":

@@ -69,6 +69,14 @@ class PolicyError(PermissionError):
     """表示动作超出了 MVP 允许的安全边界。"""
 
 
+class PolicyArgumentError(PolicyError):
+    """本地解析尚未得到可执行动作；与已作出的权限拒绝保持类型区别。"""
+
+
+class WorkspacePathNotFoundError(PolicyArgumentError):
+    """工作区内目标不存在；调用方可修改参数后重试。"""
+
+
 class WorkspacePolicy:
     """确保模型只能访问明确指定的工作区。"""
 
@@ -92,7 +100,7 @@ class WorkspacePolicy:
             raise PolicyError("目标路径超出工作区")
         self._check_sensitive_parts(resolved.relative_to(self.workspace).parts)
         if must_exist and not resolved.exists():
-            raise PolicyError(f"目标路径不存在：{path}")
+            raise WorkspacePathNotFoundError(f"目标路径不存在：{path}")
         return resolved
 
     def _check_sensitive_parts(self, parts: tuple[str, ...]) -> None:
@@ -114,6 +122,14 @@ class CommandPolicy:
 
     _META_PATTERN = re.compile(r"[|&;><`\r\n]")
     _PYTHON_MODULES = {"unittest", "pytest", "compileall", "ruff", "mypy"}
+
+    @classmethod
+    def is_verification_command(cls, args: list[str]) -> bool:
+        """只分类 validate 后的 argv；普通脚本和外部声明不能晋升为验证器。"""
+        return (len(args) >= 3
+                and Path(args[0]).name.lower().removesuffix(".exe") in {"python", "py"}
+                and args[1] == "-m" and args[2] in cls._PYTHON_MODULES)
+
     # 这些工具必须通过 `python -m` 运行：直接调用会被 Windows 从 cwd 或 PATH
     # 命中同名程序，无法保证执行来源可信。
     _DISALLOWED_DIRECT_TOOLS = {
@@ -221,15 +237,15 @@ class CommandPolicy:
         """
 
         if not command.strip():
-            raise PolicyError("命令不能为空")
+            raise PolicyArgumentError("命令不能为空")
         if self._META_PATTERN.search(command):
             raise PolicyError("命令包含不允许的 Shell 元字符")
         try:
             args = shlex.split(command, posix=os.name != "nt")
         except ValueError as exc:
-            raise PolicyError(f"命令格式无效：{exc}") from exc
+            raise PolicyArgumentError("命令格式无效") from exc
         if not args:
-            raise PolicyError("命令不能为空")
+            raise PolicyArgumentError("命令不能为空")
 
         raw_executable = args[0]
         executable = Path(raw_executable).name.lower()

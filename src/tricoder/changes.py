@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import difflib
+import threading
 from dataclasses import dataclass
 import re
+
+from tricoder.execution_state import EffectState, FileEffects
 
 
 MAX_TASK_CHANGE_CHARS = 2_000_000
@@ -220,17 +223,21 @@ class ChangeJournal:
         self._before_modified_files: tuple[str, ...] = ()
         self._before_verification = ""
         self._latest: TaskChangeSet | None = None
+        self._revision = 0
+        self._revision_lock = threading.RLock()
 
     def begin_task(self, modified_files: tuple[str, ...], verification: str) -> None:
         """开始记录一个任务；同一时间只允许一个活动任务。"""
 
-        if self._active_changes is not None:
-            raise ChangeJournalError("当前任务尚未封存")
-        self._active_changes = {}
-        self._active_after = {}
-        self._active_tainted_paths = set()
-        self._before_modified_files = modified_files
-        self._before_verification = verification
+        with self._revision_lock:
+            if self._active_changes is not None:
+                raise ChangeJournalError("当前任务尚未封存")
+            self._active_changes = {}
+            self._active_after = {}
+            self._active_tainted_paths = set()
+            self._revision = 0
+            self._before_modified_files = modified_files
+            self._before_verification = verification
 
     def reserve(self, proposed: tuple[FileChange, ...]) -> None:
         """确认拟议变更加入后仍处于任务字符预算内。"""
@@ -254,12 +261,14 @@ class ChangeJournal:
     ) -> None:
         """记录一次已提交写入，保留该路径的最早前态与最新后态。"""
 
-        changes = self._require_active_changes()
-        self._validate_change(FileChange(path, before, after))
-        self._apply(changes, FileChange(path, before, after))
-        if self._active_after is None:
-            raise ChangeJournalError("尚未开始任务变更记录")
-        self._active_after[path] = after
+        with self._revision_lock:
+            changes = self._require_active_changes()
+            self._validate_change(FileChange(path, before, after))
+            self._apply(changes, FileChange(path, before, after))
+            if self._active_after is None:
+                raise ChangeJournalError("尚未开始任务变更记录")
+            self._active_after[path] = after
+            self._revision += 1
 
     def active_after(self, path: str) -> tuple[bool, FileSnapshot | None]:
         """返回路径是否写过，以及最近一次工具提交的已证明后态。"""
@@ -272,10 +281,32 @@ class ChangeJournal:
     def mark_tainted(self, path: str) -> None:
         """记录工具层无法证明归属连续性的规范路径，不保存外部快照。"""
 
-        self._require_active_changes()
-        if self._active_tainted_paths is None:
-            raise ChangeJournalError("尚未开始任务变更记录")
-        self._active_tainted_paths.add(path)
+        with self._revision_lock:
+            self._require_active_changes()
+            if self._active_tainted_paths is None:
+                raise ChangeJournalError("尚未开始任务变更记录")
+            if path not in self._active_tainted_paths:
+                self._active_tainted_paths.add(path)
+                self._revision += 1
+
+    @property
+    def active_revision(self) -> int:
+        """任务内已提交事实的单调游标；读取/审批/reserve 不推进。"""
+        with self._revision_lock:
+            self._require_active_changes()
+            return self._revision
+
+    def active_effects_since(self, consumed_revision: int) -> FileEffects:
+        """只有消费游标之后有新事实，才允许重放整个活动账本。"""
+        with self._revision_lock:
+            self._require_active_changes()
+            if self._revision <= consumed_revision:
+                return FileEffects(EffectState.NONE)
+            effects = self.active_effects()
+            if effects.state is EffectState.NONE:
+                # 新提交可写回净零，但仍改变版本；路径来自真实提交，不制造 undo 净变化。
+                return FileEffects(EffectState.CONFIRMED, tuple(self._active_after or ()))
+            return effects
 
     def is_tainted(self, path: str) -> bool:
         """判断活动任务的规范路径是否已失去工具所有权证明。"""
@@ -285,32 +316,47 @@ class ChangeJournal:
             raise ChangeJournalError("尚未开始任务变更记录")
         return path in self._active_tainted_paths
 
+    def active_effects(self) -> FileEffects:
+        """只读导出净变化与不确定状态，不封存、不暴露源码快照。"""
+
+        with self._revision_lock:
+            changes = self._require_active_changes()
+            tainted = self._active_tainted_paths or set()
+            # changes 与 tainted_paths 都只由本地写入边界记录。即使某个路径
+            # 已失去连续身份、不能升级为 CONFIRMED，也要作为 UNKNOWN 的已知
+            # 受影响范围保留下来，供 Runtime、SQLite 与用户界面提示核对。
+            paths = tuple(dict.fromkeys((*changes, *sorted(tainted))))
+            state = (EffectState.UNKNOWN if tainted else
+                     EffectState.CONFIRMED if paths else EffectState.NONE)
+            return FileEffects(state, paths)
+
     def seal_task(
         self, modified_files: tuple[str, ...], verification: str
     ) -> TaskChangeSet | None:
         """封存活动任务；没有净变化时保留此前的最近结果。"""
 
-        changes = self._require_active_changes()
-        result = (
-            TaskChangeSet(
-                changes=tuple(changes.values()),
-                before_modified_files=self._before_modified_files,
-                before_verification=self._before_verification,
-                after_modified_files=modified_files,
-                after_verification=verification,
-                tainted_paths=tuple(sorted(self._active_tainted_paths or ())),
+        with self._revision_lock:
+            changes = self._require_active_changes()
+            result = (
+                TaskChangeSet(
+                    changes=tuple(changes.values()),
+                    before_modified_files=self._before_modified_files,
+                    before_verification=self._before_verification,
+                    after_modified_files=modified_files,
+                    after_verification=verification,
+                    tainted_paths=tuple(sorted(self._active_tainted_paths or ())),
+                )
+                if changes or self._active_tainted_paths
+                else None
             )
-            if changes
-            else None
-        )
-        self._active_changes = None
-        self._active_after = None
-        self._active_tainted_paths = None
-        self._before_modified_files = ()
-        self._before_verification = ""
-        if result is not None:
-            self._latest = result
-        return result
+            self._active_changes = None
+            self._active_after = None
+            self._active_tainted_paths = None
+            self._before_modified_files = ()
+            self._before_verification = ""
+            if result is not None:
+                self._latest = result
+            return result
 
     def latest(self) -> TaskChangeSet | None:
         """返回最近一次有净变化的已封存任务。"""

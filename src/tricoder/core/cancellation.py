@@ -2,12 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from tricoder.task_cleanup import TaskCleanup
 
 
 class CancellationError(RuntimeError):
     """任务因显式取消而停止。"""
+
+    def __init__(self, message: str = "操作已取消", *, cleanup_failed: bool = False,
+                 cleanup_owner: TaskCleanup | None = None) -> None:
+        super().__init__(message)
+        self.cleanup_failed = cleanup_failed
+        self.cleanup_owner = cleanup_owner
+
+    def record_cleanup_failure(self, owner: TaskCleanup) -> None:
+        """自有异常的显式黏着状态；保留 token 首异常身份，不改 foreign 异常。"""
+        self.cleanup_failed = True
+        self.cleanup_owner = owner
+
+
+class NativeCancellationError(asyncio.CancelledError):
+    """保留 asyncio 取消语义的本地结构化异常；原生首异常只作为只读 cause。"""
+
+    def __init__(self, primary: asyncio.CancelledError, *, cleanup_owner: TaskCleanup) -> None:
+        super().__init__(*primary.args)
+        self.primary = primary
+        self.__cause__ = primary
+        self.cleanup_failed = True
+        self.cleanup_owner = cleanup_owner
 
 
 class CancellationToken:
@@ -60,3 +86,24 @@ class CancellationToken:
                 0.05 if remaining is None else min(0.05, remaining)
             )
         return True
+
+
+# ContextVar 随 asyncio.to_thread 复制，不能把当前令牌写进共享 ToolContext。
+_current_cancellation: ContextVar[CancellationToken | None] = ContextVar(
+    "tool_cancellation", default=None,
+)
+
+
+@contextmanager
+def cancellation_scope(cancellation: CancellationToken | None):
+    snapshot = _current_cancellation.set(cancellation)
+    try:
+        yield
+    finally:
+        _current_cancellation.reset(snapshot)
+
+
+def check_current_cancellation() -> None:
+    token = _current_cancellation.get()
+    if token is not None:
+        token.raise_if_cancelled()

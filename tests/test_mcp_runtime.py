@@ -179,6 +179,135 @@ class _PartialRegistrationHost:
 
 
 class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_token_primary_keeps_identity_and_cleanup_owner_when_manager_stop_fails(self):
+        from tricoder.task_cleanup import current_cleanup
+        primary = CancellationError("original token cancellation")
+        owners = []
+        class Resource:
+            def cleanup(self, deadline):
+                return False
+        resource = Resource()
+        class Manager(_FakeManager):
+            async def stop_all(inner):
+                scope = current_cleanup()
+                owners.append(scope)
+                scope.retain(resource)
+                raise MCPCleanupError()
+        async def operation(registry):
+            raise primary
+        with self.assertRaises(CancellationError) as caught:
+            await run_mcp_task(self.config, self.registry, source_env={}, audit=None,
+                cancellation=self.token, operation=operation, manager_factory=lambda *_: Manager([]))
+        self.assertIs(primary, caught.exception)
+        self.assertTrue(primary.cleanup_failed, "异常出口也必须传递最后清理的黏着失败")
+        self.assertIs(primary.cleanup_owner, owners[0])
+        self.assertTrue(self.registry.has_pending_cleanup)
+
+    async def test_normal_task_return_cannot_hide_sticky_cleanup_failure(self):
+        from tricoder import subprocess_control as control
+        from tricoder.models import RunResult, SessionContext, SessionTurnResult
+        from tricoder.task_cleanup import current_cleanup
+        (self.workspace / "owned.py").write_text("pass\n", encoding="utf-8")
+        original = control._ProcessResources.cleanup
+        for returned in (RunResult(True, "masked success", 1),
+                         SessionTurnResult(RunResult(True, "masked success", 1), SessionContext()),
+                         "masked generic success"):
+            with self.subTest(result_type=type(returned).__name__):
+                registry = ToolRegistry(ToolContext(WorkspacePolicy(self.workspace),
+                    CommandPolicy(self.workspace), lambda *_: True))
+                owners = []
+                def uncertain(resource, deadline):
+                    self.assertTrue(original(resource, deadline))
+                    return False
+                async def operation(active):
+                    owners.append(weakref.ref(current_cleanup()))
+                    failed = await active.execute_async("run_command", {"command": "python owned.py"})
+                    self.assertFalse(failed.ok)
+                    return returned  # 模拟宿主消费工具错误后自行报告成功。
+                with mock.patch.object(control._ProcessResources, "cleanup", uncertain):
+                    if isinstance(returned, str):
+                        with self.assertRaises(MCPCleanupError) as caught:
+                            await run_mcp_task(self.config, registry, source_env={}, audit=None,
+                                cancellation=CancellationToken(), operation=operation,
+                                manager_factory=lambda *_: _FakeManager([]))
+                        self.assertIs(caught.exception.cleanup_owner, owners[0]())
+                    else:
+                        outcome = await run_mcp_task(self.config, registry, source_env={}, audit=None,
+                            cancellation=CancellationToken(), operation=operation,
+                            manager_factory=lambda *_: _FakeManager([]))
+                        result = outcome.result if isinstance(outcome, SessionTurnResult) else outcome
+                        self.assertFalse(result.ok, "局部 scope.failed 不能被正常成功返回掩盖")
+                        self.assertTrue(result.cleanup_failed)
+                gc.collect()
+                self.assertIsNotNone(owners[0]())
+                self.assertTrue(owners[0]().failed)
+                self.assertFalse(registry.execute("finish", {"summary": "blocked"}).ok)
+
+    async def test_standalone_normal_and_exception_exits_keep_exact_command_cleanup_owner(self):
+        from tricoder import subprocess_control as control
+        from tricoder.execution_state import ErrorCode
+        from tricoder.task_cleanup import current_cleanup
+        (self.workspace / "owned.py").write_text("pass\n", encoding="utf-8")
+        real_cleanup = control._ProcessResources.cleanup
+        primary = ValueError("synthetic primary")
+        for exceptional in (False, True):
+            with self.subTest(exceptional=exceptional):
+                registry = ToolRegistry(ToolContext(WorkspacePolicy(self.workspace),
+                    CommandPolicy(self.workspace), lambda *_: True))
+                owners = []
+                resources = []
+
+                def uncertain(resource, deadline):
+                    self.assertTrue(real_cleanup(resource, deadline))
+                    resources.append(weakref.ref(resource))
+                    return False
+
+                async def operation(active):
+                    owners.append(weakref.ref(current_cleanup()))
+                    result = await active.execute_async("run_command", {"command": "python owned.py"})
+                    self.assertEqual(ErrorCode.CLEANUP_FAILED, result.error.code)
+                    if exceptional:
+                        raise primary
+                    return result
+
+                with mock.patch.object(control._ProcessResources, "cleanup", uncertain):
+                    if exceptional:
+                        with self.assertRaises(ValueError) as caught:
+                            await run_mcp_task(self.config, registry, source_env={}, audit=None,
+                                cancellation=CancellationToken(), operation=operation,
+                                manager_factory=lambda *_: _FakeManager([]))
+                        self.assertIs(primary, caught.exception)
+                    else:
+                        result = await run_mcp_task(self.config, registry, source_env={}, audit=None,
+                            cancellation=CancellationToken(), operation=operation,
+                            manager_factory=lambda *_: _FakeManager([]))
+                        self.assertFalse(result.ok)
+                gc.collect()
+                self.assertIsNotNone(owners[0](), "局部 MCP scope 在正常返回后失去 strong owner")
+                self.assertTrue(owners[0]().failed)
+                self.assertTrue(owners[0]().has_pending)
+                self.assertIsNotNone(resources[0](), "exact command resource 必须由 scope 保留")
+                blocked = registry.execute("finish", {"summary": "must remain blocked"})
+                self.assertFalse(blocked.ok, "独立 MCP 退出后不得复用未回收执行资源")
+                self.assertEqual(ErrorCode.CLEANUP_FAILED, blocked.error.code)
+
+    async def test_standalone_task_scope_publishes_one_cleanup_owner(self):
+        from tricoder.task_cleanup import current_cleanup
+        scopes = []
+        class Manager(_FakeManager):
+            async def stop_all(inner):
+                scopes.append(current_cleanup())
+
+        async def operation(_registry):
+            scopes.append(current_cleanup())
+            return "done"
+
+        await run_mcp_task(self.config, self.registry, source_env={}, audit=None,
+            cancellation=self.token, operation=operation,
+            manager_factory=lambda *_: Manager([]))
+        self.assertIsNotNone(scopes[0], "独立 MCP task 缺少共同清理预算/所有权")
+        self.assertIs(scopes[0], scopes[1])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name).resolve()

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError
+
+if TYPE_CHECKING:
+    from tricoder.verification import VerificationEvidence, WorkspaceSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +267,21 @@ class ToolResult:
     spill_reference: str | None = None
     spill_bytes: int = 0
     spill_sha256: str | None = None
+    file_effects: FileEffects | None = None
+    error: ToolError | None = None
+    verification_evidence: VerificationEvidence | None = None
+
+
+def tool_failure(
+    code: ErrorCode, output: str, *, recovery: RecoveryAction | None = None,
+    **metadata: Any,
+) -> ToolResult:
+    """由本地错误产生点选择类别；可重新规划不等于允许自动重试。"""
+    if recovery is None:
+        recovery = (RecoveryAction.REPLAN if code in {
+            ErrorCode.UNKNOWN_TOOL, ErrorCode.INVALID_ARGUMENT, ErrorCode.EXECUTION_FAILED,
+        } else RecoveryAction.STOP_TASK)
+    return ToolResult(False, output, error=ToolError(code, recovery), **metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +307,7 @@ class SessionMemory:
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
     permission_level: str = "strict"
+    unknown_effects: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +321,12 @@ class RunResult:
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
     usage: TokenUsage | None = None
+    unknown_effects: bool = False
+    cleanup_failed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.cleanup_failed:
+            object.__setattr__(self, "ok", False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +337,10 @@ class SessionContext:
     persisted_summary: str = ""
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
+    unknown_effects: bool = False
+    verification_evidence: VerificationEvidence | None = None
+    verification_failure: WorkspaceSnapshot | None = None
+    verification_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,3 +349,5 @@ class SessionTurnResult:
 
     result: RunResult
     context: SessionContext
+    # 仅当 Agent 已消费本轮所有已执行工具的副作用时为真；不持久化。
+    file_effects_observed: bool = False

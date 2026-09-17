@@ -2,7 +2,6 @@ import asyncio
 import io
 import inspect
 import json
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -363,10 +362,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("任务已取消", output.getvalue())
 
     def test_real_one_shot_assembly_spills_mcp_result_and_cleans_task_store(self) -> None:
-        """真实 main/Agent/manager 装配必须提供有界正文与本任务可回读引用。"""
+        """真实装配遇到未知 MCP 写影响时必须停止，并清理本任务暂存。"""
         payload = "X" * 200_000
         histories = []
         captured_registries = []
+        captured_results: list[ToolResult] = []
+        spill_existed_during_task: list[bool] = []
+        output = io.StringIO()
 
         class Client:
             async def start(self, cancellation):
@@ -390,25 +392,33 @@ class CliTests(unittest.TestCase):
                 if planning is not None:
                     return planning
                 histories.append(list(messages))
-                if len(histories) == 1:
-                    call = ToolCall("large-result", "mcp__docs__large", {})
-                elif len(histories) == 2:
-                    reference = re.search(r"spill_[0-9a-f]{32}", messages[-1].content)
-                    call = (
-                        ToolCall("read-middle", "read_tool_result", {"reference": reference[0], "offset": 100_000})
-                        if reference else ToolCall("finish", "finish", {"summary": "missing spill"})
-                    )
-                else:
-                    call = ToolCall("finish", "finish", {"summary": "complete"})
-                return ProviderResponse(tool_calls=(call,), finish_reason="tool_calls")
+                return ProviderResponse(
+                    tool_calls=(ToolCall("large-result", "mcp__docs__large", {}),),
+                    finish_reason="tool_calls",
+                )
 
         def task_scope(*args, **kwargs):
             return run_mcp_task_sync(*args, **kwargs, manager_factory=lambda *manager_args: MCPManager(
                 *manager_args, client_factory=lambda *_args: Client(),
             ))
 
+        class RecordingRegistry(ToolRegistry):
+            async def execute_async(self, name, arguments, **kwargs):  # type: ignore[no-untyped-def]
+                result = await super().execute_async(name, arguments, **kwargs)
+                if name == "mcp__docs__large":
+                    captured_results.append(result)
+                    store = self.context.spill_store
+                    spill_existed_during_task.append(
+                        bool(
+                            store is not None
+                            and result.spill_reference
+                            and (store.session_dir / f"{result.spill_reference}.txt").is_file()
+                        )
+                    )
+                return result
+
         def registry_factory(context):
-            registry = ToolRegistry(context)
+            registry = RecordingRegistry(context)
             captured_registries.append(registry)
             return registry
 
@@ -424,20 +434,24 @@ class CliTests(unittest.TestCase):
                 exit_code = main(
                     ["run", "large result", "--workspace", str(workspace), "--no-color"],
                     environ={}, provider_factory=lambda *_args: Provider(),
-                    input_fn=lambda _prompt: "yes", output=io.StringIO(),
+                    input_fn=lambda _prompt: "yes", output=output,
                 )
-            self.assertEqual(0, exit_code)
-            tool_message = next(message for message in histories[1] if message.role == "tool")
-            tool_output = json.loads(tool_message.content)["tool_result"]["output"]
-            self.assertLessEqual(len(tool_output), 20_000)
-            self.assertRegex(tool_message.content, r"spill_[0-9a-f]{32}")
-            self.assertEqual("X" * 20_000, json.loads(histories[2][-1].content)["tool_result"]["output"])
+            # MCP 扩展不是受信的只读工具；它返回内容后影响范围仍为 UNKNOWN，
+            # Agent 必须在下一次模型调用前停下，不能把大段外部内容继续发送。
+            self.assertEqual(1, exit_code)
+            self.assertEqual(1, len(histories))
+            self.assertEqual(1, len(captured_results))
+            self.assertLessEqual(len(captured_results[0].output), 20_000)
+            self.assertRegex(captured_results[0].output, r"spill_[0-9a-f]{32}")
+            self.assertEqual(len(payload.encode("utf-8")), captured_results[0].spill_bytes)
+            self.assertEqual([True], spill_existed_during_task)
             store = captured_registries[0].context.spill_store
             self.assertIsNotNone(store)
             self.assertEqual([], list(store.session_dir.iterdir()))
             audit_text = "".join(path.read_text(encoding="utf-8") for path in config.audit_dir.glob("*.jsonl"))
             self.assertNotIn("X" * 100, audit_text)
-            self.assertNotIn(str(store.session_dir), tool_message.content)
+            self.assertNotIn(str(store.session_dir), audit_text)
+            self.assertIn("文件影响未确认", output.getvalue())
 
     def test_one_shot_run_uses_shared_provider_factory_by_default(self) -> None:
         """防止 CLI 一次性运行保留独立工厂并绕过 Provider 注册表。"""
@@ -995,6 +1009,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
             audit_dir = Path(directory) / "audit-output"
+            (Path(directory) / "missing.py").write_text("value = 1\n", encoding="utf-8")
             provider = ScriptedProvider(
                 [
                     {
@@ -1029,7 +1044,7 @@ class CliTests(unittest.TestCase):
                 output=output,
             )
 
-            self.assertEqual(0, exit_code)
+            self.assertEqual(0, exit_code, output.getvalue())
             self.assertEqual(2, len(provider.histories))
             self.assertIn(
                 Message("system", CONTEXT_COMPACTION_NOTICE),
