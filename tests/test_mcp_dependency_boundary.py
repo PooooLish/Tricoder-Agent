@@ -184,6 +184,7 @@ class MCPProcessBindingsTests(unittest.IsolatedAsyncioTestCase):
             "start_new_session": True,
         }, captured)
 
+    @unittest.skipUnless(os.name == "nt", "Windows SDK 进程绑定仅在 Windows 验证")
     async def test_windows_spawn_uses_job_aware_creator_and_exact_approved_parameters(self):
         utilities = importlib.import_module("mcp.os.win32.utilities")
         captured = {}

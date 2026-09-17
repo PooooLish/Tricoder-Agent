@@ -90,9 +90,25 @@ def _is_reparse(metadata: os.stat_result) -> bool:
 
 
 def _metadata(metadata: os.stat_result) -> tuple[int, ...]:
-    return (metadata.st_mode, metadata.st_dev, metadata.st_ino, metadata.st_size,
-            metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_nlink,
-            getattr(metadata, "st_file_attributes", 0))
+    """返回跨 Python/文件系统稳定、且足以绑定对象版本的元数据。
+
+    目录大小和链接数会因被排除的 ``__pycache__`` 等目录出现而变化；若把
+    它们用于两次清单核验，验证命令自身就会令快照假失败。文件时间戳在
+    Windows 的 path/handle API 及 Python 版本间也并不稳定。目录仅绑定类型
+    和身份，普通文件再加入权限、大小、链接数和 Windows 属性；文件正文由
+    后续 SHA-256 覆盖。
+    """
+    identity = (stat.S_IFMT(metadata.st_mode), metadata.st_dev, metadata.st_ino)
+    if stat.S_ISDIR(metadata.st_mode):
+        return identity
+    return (
+        metadata.st_mode,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_nlink,
+        getattr(metadata, "st_file_attributes", 0),
+    )
 
 
 @contextmanager

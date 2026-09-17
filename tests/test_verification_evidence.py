@@ -208,6 +208,25 @@ class SnapshotTests(WorkspaceCase):
         with patch.object(api, "_open_binary", side_effect=mutate):
             self.assertFalse(self.capture().complete)
 
+    def test_excluded_cache_created_during_scan_does_not_invalidate_snapshot(self):
+        """验证器新建被排除缓存时，父目录元数据变化不能制造假失败。"""
+        api = self.api()
+        real_open = api._open_binary
+        created = False
+
+        def create_cache(path, *args, **kwargs):
+            nonlocal created
+            if not created:
+                created = True
+                cache = self.root / "__pycache__"
+                cache.mkdir()
+                (cache / "app.pyc").write_bytes(b"cache")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(api, "_open_binary", side_effect=create_cache):
+            snapshot = self.capture()
+        self.assertTrue(snapshot.complete, snapshot.limitations)
+
     def test_directory_replaced_before_read_is_not_followed(self):
         api = self.api()
         directory = self.root / "src"

@@ -125,8 +125,16 @@ class CommandPolicyTests(unittest.TestCase):
                 args = self.policy.validate(command)
                 resolved = Path(args[0])
                 self.assertTrue(resolved.is_absolute())
-                self.assertEqual(name, resolved.name.lower().removesuffix(".exe"))
+                self.assertEqual(name, CommandPolicy._canonical_executable(args[0]))
                 self.assertTrue(resolved.exists())
+
+    def test_versioned_posix_python_is_still_a_verification_executable(self) -> None:
+        """可信解析得到 python3.11 时仍应识别为内置验证器。"""
+        self.assertTrue(
+            CommandPolicy.is_verification_command(
+                ["/usr/bin/python3.11", "-m", "compileall", "-q", "src"]
+            )
+        )
 
     def test_validate_ignores_cwd_and_workspace_executable_hijacks(self) -> None:
         """Python and Git must not resolve from attacker-controlled PATH entries."""
@@ -461,6 +469,7 @@ class CommandPolicyWorkspaceTests(unittest.TestCase):
                 self.policy.validate("python test/link/outside.py")
         finally:
             link.unlink(missing_ok=True)
+            (outside / "outside.py").unlink(missing_ok=True)
             outside.rmdir()
 
     def test_accepts_in_workspace_paths(self) -> None:

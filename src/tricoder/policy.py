@@ -127,7 +127,7 @@ class CommandPolicy:
     def is_verification_command(cls, args: list[str]) -> bool:
         """只分类 validate 后的 argv；普通脚本和外部声明不能晋升为验证器。"""
         return (len(args) >= 3
-                and Path(args[0]).name.lower().removesuffix(".exe") in {"python", "py"}
+                and cls._is_python_executable(args[0])
                 and args[1] == "-m" and args[2] in cls._PYTHON_MODULES)
 
     # 这些工具必须通过 `python -m` 运行：直接调用会被 Windows 从 cwd 或 PATH
@@ -212,6 +212,7 @@ class CommandPolicy:
         "--show-error-codes", "--pretty", "--no-error-summary",
     }
     _ABSOLUTE_PATH_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
+    _VERSIONED_PYTHON = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 
     def __init__(
         self,
@@ -241,7 +242,15 @@ class CommandPolicy:
         if self._META_PATTERN.search(command):
             raise PolicyError("命令包含不允许的 Shell 元字符")
         try:
-            args = shlex.split(command, posix=os.name != "nt")
+            # POSIX shlex 默认把反斜杠当转义符，会把 ``..\\outside`` 吞成
+            # ``..outside``，导致来自其他平台的路径绕过边界检查。这里仍使用
+            # POSIX 引号规则去掉成对引号，但关闭转义，确保两类路径分隔符都
+            # 原样进入后续的跨平台校验。
+            lexer = shlex.shlex(command, posix=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            lexer.escape = ""
+            args = list(lexer)
         except ValueError as exc:
             raise PolicyArgumentError("命令格式无效") from exc
         if not args:
@@ -271,9 +280,7 @@ class CommandPolicy:
                 "command_valid": False,
                 "command_chars": len(command),
             }
-        executable = Path(args[0]).name.lower()
-        if executable.endswith(".exe"):
-            executable = executable[:-4]
+        executable = self._canonical_executable(args[0])
         metadata: dict[str, object] = {
             "command_valid": True,
             "executable": executable,
@@ -289,6 +296,19 @@ class CommandPolicy:
         elif executable == "git":
             metadata["git_subcommand"] = args[1].lower()
         return metadata
+
+    @classmethod
+    def _canonical_executable(cls, raw: str) -> str:
+        """把可信解析后的解释器文件名归一化为稳定的审计分类。"""
+        executable = Path(raw).name.lower().removesuffix(".exe")
+        if cls._VERSIONED_PYTHON.fullmatch(executable):
+            return "python"
+        return executable
+
+    @classmethod
+    def _is_python_executable(cls, raw: str) -> bool:
+        """识别 Windows ``python.exe`` 与 POSIX ``python3.11`` 等名称。"""
+        return cls._canonical_executable(raw) in {"python", "py"}
 
     def _safe_relative_script(self, script: str) -> str:
         """把脚本路径规范化为工作区内相对路径；不可解析时返回受限提示。"""

@@ -743,10 +743,9 @@ class ToolTests(unittest.TestCase):
         )
         (self.workspace / "app.log").write_text("noise\n", encoding="utf-8")
         (self.workspace / "binary.bin").write_bytes(b"\x00\x01\x02target\x00")
-        (self.workspace / "huge.txt").write_text(
-            "big\n" * 50,
-            encoding="utf-8",
-        )
+        # 固定写入 204 bytes，避免文本换行在 Windows/Linux 上分别为
+        # CRLF/LF，使边界用例只在某个平台超过 200 bytes。
+        (self.workspace / "huge.txt").write_bytes(b"big\n" * 51)
         self.registry.context.max_search_file_bytes = 200
 
         regex_result = self.registry.execute(
