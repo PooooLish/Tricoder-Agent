@@ -346,7 +346,7 @@ class CommandEvidenceTests(WorkspaceCase):
         (self.root / "test_mutate.py").write_text(
             "from pathlib import Path\nPath('app.py').write_text('x = 9\\n')\n", encoding="utf-8")
         result = self.tools.execute("run_command", {"command": "python -m unittest discover -q -p test_mutate.py"})
-        self.assertTrue(result.ok)
+        self.assertTrue(result.ok, result.output)
         self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
         self.assertFalse(result.verification_evidence.passed)
 

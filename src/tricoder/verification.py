@@ -65,6 +65,10 @@ class VerificationScope:
     token: str = field(default_factory=lambda: secrets.token_hex(24), repr=False)
     task_id: str = field(default_factory=lambda: secrets.token_hex(16))
     audit_files: tuple[Path, ...] = field(default=(), repr=False)
+    # 生产调用在较慢的 Windows/杀毒扫描环境中仍需覆盖小型工作区；底层
+    # capture_workspace 保留 3 秒显式接口默认值，范围所有者使用实测后的
+    # 较宽协作预算。文件数与字节数硬上限保持不变。
+    scan_timeout: float = field(default=10.0, repr=False)
     _authority: object = field(default_factory=object, repr=False)
     unknown_effects: bool = False
 
@@ -75,7 +79,12 @@ class VerificationScope:
         self._authority = object()
 
     def capture(self, policy: WorkspacePolicy) -> WorkspaceSnapshot:
-        return capture_workspace(policy, scope_id=self.token, _audit_files=self.audit_files)
+        return capture_workspace(
+            policy,
+            scope_id=self.token,
+            timeout=self.scan_timeout,
+            _audit_files=self.audit_files,
+        )
 
     def issue(self, before: WorkspaceSnapshot, after: WorkspaceSnapshot, passed: bool) -> VerificationEvidence:
         return VerificationEvidence(self.task_id, secrets.token_hex(16), before, after,

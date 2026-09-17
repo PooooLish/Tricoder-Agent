@@ -517,7 +517,7 @@ class FinalLoggingTests(unittest.TestCase):
                     stores += 1
                     if stores == (1 if install else 2):
                         reached.set()
-                        if not resume.wait(3):
+                        if not resume.wait(10):
                             raise AssertionError("synthetic scheduler timeout")
             return trace
 
@@ -534,20 +534,20 @@ class FinalLoggingTests(unittest.TestCase):
         thread = threading.Thread(target=worker)
         try:
             thread.start()
-            self.assertTrue(reached.wait(3))
+            self.assertTrue(reached.wait(10))
             if remove:
                 logger.removeFilter(host)
             else:
                 logger.addFilter(host)
             resume.set()
-            thread.join(3)
+            thread.join(10)
             self.assertFalse(thread.is_alive())
             self.assertEqual([], errors)
             self.assertEqual(not remove, host in logger.filters)
             self.assertIs(original, logger.filters)
         finally:
             resume.set()
-            thread.join(3)
+            thread.join(10)
             logger.removeFilter(host)
 
     def test_install_preserves_concurrent_standard_add_filter(self):

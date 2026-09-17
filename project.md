@@ -14,7 +14,7 @@
 - T5 第 4 轮裁决：Runtime 对 scope-owned evidence 取得结束前当前快照，扫描异常/不完整不再用 evidence.after 自证；最终 token 取消独立阻断，不给纯读伪造验证需求。扫描留在已有同步任务所有权/cleanup scope 内，普通扫描异常 fail closed，Native/structured 取消沿原异常收尾并保留首异常；无新后台线程或硬超时承诺。
 - T5 第 5 轮裁决：私有取消接收标志与 cancel_current 共用状态锁，seal/current/memory 准备后、persist 前决定结果并关闭接收；已接受取消进入 result/context/memory，提交后取消返回 False 而任务所有权仍保留。final capture 本地阶段标记使 BaseException 沿既有异常对账撤销 pass、保留 failure 与首异常；不把 Agent/observer 的其他异常一概清证据。
 - T5 第 6 轮裁决：仅将 Runtime 三处“已有主异常后的补偿 seal/persist”捕获扩为 BaseException，原裸 raise 保留同一主异常及 Native cause。正常扫描/对账/持久化异常边界不扩大；失败证据撤销、dirty 与任务取消复位控制保留，不伪造补偿保存成功。
-- T5 成本与限制：合成 256 文件/4 MiB 扫描 1.401 秒；生产默认单次 3 秒仍是协作式预算，不保证阻塞系统调用硬超时。敏感条目不读正文但使覆盖不完整。Windows 离线已验，POSIX 与真实外部 Provider/MCP 未验。
+- T5 成本与限制：合成 256 文件/4 MiB 扫描 1.401 秒；底层扫描接口默认 3 秒，生产 `VerificationScope` 根据 Windows CI 实测使用 10 秒协作式预算，不保证阻塞系统调用硬超时。敏感条目不读正文但使覆盖不完整。Windows 离线已验，POSIX 与真实外部 Provider/MCP 未验。
 - 集成证据：I01–I07 7/7 通过；最终 Windows 完整串行 `unittest discover -s tests -q` 为 1,077 项通过、6 项平台条件跳过。最终整改定向复审及测试稳定性复审均为 PASS；详细记录见 `runtime/reliability-top5/integration-report.md` 与 `runtime/reliability-top5/final-remediation-review.md`。
 - 下一步：向用户交付工作树与证据；POSIX、Python 3.12、真实 Provider 和真实外部 MCP 仍需另行验证。不自动暂存、提交、合并或发布。
 
