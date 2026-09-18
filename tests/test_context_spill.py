@@ -171,7 +171,10 @@ class ToolResultSpillStoreTests(unittest.TestCase):
 
         self.assertNotIn(secret.encode("utf-8"), raw_database)
         self.assertNotIn(str(self.runtime_root).encode("utf-8"), raw_database)
-        self.assertEqual({"sessions", "session_memory"}, tables)
+        self.assertEqual(
+            {"sessions", "session_memory", "conversation_memory"},
+            tables,
+        )
 
 
 class ToolRegistrySpillTests(unittest.TestCase):

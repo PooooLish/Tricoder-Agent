@@ -114,11 +114,25 @@ class CommandParserTests(unittest.TestCase):
                 with self.assertRaises(CommandError):
                     parse_command(text)
 
+    def test_memory_command_has_local_view_save_and_edit_forms(self) -> None:
+        self.assertEqual(ParsedCommand("memory", None, None), parse_command("/memory"))
+        self.assertEqual(
+            ParsedCommand("memory", "save", None), parse_command("/memory save")
+        )
+        self.assertEqual(
+            ParsedCommand("memory", "edit", "constraint-api"),
+            parse_command("/memory edit constraint-api"),
+        )
+        for text in ("/memory save extra", "/memory edit", "/memory unknown"):
+            with self.subTest(text=text), self.assertRaises(CommandError):
+                parse_command(text)
+
     def test_command_registry_covers_parsed_commands(self) -> None:
         """注册表必须包含全部可解析命令，且解析器只接受已注册命令。"""
         specs = list_commands()
         self.assertIn("help", specs)
         self.assertIn("session", specs)
+        self.assertIn("memory", specs)
         for name in ("help", "status", "model", "clear", "diff", "undo", "exit"):
             self.assertEqual(name, parse_command(f"/{name}").name)
         self.assertIsNotNone(command_spec("undo"))

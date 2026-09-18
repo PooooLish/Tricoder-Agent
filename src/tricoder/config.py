@@ -15,6 +15,7 @@ from tricoder.models import (
     HooksConfig,
     MCPConfig,
     MCPServerConfig,
+    MemoryConfig,
     ProviderConfig,
     SkillsConfig,
     WorktreeConfig,
@@ -477,6 +478,66 @@ def _parse_extension_config(
     return extensions, mcp, skills, hooks, worktree, agents
 
 
+def _parse_memory_config(
+    project: dict[str, object],
+    environment: Mapping[str, str],
+) -> MemoryConfig:
+    """严格解析默认关闭的会话语义记忆配置。"""
+
+    table = _strict_table(
+        project,
+        "memory",
+        frozenset(
+            {
+                "compaction",
+                "persistence",
+                "trigger_ratio",
+                "target_ratio",
+                "summary_max_chars",
+                "summary_timeout_seconds",
+            }
+        ),
+    )
+    values = {
+        "compaction": environment.get(
+            "TRICODER_MEMORY_COMPACTION", table.get("compaction", "off")
+        ),
+        "persistence": environment.get(
+            "TRICODER_MEMORY_PERSISTENCE", table.get("persistence", "off")
+        ),
+        "trigger_ratio": environment.get(
+            "TRICODER_MEMORY_TRIGGER_RATIO", table.get("trigger_ratio", 0.80)
+        ),
+        "target_ratio": environment.get(
+            "TRICODER_MEMORY_TARGET_RATIO", table.get("target_ratio", 0.65)
+        ),
+        "summary_max_chars": environment.get(
+            "TRICODER_MEMORY_SUMMARY_MAX_CHARS", table.get("summary_max_chars", 6_000)
+        ),
+        "summary_timeout_seconds": environment.get(
+            "TRICODER_MEMORY_SUMMARY_TIMEOUT_SECONDS",
+            table.get("summary_timeout_seconds", 15.0),
+        ),
+    }
+    if not isinstance(values["compaction"], str) or not isinstance(values["persistence"], str):
+        raise ConfigError("memory 模式必须是字符串")
+    try:
+        return MemoryConfig(
+            compaction=values["compaction"].strip(),
+            persistence=values["persistence"].strip(),
+            trigger_ratio=_positive_float(values["trigger_ratio"], "memory.trigger_ratio"),
+            target_ratio=_positive_float(values["target_ratio"], "memory.target_ratio"),
+            summary_max_chars=_positive_int(
+                values["summary_max_chars"], "memory.summary_max_chars"
+            ),
+            summary_timeout_seconds=_positive_float(
+                values["summary_timeout_seconds"], "memory.summary_timeout_seconds"
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def load_config(
     provider: str,
     workspace: Path,
@@ -621,6 +682,7 @@ def load_config(
         env,
         process_env,
     )
+    memory = _parse_memory_config(project, env)
 
     return AppConfig(
         workspace=resolved_workspace,
@@ -645,4 +707,5 @@ def load_config(
         hooks=hooks,
         worktree=worktree,
         agents=agents,
+        memory=memory,
     )

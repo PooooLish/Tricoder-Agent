@@ -36,10 +36,20 @@ from tricoder.context import (
     CONTEXT_COMPACTION_NOTICE,
     ContextBudget,
     ContextManager,
+    assign_message_sequences,
+    conversation_memory_message,
+)
+from tricoder.context.memory import ConversationMemory, MemoryValidationError
+from tricoder.context.summarizer import (
+    MemorySummarizer,
+    MemorySummaryError,
+    memory_summary_failure_code,
+    memory_summary_failure_label,
 )
 from tricoder.extensions.models import ToolOrigin
 from tricoder.models import (
     Message,
+    MemoryConfig,
     ProviderResponse,
     RunResult,
     SessionContext,
@@ -80,6 +90,10 @@ PLANNING_PROMPT = """在开始执行前，请先输出一份简短的分步执�
 
 # 规划阶段审计失败时的终止哨兵。
 _PLAN_ABORT = object()
+
+
+class _MemoryAuditFailure(RuntimeError):
+    """记忆状态无法留下审计证据时，按既有安全边界终止本轮。"""
 
 
 def _is_complete_tool_round(
@@ -239,6 +253,8 @@ class CodingAgent:
         observer: AgentObserver | None = None,
         tool_protocol: str = "native",
         plan_enabled: bool = True,
+        memory_config: MemoryConfig | None = None,
+        memory_summarizer: object | None = None,
     ) -> None:
         if max_rounds <= 0:
             raise ValueError("max_rounds 必须大于 0")
@@ -262,6 +278,10 @@ class CodingAgent:
         self.observer = observer or NullObserver()
         self.tool_protocol = tool_protocol
         self.plan_enabled = plan_enabled
+        self.memory_config = memory_config or MemoryConfig()
+        self.memory_summarizer = memory_summarizer
+        if self.memory_config.compaction == "structured" and self.memory_summarizer is None:
+            self.memory_summarizer = MemorySummarizer(provider, self.memory_config)
         self._protocol: ActionProtocol = _PROTOCOLS[tool_protocol]
         # 旧配置仍以字符数命名，因此同时保留字符硬上限；同值 token 上限
         # 让 Provider usage 可在字符估算明显偏低时触发完整回合压缩。
@@ -369,8 +389,32 @@ class CodingAgent:
                 )
             )
         history_start = len(messages)
-        messages.extend(context.messages)
+        base_history, base_next_message_seq = assign_message_sequences(
+            context.messages,
+            context.next_message_seq,
+        )
+        next_message_seq = base_next_message_seq
+        messages.extend(base_history)
         messages.append(Message("user", f"用户任务：{task.strip()}", kind="task"))
+
+        def normalize_history() -> tuple[Message, ...]:
+            """在进入 Provider 或交付 Context 前只为新增历史分配一次序号。"""
+
+            nonlocal next_message_seq
+            normalized, next_message_seq = assign_message_sequences(
+                tuple(messages[history_start:]),
+                next_message_seq,
+            )
+            messages[history_start:] = normalized
+            return normalized
+
+        initial_history = normalize_history()
+        current_task_id = initial_history[-1].task_id
+        conversation_memory = context.conversation_memory
+        if not isinstance(conversation_memory, ConversationMemory):
+            result = RunResult(False, "会话记忆状态无效", 0)
+            self._emit(event_sink, RuntimeFailed("memory", result.summary))
+            return SessionTurnResult(result, context)
         tool_calls = 0
         modified_files = list(context.modified_files)
         verification = context.verification
@@ -408,13 +452,264 @@ class CodingAgent:
         cleanup_failed = False
         file_effects_observed = True
         accumulated_usage: TokenUsage | None = None
+        memory_usage: TokenUsage | None = None
+        memory_calls = 0
+        memory_summary_failed = False
+        memory_compacted = False
+        memory_warning = ""
         observation = current_task_observation()
+
+        def request_view() -> list[Message]:
+            """把结构化记忆仅注入临时请求视图，绝不追加到原始历史。"""
+
+            prefix = list(messages[:history_start])
+            if self.memory_config.compaction == "structured":
+                memory_message = conversation_memory_message(conversation_memory)
+                if memory_message is not None:
+                    prefix.append(memory_message)
+            return [*prefix, *messages[history_start:]]
+
+        async def prepare_structured_memory(
+            provider_tools: tuple[ToolDefinition, ...] | list[ToolDefinition],
+        ) -> None:
+            """最多两批总结；候选校验成功前绝不删除历史。"""
+
+            nonlocal conversation_memory, memory_usage, memory_calls
+            nonlocal memory_summary_failed, memory_compacted
+            if self.memory_config.compaction != "structured":
+                return
+            summarizer = self.memory_summarizer
+            if summarizer is None or not callable(getattr(summarizer, "summarize", None)):
+                raise MemorySummaryError(
+                    "结构化记忆摘要器不可用",
+                    code="unavailable",
+                )
+            for _batch in range(2):
+                normalize_history()
+                memory_message = conversation_memory_message(conversation_memory)
+                fixed = [*messages[:history_start]]
+                if memory_message is not None:
+                    fixed.append(memory_message)
+                plan = self.context_manager.plan_compaction(
+                    tuple(messages[history_start:]),
+                    fixed_messages=fixed,
+                    tools=tuple(provider_tools),
+                    trigger_ratio=self.memory_config.trigger_ratio,
+                    target_ratio=self.memory_config.target_ratio,
+                    covered_through=conversation_memory.covered_through,
+                )
+                if not plan.needs_compaction:
+                    if plan.over_hard_limit:
+                        raise MemorySummaryError(
+                            plan.reason or "完整请求超过上下文硬上限",
+                            code="budget",
+                        )
+                    return
+                if memory_summary_failed:
+                    if plan.over_hard_limit:
+                        raise MemorySummaryError(
+                            "摘要失败且完整请求超过上下文硬上限",
+                            code="budget",
+                        )
+                    return
+                memory_calls += 1
+                try:
+                    summary_result = await summarizer.summarize(
+                        conversation_memory,
+                        plan.source_messages,
+                        cancellation,
+                    )
+                except CancellationError:
+                    raise
+                except MemorySummaryError as exc:
+                    memory_summary_failed = True
+                    self.observer.on_error("会话记忆整理失败；原历史保持不变")
+                    if not self._log(
+                        {
+                            "status": "memory_summary_failed",
+                            "failure_code": memory_summary_failure_code(exc),
+                            "source_count": len(plan.source_messages),
+                            "covered_through": plan.covered_through,
+                        }
+                    ):
+                        raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
+                    if plan.over_hard_limit:
+                        raise MemorySummaryError(
+                            "摘要失败且完整请求超过上下文硬上限",
+                            code="budget",
+                        )
+                    return
+                if summary_result.usage is not None:
+                    memory_usage = (
+                        summary_result.usage
+                        if memory_usage is None
+                        else memory_usage.merge(summary_result.usage)
+                    )
+                transient = SessionContext(
+                    messages=tuple(messages[history_start:]),
+                    persisted_summary=context.persisted_summary,
+                    modified_files=tuple(modified_files),
+                    verification=verification,
+                    unknown_effects=unknown_effects,
+                    verification_evidence=evidence,
+                    verification_failure=failed_snapshot,
+                    verification_required=verification_required,
+                    conversation_memory=conversation_memory,
+                    next_message_seq=next_message_seq,
+                    persisted_memory_revision=context.persisted_memory_revision,
+                    memory_pending_clear=context.memory_pending_clear,
+                )
+                committed = self.context_manager.commit_compaction(
+                    transient,
+                    plan,
+                    summary_result.candidate,
+                    summary_max_chars=self.memory_config.summary_max_chars,
+                )
+                if not self._log(
+                    {
+                        "status": "memory_compacted",
+                        "source_count": len(plan.source_messages),
+                        "retained_count": len(plan.retained_messages),
+                        "revision": committed.conversation_memory.revision,
+                        "covered_through": committed.conversation_memory.covered_through,
+                    }
+                ):
+                    raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
+                conversation_memory = committed.conversation_memory
+                messages[history_start:] = committed.messages
+                memory_compacted = True
+
+            normalize_history()
+            memory_message = conversation_memory_message(conversation_memory)
+            fixed = [*messages[:history_start]]
+            if memory_message is not None:
+                fixed.append(memory_message)
+            final_plan = self.context_manager.plan_compaction(
+                tuple(messages[history_start:]),
+                fixed_messages=fixed,
+                tools=tuple(provider_tools),
+                trigger_ratio=self.memory_config.trigger_ratio,
+                target_ratio=self.memory_config.target_ratio,
+                covered_through=conversation_memory.covered_through,
+            )
+            if final_plan.over_hard_limit:
+                raise MemorySummaryError(
+                    "两批摘要后请求仍超过上下文硬上限",
+                    code="budget",
+                )
+
+        async def prepare_review_memory() -> None:
+            """正常结束时只整理较早闭合任务，保留最近两项完整对话。"""
+
+            nonlocal conversation_memory, memory_usage, memory_calls, memory_warning
+            if (
+                self.memory_config.persistence != "reviewed_summary"
+                or context.memory_pending_clear
+                or memory_summary_failed
+                or cancellation.is_cancelled
+            ):
+                return
+            normalize_history()
+            plan = self.context_manager.plan_review_compaction(
+                tuple(messages[history_start:]),
+                covered_through=conversation_memory.covered_through,
+            )
+            if not plan.needs_compaction:
+                return
+            summarizer = self.memory_summarizer
+            if summarizer is None or not callable(getattr(summarizer, "summarize", None)):
+                memory_warning = "会话记忆候选未生成"
+                return
+            memory_calls += 1
+            try:
+                summary_result = await summarizer.summarize(
+                    conversation_memory,
+                    plan.source_messages,
+                    cancellation,
+                )
+                transient = SessionContext(
+                    messages=tuple(messages[history_start:]),
+                    persisted_summary=context.persisted_summary,
+                    modified_files=tuple(modified_files),
+                    verification=verification,
+                    unknown_effects=unknown_effects,
+                    verification_evidence=evidence,
+                    verification_failure=failed_snapshot,
+                    verification_required=verification_required,
+                    conversation_memory=conversation_memory,
+                    next_message_seq=next_message_seq,
+                    persisted_memory_revision=context.persisted_memory_revision,
+                    memory_pending_clear=context.memory_pending_clear,
+                )
+                committed = self.context_manager.commit_compaction(
+                    transient,
+                    plan,
+                    summary_result.candidate,
+                    summary_max_chars=self.memory_config.summary_max_chars,
+                )
+            except CancellationError:
+                raise
+            except MemorySummaryError as exc:
+                reason = memory_summary_failure_code(exc)
+                memory_warning = (
+                    f"会话记忆候选生成失败（{memory_summary_failure_label(reason)}）；"
+                    "执行结果不受影响"
+                )
+                self.observer.on_error(memory_warning)
+                if not self._log(
+                    {
+                        "status": "memory_review_failed",
+                        "failure_code": reason,
+                        "source_count": len(plan.source_messages),
+                        "covered_through": plan.covered_through,
+                    }
+                ):
+                    raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
+                return
+            except MemoryValidationError:
+                reason = "commit"
+                memory_warning = (
+                    f"会话记忆候选生成失败（{memory_summary_failure_label(reason)}）；"
+                    "执行结果不受影响"
+                )
+                self.observer.on_error(memory_warning)
+                if not self._log(
+                    {
+                        "status": "memory_review_failed",
+                        "failure_code": reason,
+                        "source_count": len(plan.source_messages),
+                        "covered_through": plan.covered_through,
+                    }
+                ):
+                    raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
+                return
+            if not self._log(
+                {
+                    "status": "memory_review_candidate",
+                    "source_count": len(plan.source_messages),
+                    "revision": committed.conversation_memory.revision,
+                    "covered_through": committed.conversation_memory.covered_through,
+                }
+            ):
+                raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
+            conversation_memory = committed.conversation_memory
+            messages[history_start:] = committed.messages
+            if summary_result.usage is not None:
+                memory_usage = (
+                    summary_result.usage
+                    if memory_usage is None
+                    else memory_usage.merge(summary_result.usage)
+                )
 
         def execution_context() -> SessionContext:
             return SessionContext(
                 modified_files=tuple(modified_files), verification=verification,
                 unknown_effects=unknown_effects, verification_evidence=evidence,
                 verification_failure=failed_snapshot, verification_required=verification_required,
+                conversation_memory=conversation_memory,
+                next_message_seq=next_message_seq,
+                persisted_memory_revision=context.persisted_memory_revision,
+                memory_pending_clear=context.memory_pending_clear,
             )
 
         def publish_state() -> None:
@@ -454,14 +749,32 @@ class CodingAgent:
                     verification_required = True
                     verification = "失败" if failed_snapshot is not None else "待验证"
             publish_state()
+            normalized_history = normalize_history()
+            current_complete = current_task_has_complete_round()
+            # 兼容关闭新记忆能力时的失败语义：未开始完整工具回合的任务
+            # 必须原样返回调用方上下文，不能仅因本地编号产生可见变化。
+            if rollback_task and not current_complete and memory_compacted:
+                current_index = next(
+                    (
+                        index
+                        for index, message in enumerate(normalized_history)
+                        if message.kind == "task" and message.task_id == current_task_id
+                    ),
+                    len(normalized_history),
+                )
+                rollback_history = normalized_history[:current_index]
+                rollback_next_message_seq = next_message_seq
+            else:
+                rollback_history = context.messages
+                rollback_next_message_seq = context.next_message_seq
             turn = SessionTurnResult(
                 replace(result, usage=accumulated_usage, unknown_effects=unknown_effects,
                         verification=verification, cleanup_failed=cleanup_bad),
                 SessionContext(
                     messages=(
-                        context.messages
-                        if rollback_task and not current_task_has_complete_round()
-                        else tuple(messages[history_start:])
+                        rollback_history
+                        if rollback_task and not current_complete
+                        else normalized_history
                     ),
                     persisted_summary=context.persisted_summary,
                     modified_files=tuple(modified_files),
@@ -470,8 +783,19 @@ class CodingAgent:
                     verification_evidence=evidence,
                     verification_failure=failed_snapshot,
                     verification_required=verification_required,
+                    conversation_memory=conversation_memory,
+                    next_message_seq=(
+                        rollback_next_message_seq
+                        if rollback_task and not current_complete
+                        else next_message_seq
+                    ),
+                    persisted_memory_revision=context.persisted_memory_revision,
+                    memory_pending_clear=context.memory_pending_clear,
                 ),
                 file_effects_observed=file_effects_observed,
+                memory_usage=memory_usage,
+                memory_calls=memory_calls,
+                memory_warning=memory_warning,
             )
             if turn.result.ok:
                 self._emit(event_sink, RuntimeCompleted(turn.result))
@@ -498,6 +822,28 @@ class CodingAgent:
                     RunResult(False, AUDIT_FAILURE_MESSAGE, 0), rollback_task=True
                 )
 
+        provider_tools = (
+            self.tools.definitions if self._protocol.tools_enabled else ()
+        )
+        try:
+            await prepare_structured_memory(provider_tools)
+        except CancellationError:
+            return turn_result(
+                RunResult(False, "任务已取消", 0, tool_calls, tuple(modified_files), verification),
+                rollback_task=True,
+            )
+        except _MemoryAuditFailure:
+            return turn_result(
+                self._audit_failure_result(0, tool_calls, modified_files, verification),
+                rollback_task=True,
+            )
+        except MemorySummaryError:
+            return turn_result(
+                RunResult(False, "上下文记忆整理失败，未发送模型请求", 0, tool_calls,
+                          tuple(modified_files), verification),
+                rollback_task=True,
+            )
+
         if self.plan_enabled:
             try:
                 plan_usage = await self._planning_round_async(
@@ -507,6 +853,7 @@ class CodingAgent:
                     verification,
                     cancellation,
                     event_sink,
+                    request_messages=request_view(),
                 )
             except CancellationError:
                 return turn_result(
@@ -543,9 +890,41 @@ class CodingAgent:
             self.observer.on_round_start(round_number, self.max_rounds)
             self._emit(event_sink, RoundStarted(round_number, self.max_rounds))
             started = time.perf_counter()
-            context_snapshot = self.context_manager.prepare(messages)
+            normalize_history()
+            try:
+                await prepare_structured_memory(provider_tools)
+            except CancellationError:
+                return turn_result(
+                    RunResult(False, "任务已取消", round_number - 1, tool_calls,
+                              tuple(modified_files), verification),
+                    rollback_task=True,
+                )
+            except _MemoryAuditFailure:
+                return turn_result(
+                    self._audit_failure_result(
+                        round_number - 1, tool_calls, modified_files, verification
+                    ),
+                    rollback_task=True,
+                )
+            except MemorySummaryError:
+                return turn_result(
+                    RunResult(False, "上下文记忆整理失败，未发送模型请求", round_number - 1,
+                              tool_calls, tuple(modified_files), verification),
+                    rollback_task=True,
+                )
+            assembled_messages = request_view()
+            context_snapshot = self.context_manager.prepare(assembled_messages)
+            if (
+                self.memory_config.compaction == "structured"
+                and context_snapshot.history_truncated
+            ):
+                return turn_result(
+                    RunResult(False, "结构化记忆模式拒绝静默裁剪历史", round_number - 1,
+                              tool_calls, tuple(modified_files), verification),
+                    rollback_task=True,
+                )
             request_messages = list(context_snapshot.messages)
-            if context_snapshot.compacted:
+            if context_snapshot.history_truncated:
                 self._emit(
                     event_sink,
                     ContextCompacted(
@@ -553,9 +932,6 @@ class CodingAgent:
                         after_chars=context_snapshot.character_count,
                     ),
                 )
-            provider_tools = (
-                self.tools.definitions if self._protocol.tools_enabled else ()
-            )
             try:
                 response = await self._request_provider_async(
                     request_messages,
@@ -643,10 +1019,15 @@ class CodingAgent:
 
             resolved = self._protocol.resolve_action(response)
             messages.extend(resolved.assistant_messages)
+            normalize_history()
             if response.usage is not None:
+                assistant_count = len(resolved.assistant_messages)
+                normalized_assistant = (
+                    messages[-assistant_count:] if assistant_count else []
+                )
                 self.context_manager.record_usage(
                     response.usage,
-                    [*request_messages, *resolved.assistant_messages],
+                    [*request_messages, *normalized_assistant],
                 )
             if not resolved.actions:
                 feedback = resolved.feedback or Message(
@@ -891,6 +1272,22 @@ class CodingAgent:
                         summary = f"{summary}；文件修改后尚未运行验证命令，或受覆盖文件状态证据已失效"
                     elif result.ok and verification_required and verification == "失败":
                         summary = f"{summary}；文件修改后的验证失败"
+                    if completed and self.memory_config.persistence == "reviewed_summary":
+                        try:
+                            await prepare_review_memory()
+                        except CancellationError:
+                            return turn_result(RunResult(
+                                False, "任务已取消", round_number, tool_calls,
+                                tuple(modified_files), verification,
+                            ))
+                        except _MemoryAuditFailure:
+                            return turn_result(
+                                self._audit_failure_result(
+                                    round_number, tool_calls, modified_files, verification
+                                )
+                            )
+                        if memory_warning:
+                            summary = f"{summary}；{memory_warning}"
                     return turn_result(
                         RunResult(
                             completed,
@@ -974,6 +1371,7 @@ class CodingAgent:
         verification: str,
         cancellation: CancellationToken,
         event_sink: EventSink | None,
+        request_messages: list[Message] | None = None,
     ) -> object:
         """任务执行前的规划阶段（round 0）：生成并注入分步计划。
 
@@ -984,7 +1382,8 @@ class CodingAgent:
         started = time.perf_counter()
         try:
             response = await self._request_provider_async(
-                [*messages, Message("user", PLANNING_PROMPT)],
+                [*(request_messages if request_messages is not None else messages),
+                 Message("user", PLANNING_PROMPT)],
                 (),
                 cancellation,
                 event_sink,

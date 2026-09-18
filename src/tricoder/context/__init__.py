@@ -2,17 +2,41 @@
 
 from tricoder.context.manager import (
     CONTEXT_COMPACTION_NOTICE,
+    CompactionPlan,
     ContextBudget,
     ContextManager,
     ContextSnapshot,
+)
+from tricoder.context.memory import (
+    ConversationMemory,
+    MemoryItem,
+    MemoryValidationError,
+    assign_message_sequences,
+    conversation_memory_message,
+    memory_from_json,
+    memory_to_json,
+    memory_source_ids,
+    merge_candidate,
+    validate_candidate,
 )
 from tricoder.context.spill import SpillError, SpillRecord, ToolResultSpillStore
 
 __all__ = [
     "CONTEXT_COMPACTION_NOTICE",
+    "CompactionPlan",
     "ContextBudget",
     "ContextManager",
     "ContextSnapshot",
+    "ConversationMemory",
+    "MemoryItem",
+    "MemoryValidationError",
+    "assign_message_sequences",
+    "conversation_memory_message",
+    "memory_from_json",
+    "memory_to_json",
+    "memory_source_ids",
+    "merge_candidate",
+    "validate_candidate",
     "SpillError",
     "SpillRecord",
     "ToolResultSpillStore",

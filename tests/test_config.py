@@ -11,6 +11,7 @@ from tricoder.models import (
     ExtensionsConfig,
     HooksConfig,
     MCPConfig,
+    MemoryConfig,
     SkillsConfig,
     WorktreeConfig,
 )
@@ -32,6 +33,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(HooksConfig(), config.hooks)
         self.assertEqual(WorktreeConfig(), config.worktree)
         self.assertEqual(AgentsConfig(), config.agents)
+        self.assertEqual(MemoryConfig(), config.memory)
+
+    def test_memory_config_is_strict_and_requires_structured_for_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[memory]\ncompaction = "structured"\npersistence = "reviewed_summary"\n'
+                'trigger_ratio = 0.75\ntarget_ratio = 0.50\nsummary_max_chars = 1200\n'
+                'summary_timeout_seconds = 3.5\n',
+                encoding="utf-8",
+            )
+            config = load_config(
+                provider="openai",
+                workspace=workspace,
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+        self.assertEqual("structured", config.memory.compaction)
+        self.assertEqual("reviewed_summary", config.memory.persistence)
+        self.assertEqual(0.75, config.memory.trigger_ratio)
+        self.assertEqual(3.5, config.memory.summary_timeout_seconds)
+
+        invalid_documents = (
+            '[memory]\npersistence = "reviewed_summary"\n',
+            '[memory]\ncompaction = "structured"\ntarget_ratio = 0.9\ntrigger_ratio = 0.8\n',
+            '[memory]\ncompaction = "structured"\nallow_unreviewed = true\n',
+        )
+        for document in invalid_documents:
+            with self.subTest(document=document), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                (workspace / ".tricoder.toml").write_text(document, encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        provider="openai",
+                        workspace=workspace,
+                        environ={"OPENAI_API_KEY": "test-key"},
+                    )
 
     def test_extension_config_rejects_invalid_transport_duplicate_ids_and_plaintext_secret(self) -> None:
         """宽松解析会掩盖错误服务器或把明文凭据纳入项目版本控制。"""

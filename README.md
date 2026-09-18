@@ -10,8 +10,8 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 - **统一 Provider 边界**：OpenAI、DeepSeek、GLM 的 OpenAI-compatible SSE 流统一归一化为类型化文本、工具、usage 与完成事件；同步 `complete()` 仍保持兼容。
 - **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
 - **可控本地执行**：读取、检索（`search_text` 支持正则、基础 `.gitignore` 常用语义（尾随 `/` 目录规则按任意层级匹配）与二进制/超大文件跳过，正则长度与单行长度受限以防灾难性回溯；`glob_files` 按相对模式定位文件，pattern 长度、`**` 数量与扫描结果规模均受限）、编辑、创建文件和运行受限命令；`git_diff` 只读展示工作区未提交变更统计；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除或重命名；`--read-only` 禁止 `edit_file`、`create_file`、`apply_patch` 等写入；写操作与命令执行需要人工审批。
-- **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态。
-- **本地斜杠命令**：`/session`、`/model`、`/status`、`/clear` 等命令不会发送给 Provider。
+- **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态；可选结构化任务记忆默认关闭。
+- **本地斜杠命令**：`/session`、`/model`、`/status`、`/memory`、`/clear` 等命令不会发送给 Provider。
 - **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。
 - **异步与可取消**：异步 Agent 是规范执行路径；取消信号可停止 Provider 读取、重试退避、后续工具和运行中的受管命令，且不会执行尚未完整生成的工具调用。
 - **token-aware 上下文**：优先使用 Provider 的真实 usage 作为前缀锚点，缺失时按 UTF-8 字节保守估算；压缩始终以完整任务块和工具回合为单位。
@@ -27,6 +27,28 @@ Context Manager 会把同时存在的 `input_tokens` 与 `output_tokens` 绑定�
 缓存相关字段是观测值，不是本地缓存状态：单个用量字段缺失或无效时，界面会显示 `-`，不会将未知值当作 `0`；整个 `usage` 缺失、无效或所有字段均无效时，本轮不显示用量行。缓存命中率仅在服务商同时返回可计算的输入和缓存 token 时显示。
 
 本版本没有启用显式 cache key，也没有实现延长缓存保留期等缓存策略；实际缓存行为、命中与保留规则均由所选 Provider 决定。
+
+## 结构化会话记忆（默认关闭）
+
+TriCoder 可把较早且已闭合的完整任务块整理为结构化的目标、约束、决策和待办，同时保留近期完整对话。摘要使用同一个 Provider 的独立无工具调用，输入与输出均有上限；候选通过版本、来源、覆盖范围和保守合并校验后，才会原子替换对应历史。工具调用与结果成组保留，摘要失败或取消不会先删除消息。模型生成的记忆不包含也不能改变权限、审批、验证证据或 `unknown_effects`；这些可信执行状态始终独立维护。
+
+摘要 Provider 只生成 `goal`、`constraints`、`decisions` 与 `open_items` 四类低信任语义字段；schema 版本、revision、generation 和覆盖位置由本地程序填写。解析器接受纯 JSON，以及包住整个响应且不带额外说明的单个 JSON 代码围栏，仍会拒绝未知字段、伪造来源、工具调用和截断响应。失败时 CLI 只显示固定诊断类别（例如 JSON 格式无效、响应截断或 Provider 请求失败），不会展示或审计模型原文；原始历史与现有记忆保持不变。
+
+新能力默认完全关闭。要只启用当前进程内的结构化压缩，可在 `.tricoder.toml` 中配置：
+
+```toml
+[memory]
+compaction = "structured"
+persistence = "off"
+trigger_ratio = 0.80
+target_ratio = 0.65
+summary_max_chars = 6000
+summary_timeout_seconds = 15
+```
+
+如需重启恢复，再把 `persistence` 改为 `"reviewed_summary"`。此模式只生成待审候选，不会自动写入 SQLite；使用 `/memory` 查看当前候选，`/memory edit <条目ID>` 在本地预览并确认修改，`/memory save` 查看数据库位置和精确 JSON 后再次确认保存。持久化只接受经过校验、未命中敏感内容检查的结构化字段，不保存源码正文、原始工具输出、真实凭据或可信执行状态。记忆整理会增加额外模型调用和 token 用量，CLI 将其与业务调用分开统计。
+
+`/clear` 会递增记忆代次、清除当前消息和结构化语义记忆，并删除该 Session 已保存的语义记忆；修改文件、验证/审批状态、`unknown_effects` 和审计记录仍按原有安全规则处理。数据库删除失败时，本进程会阻止保存、编辑和重新加载旧语义记忆，退出重试持久化前会保持明确警告。把 `[memory]` 两项改回 `off` 可恢复旧行为且不会加载已保存语义记忆，但已经被成功压缩并替换的原始历史无法从摘要反向恢复。
 
 ## 5 分钟快速体验
 
@@ -111,6 +133,14 @@ max_context_chars = 80000
 timeout = 30
 tool_protocol = "native"
 plan = true
+
+[memory]
+compaction = "off"
+persistence = "off"
+trigger_ratio = 0.80
+target_ratio = 0.65
+summary_max_chars = 6000
+summary_timeout_seconds = 15
 
 [providers.glm]
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
@@ -279,7 +309,10 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/help` | 显示命令、参数和示例。 |
 | `/status` | 显示当前 Session、工作区、Provider、模型、只读、验证及上下文状态。 |
 | `/model` | 显示 OpenAI、DeepSeek、GLM 的模型并按序号切换。 |
-| `/clear` | 仅在输入 `y` 或 `yes` 后清除当前 Session 的运行时上下文和持久化摘要。 |
+| `/memory` | 查看当前结构化目标、约束、决策、待办、revision 与保存状态。 |
+| `/memory edit <条目ID>` | 输入新文本和作用域后预览本地修改；确认后只更新内存候选，不自动保存。 |
+| `/memory save` | 预览数据库位置和精确 JSON；确认后以 revision 比较写入当前 Session。 |
+| `/clear` | 仅在输入 `y` 或 `yes` 后清除当前 Session 的运行时上下文、旧安全摘要和结构化语义记忆。 |
 | `/diff` | 本地展示当前 Session 最近一次非空任务的正向 unified diff，不发送给 Provider。 |
 | `/undo` | 先本地展示当前 Session 最近一次非空任务的完整反向 unified diff；仅在输入 `y` 或 `yes` 后尝试撤销整组变更。任何外部内容、权限模式或文件身份冲突都会拒绝全部写入；`--read-only` 会在预览或确认前拒绝撤销。 |
 | `/session` | 列出全部 Session，并按序号选择。 |
@@ -294,7 +327,7 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 
 `/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先构建并验证目标配置、策略、工具和 Agent；任何一步失败都会保留原 Session 和原工作区。
 
-`/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据和审计记录；它会清除当前会话的消息历史、可持久化摘要，以及该 Session 的临时大型工具结果。
+`/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据、验证/审批安全状态和审计记录；它会清除当前会话的消息历史、可持久化摘要、结构化语义记忆，以及该 Session 的临时大型工具结果。语义记忆清除失败时不会恢复旧内容，本进程会标记“持久化清除待重试”并阻止 `/memory save`、编辑和旧记忆加载。
 
 内置文件工具失败不等于没有改动：已确认的残留路径仍会计入任务与会话状态，并使旧验证变为“待验证”。如果文件身份变化或后态无法核实，Session 会保留“文件影响未确认”（UNKNOWN）标记；该标记跨轮次及重启保存，当前 Session 的普通任务和撤销均被阻止。请先自行检查实际文件，再通过 `/clear` 的明确确认解除阻断；拒绝确认会保留阻断，清除记录不会恢复或撤销文件。`/status` 会显示未确认提示。
 
@@ -385,9 +418,9 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 - Windows：`%LOCALAPPDATA%\TriCoder\sessions.db`；若未设置 `LOCALAPPDATA`，使用 `%USERPROFILE%\AppData\Local\TriCoder\sessions.db`。
 - 其他系统：`$XDG_STATE_HOME/tricoder/sessions.db`；若未设置 `XDG_STATE_HOME`，使用 `~/.local/state/tricoder/sessions.db`。
 
-每个 Session 独立保存名称、工作区绝对路径、Provider、模型、时间戳、修改文件路径、验证状态和受限长度的安全摘要。进程运行期间，每个已打开 Session 有独立的完整消息上下文；重启后只恢复安全摘要和结构化元数据。Agent 如需源码，必须重新调用读取工具。
+每个 Session 独立保存名称、工作区绝对路径、Provider、模型、时间戳、修改文件路径、验证状态和受限长度的安全摘要。进程运行期间，每个已打开 Session 有独立的完整消息上下文；默认重启后只恢复旧安全摘要和结构化执行元数据。只有显式启用 `persistence = "reviewed_summary"` 并确认 `/memory save` 后，才会额外恢复经审阅的结构化目标、约束、决策与待办；Agent 如需源码，仍必须重新调用读取工具。
 
-会话持久化只保存受控结构化元数据，不保存任何用户任务或模型 `RunResult.summary` 的自由文本原文。无论内容是空白、中英文自然语言、源码、命令、工具输出、Provider 原始响应、动作 JSON、认证信息还是完整消息历史，SQLite 中的 `requirements_summary` 都只保存长度占位；运行结果只保存固定格式的成功/失败、修改文件数量和规范化验证状态。成功编辑或创建的文件路径由工作区策略解析后以规范相对路径保存，不会保存原始绝对路径或 `..` 形式。这个策略不依赖“看起来像代码或命令”的启发式判断。
+旧会话持久化只保存受控结构化元数据，不保存任何用户任务或模型 `RunResult.summary` 的自由文本原文。无论内容是空白、中英文自然语言、源码、命令、工具输出、Provider 原始响应、动作 JSON、认证信息还是完整消息历史，SQLite 中的 `requirements_summary` 都只保存长度占位；运行结果只保存固定格式的成功/失败、修改文件数量和规范化验证状态。成功编辑或创建的文件路径由工作区策略解析后以规范相对路径保存，不会保存原始绝对路径或 `..` 形式。可选的 `conversation_memory` 表仅保存用户明确预览确认过的结构化语义字段和消息序号，不保存源码正文、原始工具输出、权限、审批、验证证据或 `unknown_effects`。关闭持久化后不会读取该表，但也不会隐式删除已保存候选。
 
 完整消息上下文仅保留在当前进程的 Session 中，CLI 仍会在当前轮显示 `RunResult.summary`；重启后只能恢复上述结构化元数据和长度占位。该边界仍需配合工作区权限和本地存储权限管理。
 

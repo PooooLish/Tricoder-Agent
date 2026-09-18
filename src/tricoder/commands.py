@@ -43,13 +43,19 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
         "查看权限级别，或切换 strict / relaxed / fullaccess（fullaccess 放行全部非危险工具）",
         takes_argument=True,
     ),
+    "memory": CommandSpec(
+        "查看结构化记忆，或预览确认 edit/save",
+        takes_argument=True,
+    ),
     "exit": CommandSpec("保存安全记忆并退出"),
 }
 
 _SESSION_SUBCOMMANDS = {"new", "current", "rename"}
+_MEMORY_SUBCOMMANDS = {"save", "edit"}
 # 简单命令集合由注册表派生；session/permission 是带参数命令。
 _SIMPLE_COMMANDS = frozenset(
-    name for name, spec in _COMMAND_SPECS.items() if name not in {"session", "permission"}
+    name for name, spec in _COMMAND_SPECS.items()
+    if name not in {"session", "permission", "memory"}
 )
 
 
@@ -93,6 +99,24 @@ def parse_command(text: str) -> ParsedCommand:
         if argument is not None and argument not in {"strict", "relaxed", "fullaccess"}:
             raise CommandError("permission 只能是 strict、relaxed 或 fullaccess")
         return ParsedCommand("permission", None, argument)
+
+    if name == "memory":
+        if not remainder:
+            return ParsedCommand("memory", None, None)
+        memory_parts = remainder.split(maxsplit=1)
+        subcommand = memory_parts[0].lower()
+        argument = memory_parts[1].strip() if len(memory_parts) == 2 else None
+        if subcommand not in _MEMORY_SUBCOMMANDS:
+            raise CommandError(f"不支持的记忆子命令：{memory_parts[0]}。")
+        if subcommand == "save":
+            if argument:
+                raise CommandError("命令 /memory save 不接受参数。")
+            return ParsedCommand("memory", "save", None)
+        if not argument:
+            raise CommandError("命令 /memory edit 需要条目 ID。")
+        if len(argument.split()) != 1:
+            raise CommandError("记忆条目 ID 不能包含空格。")
+        return ParsedCommand("memory", "edit", argument)
 
     if name != "session":
         raise CommandError(f"未知命令：/{name}。请输入 /help 查看可用命令。")

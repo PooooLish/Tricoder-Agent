@@ -1,22 +1,48 @@
 # Project: tricoder-cli
 
-## 2026-09-14 可靠性前五项任务计划（实施完成并通过独立整体复审）
+## 2026-09-19 真实 Provider 会话记忆兼容性修复
 
-- 用户要求将失败改动追踪、工具错误分类、同批失败传播、取消清理、验证绑定文件状态五项按计划实施。
-- 计划：`docs/superpowers/plans/2026-09-14-tricoder-reliability-top5.md`。
-- 实施顺序：T1→T2→T3→T4→T5；每项采用 RED→GREEN、聚焦回归、自审和独立复审。
-- 当前隔离分支：`codex/reliability-top5`；不覆盖主工作区的 `test/` 用户实验改动。
-- 当前状态：T1–T5 与 I01–I07 已完成，最终独立整体复审 PASS，Critical／Important／Minor 均为 0。整体复审后又关闭了原生 `asyncio.Task.cancel()` 迟到写、缺失路径误报策略拒绝、MCP 冷导入循环和 live-process 取消夹具四个问题；惰性包级导出保持 `MCPToolHandler` 兼容。实施前 `baseline-integration` 及整改前 `baseline-final-remediation` 均已机械复制并核对。
-- T5 关键决定：只信任内置命令对象和本地 ToolContext 能力；一般命令/MCP 的未知文件影响不因退出零而消失。证据只驻内存，数据库加载的历史通过/失败均降为待验证。
-- T5 修复裁决：只有 complete、同 scope 且 digest 明确变化或本地确认写入才能解除旧失败；每任务本地通道在通知前发布新验证事实/UNKNOWN，异常收尾仍保留失败与阻断。T1 未消费写入、T3 配对/首异常及 T4 清理所有权保留，取消/清理失败独立撤销 pass。
-- T5 第 2 轮裁决：账本真实提交/首次 taint 游标区分已消费旧写与新写；Registry 在输出处理前发布与 Agent 共用的可信纯 transition；获批后的非只读外部 dispatch 提前登记 UNKNOWN，未批准/预取消不登记。异步交付之后的取消窗口按 UNKNOWN 保守处理，不用一次普通检查替代 clear。
-- T5 第 3 轮裁决：Runtime 在任意 Agent 前 seed 原状态/游标 0，正常和异常收尾均合并可信发布；验证必须通过本地 scope authority 门禁。Agent 合成取消前刷新已发布失败；新净零提交以真实提交路径表达 CONFIRMED，立即失效证据但不制造 undo 净变更；begin/seal 与修订读取共用短锁。新增 7 项正式测试，完整证据见报告 Fix round 3。
-- T5 第 4 轮裁决：Runtime 对 scope-owned evidence 取得结束前当前快照，扫描异常/不完整不再用 evidence.after 自证；最终 token 取消独立阻断，不给纯读伪造验证需求。扫描留在已有同步任务所有权/cleanup scope 内，普通扫描异常 fail closed，Native/structured 取消沿原异常收尾并保留首异常；无新后台线程或硬超时承诺。
-- T5 第 5 轮裁决：私有取消接收标志与 cancel_current 共用状态锁，seal/current/memory 准备后、persist 前决定结果并关闭接收；已接受取消进入 result/context/memory，提交后取消返回 False 而任务所有权仍保留。final capture 本地阶段标记使 BaseException 沿既有异常对账撤销 pass、保留 failure 与首异常；不把 Agent/observer 的其他异常一概清证据。
-- T5 第 6 轮裁决：仅将 Runtime 三处“已有主异常后的补偿 seal/persist”捕获扩为 BaseException，原裸 raise 保留同一主异常及 Native cause。正常扫描/对账/持久化异常边界不扩大；失败证据撤销、dirty 与任务取消复位控制保留，不伪造补偿保存成功。
-- T5 成本与限制：合成 256 文件/4 MiB 扫描 1.401 秒；底层扫描接口默认 3 秒，生产 `VerificationScope` 根据 Windows CI 实测使用 10 秒协作式预算，不保证阻塞系统调用硬超时。敏感条目不读正文但使覆盖不完整。Windows 离线已验，POSIX 与真实外部 Provider/MCP 未验。
-- 集成证据：I01–I07 7/7 通过；最终 Windows 完整串行 `unittest discover -s tests -q` 为 1,077 项通过、6 项平台条件跳过。最终整改定向复审及测试稳定性复审均为 PASS；详细记录见 `runtime/reliability-top5/integration-report.md` 与 `runtime/reliability-top5/final-remediation-review.md`。
-- 下一步：向用户交付工作树与证据；POSIX、Python 3.12、真实 Provider 和真实外部 MCP 仍需另行验证。不自动暂存、提交、合并或发布。
+- 真实试用确认业务工具任务成功，但收尾记忆候选被严格解析器拒绝；旧 UI 只显示统一警告，无法区分 JSON、截断、超时和 Provider 故障。
+- 修复采用低信任语义对象：模型只返回目标、约束、决定和待办，本地注入 schema/revision/generation/covered_through；兼容包住整个响应的单个 JSON 围栏，但继续拒绝附加说明、未知字段、伪造来源和工具调用。
+- `MemorySummaryError` 增加固定失败类别；UI 与审计仅记录安全类别，不记录 Provider 原文。失败类别审计本身失败时继续按现有 fail-closed 规则停止且不提交候选。
+- `ContextSnapshot` 区分协议噪声归一化与预算裁剪；结构化模式只拒绝真正的预算裁剪。已经纠错并形成完整工具回合的旧任务可作为原子摘要来源，原始 Session 历史不会因请求视图归一化而丢失。
+- 新增真实故障形态的回归测试；未读取密钥或真实会话数据库，未调用真实 Provider。最终验证证据记录在 `runtime/session-memory/provider-compatibility-repair.md`。
+- 最终验证：记忆专项 36 项、ContextManager 8 项、完整项目 1128 项均通过；完整项目有 6 个既有平台/权限跳过，compileall 与 `git diff --check` 退出码均为 0。
+
+## 2026-09-18 会话记忆改造（P0—P5 已完成）
+
+- 文档：`docs/superpowers/plans/2026-09-18-tricoder-session-memory.md`；唯一目标目录为 `D:\MaHong\AGENT_WORKSPACE_V2\projects\tricoder-cli`，不修改或创建迁移副本。
+- 设计：结构化任务记忆＋近期完整回合；可信验证、审批和未知影响继续由程序管理。先内存摘要，后可选预览确认持久化，再验证恢复与 clear。
+- P0—P5 六阶段、M01—M20 验收场景；默认关闭新能力，未添加依赖，未读取密钥或调用真实 Provider。
+- 已检查当前代码存在验证证据与未知影响字段，旧计划的“尚未实施”标题不作为当前功能状态依据。
+- P0 已完成：读取规则、README、当前代码和事务/清除/命令路由；确认开始时 `src/tricoder/` 与 `tests/` 无用户未提交修改，既有手工实验与计划改动保持不动。
+- P0 新鲜基线：context 8、sessions 17、session runtime 59、cancellation 7 项测试均通过；证据见 `runtime/session-memory/baseline.md`。未调用真实模型。
+- P1 已完成：新增结构化记忆模型、严格 JSON/来源/长度校验、保守合并、稳定消息编号及 Agent 字段传播；9 项新增测试与 101 项 Agent 邻接回归通过，证据见 `runtime/session-memory/p1.md`。
+- P2 已完成：上下文预算纳入固定消息、工具 schema、输出预留及 token/字符限制；只压缩连续闭合任务前缀，工具调用与结果不拆分；校验成功后原子提交，证据见 `runtime/session-memory/p2.md`。
+- P3 已完成：独立无工具异步摘要、15 秒可配置超时、取消/截断/非法 JSON 失败关闭、最多两批总结、低信任请求视图注入和独立 memory usage；默认 off 无新增调用，证据见 `runtime/session-memory/p3.md`。
+- P4 已完成：新增独立 `conversation_memory` 表、事务 CAS、合成旧库升级、reviewed-summary 恢复、`/memory` 查看/编辑/保存的精确预览确认。候选文本不写审计，关闭模式不加载也不写语义内容，证据见 `runtime/session-memory/p4.md`。
+- P5 已完成：`/clear` 递增 generation、清除消息与目标 Session 的语义行，数据库失败进入 pending-clear 并阻止旧记忆复活；补齐取消、会话隔离、失败重试、长历史对比、README 和 M01—M20 映射，证据见 `runtime/session-memory/p5.md` 与 `runtime/session-memory/acceptance.md`。
+- 设计调整：正常任务结束的 reviewed 候选固定保留最近两项完整任务；记忆替换改为审计元数据写入成功后才提交，审计失败沿用既有 fail-closed 语义。SQLite 在初始化时创建空表，但 `persistence=off` 不写入语义行。
+- 本次最终验证：结构模型 9 项、记忆专项 30 项、邻接回归 162 项均通过；最终完整项目 `Ran 1122 ... OK (skipped=6)`，跳过项均为既有平台/权限门控，本次记忆测试无跳过。未验证真实 Provider 摘要质量、Linux/macOS 和真实用户数据库迁移。
+- 下一步：如需实际试用，先在非敏感测试会话启用 `[memory] compaction="structured"`；确认候选质量后再启用 `persistence="reviewed_summary"` 并通过 `/memory save` 保存。默认配置继续保持 off。
+
+## 2026-09-14 LangGraph 独立副本迁移计划（尚未实施）
+
+- 用户要求保留原代码，在独立副本迁移；本次只编写工程文档。
+- 文档：`docs/superpowers/plans/2026-09-14-tricoder-langgraph-safe-migration.md`。
+- 拟定副本：`D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-langgraph`；实施时原仓库只读，环境、会话、审计、暂存和测试工作区均隔离。
+- 设计：LangGraph 仅替换编排，保留可信工具入口；首版顺序执行、不启用磁盘 checkpoint 或崩溃自动续跑。M0—M5 六阶段，A01—A27 验收场景，包含回退演练。
+- 当前未复制代码、未安装依赖、未改 src/tests、未执行迁移测试；已有用户修改保持原样。文档静态检查不代表迁移验收通过。
+- 下一步：实施授权后重新检查源工作树，从 M0 审核复制清单开始；依赖安装与 Git 操作按实际授权处理。
+
+## 2026-09-14 可靠性前五项任务计划（尚未实施）
+
+- 用户要求将失败改动追踪、工具错误分类、同批失败传播、取消清理、验证绑定文件状态五项写成完整计划。
+- 计划：[2026-09-14-tricoder-reliability-top5.md](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/docs/superpowers/plans/2026-09-14-tricoder-reliability-top5.md)。包含共享状态接口、改动文件、分阶段兼容、SQLite 最小状态迁移、实现步骤、验收矩阵、测试命令、排期、回退及交接。
+- 关键决定为拟议设计：失败批次保守停止、未知副作用不静默消失、审批单次结束、验证前后与 finish 前核对文件状态。实施顺序 T1→T2→T3→T4→T5。
+- 当前状态：只完成计划；没有修改 src/ 或 tests/、运行项目测试、调用模型、安装依赖或提交。已有 test/ 用户改动保持原样。
+- 文档静态核验见 runtime/reliability-top5/plan-verification.json；示例仅做语法解析，非新增接口已实现或测试通过的证明。
+- 下一步：用户要求实施时，从 T1 基线与真实残留复现开始；执行前重新核对工作区变化，不将现有待复现风险当作已确认缺陷。
 
 ## Status
 

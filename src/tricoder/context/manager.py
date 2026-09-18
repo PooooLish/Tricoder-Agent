@@ -6,7 +6,13 @@ import json
 from dataclasses import dataclass, replace
 from typing import Iterable, Literal, Sequence
 
-from tricoder.models import Message, TokenUsage
+from tricoder.context.memory import (
+    ConversationMemory,
+    MemoryValidationError,
+    merge_candidate,
+    source_id_for_sequence,
+)
+from tricoder.models import Message, SessionContext, TokenUsage, ToolDefinition
 from tricoder.protocols import ActionProtocol
 
 
@@ -43,6 +49,23 @@ class ContextSnapshot:
     character_count: int
     compacted: bool
     token_source: Literal["provider", "estimate"]
+    history_truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionPlan:
+    """无网络压缩计划；只选择可原子替换的连续、完整历史前缀。"""
+
+    source_messages: tuple[Message, ...]
+    retained_messages: tuple[Message, ...]
+    covered_through: int
+    needs_compaction: bool
+    before_chars: int
+    after_chars: int
+    before_estimated_tokens: int
+    after_estimated_tokens: int
+    over_hard_limit: bool
+    reason: str | None = None
 
 
 class ContextManager:
@@ -74,12 +97,17 @@ class ContextManager:
             prepared = self._prepare_token_budget(copied)
         prepared_tuple = tuple(prepared)
         estimated, source = self._estimate_with_anchor(prepared_tuple)
+        copied_tuple = tuple(copied)
         return ContextSnapshot(
             messages=prepared_tuple,
             estimated_tokens=estimated,
             character_count=sum(message.character_budget() for message in prepared_tuple),
-            compacted=prepared_tuple != tuple(copied),
+            compacted=prepared_tuple != copied_tuple,
             token_source=source,
+            history_truncated=self._introduced_compaction_notice(
+                copied_tuple,
+                prepared_tuple,
+            ),
         )
 
     def prepare_generic(self, messages: Iterable[Message]) -> ContextSnapshot:
@@ -89,12 +117,210 @@ class ContextManager:
         prepared = self._compact_generic_chars(copied)
         prepared_tuple = tuple(prepared)
         estimated, source = self._estimate_with_anchor(prepared_tuple)
+        copied_tuple = tuple(copied)
         return ContextSnapshot(
-            prepared_tuple,
-            estimated,
-            sum(message.character_budget() for message in prepared_tuple),
-            prepared_tuple != tuple(copied),
+            messages=prepared_tuple,
+            estimated_tokens=estimated,
+            character_count=sum(message.character_budget() for message in prepared_tuple),
+            compacted=prepared_tuple != copied_tuple,
+            token_source=source,
+            history_truncated=self._introduced_compaction_notice(
+                copied_tuple,
+                prepared_tuple,
+            ),
+        )
+
+    @staticmethod
+    def _introduced_compaction_notice(
+        original: tuple[Message, ...],
+        prepared: tuple[Message, ...],
+    ) -> bool:
+        """区分预算裁剪与只影响请求视图的协议噪声归一化。"""
+
+        notice = Message("system", CONTEXT_COMPACTION_NOTICE)
+        return prepared.count(notice) > original.count(notice)
+
+    def plan_compaction(
+        self,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[ToolDefinition] = (),
+        fixed_messages: Sequence[Message] = (),
+        output_reserve_chars: int = 0,
+        output_reserve_tokens: int = 0,
+        trigger_ratio: float = 0.80,
+        target_ratio: float = 0.65,
+        covered_through: int = 0,
+    ) -> CompactionPlan:
+        """选择最旧的完整任务块，不发起网络请求也不修改 Session。
+
+        工具 Schema 和输出预留是请求的一部分，不能只用历史消息长度判断。
+        当前（最后）任务永不进入候选；若固定内容或单个当前任务本身超限，
+        返回明确的 ``over_hard_limit``，调用方应停止而不是反复总结。
+        """
+
+        if not (
+            isinstance(target_ratio, (int, float))
+            and not isinstance(target_ratio, bool)
+            and isinstance(trigger_ratio, (int, float))
+            and not isinstance(trigger_ratio, bool)
+            and 0 < target_ratio < trigger_ratio < 1
+        ):
+            raise ValueError("压缩比例必须满足 0 < target_ratio < trigger_ratio < 1")
+        for name, value in (
+            ("output_reserve_chars", output_reserve_chars),
+            ("output_reserve_tokens", output_reserve_tokens),
+            ("covered_through", covered_through),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} 必须是非负整数")
+
+        copied = tuple(messages)
+        fixed = tuple(fixed_messages)
+        tool_chars = self._tool_definition_chars(tools)
+        tool_tokens = self._estimate_text_tokens(tool_chars)
+        before_chars, before_tokens = self._request_cost(
+            (*fixed, *copied),
+            tool_chars=tool_chars,
+            tool_tokens=tool_tokens,
+            output_reserve_chars=output_reserve_chars,
+            output_reserve_tokens=output_reserve_tokens,
+        )
+        over_trigger = self._over_ratio(before_chars, before_tokens, trigger_ratio)
+        over_hard = self._over_ratio(before_chars, before_tokens, 1.0)
+        if not over_trigger:
+            return CompactionPlan(
+                (), copied, covered_through, False,
+                before_chars, before_chars, before_tokens, before_tokens, over_hard,
+            )
+
+        removable_ends = self._removable_task_prefixes(copied, covered_through)
+        if not removable_ends:
+            reason = "固定提示或当前完整任务组超过上下文硬上限" if over_hard else "没有可安全压缩的已闭合历史组"
+            return CompactionPlan(
+                (), copied, covered_through, False,
+                before_chars, before_chars, before_tokens, before_tokens, over_hard, reason,
+            )
+
+        chosen_end = 0
+        after_chars, after_tokens = before_chars, before_tokens
+        for end in removable_ends:
+            retained = copied[end:]
+            after_chars, after_tokens = self._request_cost(
+                (*fixed, *retained),
+                tool_chars=tool_chars,
+                tool_tokens=tool_tokens,
+                output_reserve_chars=output_reserve_chars,
+                output_reserve_tokens=output_reserve_tokens,
+            )
+            chosen_end = end
+            if not self._over_ratio(after_chars, after_tokens, target_ratio):
+                break
+
+        source = copied[:chosen_end]
+        retained = copied[chosen_end:]
+        sequences = [
+            message.message_seq
+            for message in source
+            if message.message_seq is not None
+        ]
+        if not sequences:
+            raise MemoryValidationError("压缩候选缺少稳定消息序号")
+        covered = max(sequences)
+        after_hard = self._over_ratio(after_chars, after_tokens, 1.0)
+        return CompactionPlan(
             source,
+            retained,
+            covered,
+            True,
+            before_chars,
+            after_chars,
+            before_tokens,
+            after_tokens,
+            after_hard,
+            "压缩后仍超过上下文硬上限" if after_hard else None,
+        )
+
+    def commit_compaction(
+        self,
+        context: SessionContext,
+        plan: CompactionPlan,
+        candidate: ConversationMemory,
+        *,
+        summary_max_chars: int = 6_000,
+    ) -> SessionContext:
+        """校验成功后一次替换记忆与对应历史；任何失败都不修改原对象。"""
+
+        previous = context.conversation_memory
+        if not isinstance(previous, ConversationMemory):
+            raise MemoryValidationError("SessionContext 的会话记忆类型无效")
+        if plan.covered_through <= previous.covered_through:
+            return context
+        if not plan.source_messages:
+            raise MemoryValidationError("压缩计划没有可提交的来源消息")
+        source_count = len(plan.source_messages)
+        if tuple(context.messages[:source_count]) != plan.source_messages:
+            raise MemoryValidationError("压缩来源已变化，拒绝提交过期候选")
+        if tuple(context.messages[source_count:]) != plan.retained_messages:
+            raise MemoryValidationError("压缩保留历史已变化，拒绝提交过期候选")
+        if candidate.covered_through != plan.covered_through:
+            raise MemoryValidationError("候选记忆覆盖位置与压缩计划不一致")
+        allowed_sources = {
+            source_id_for_sequence(message.message_seq)
+            for message in plan.source_messages
+            if message.message_seq is not None
+        }
+        merged = merge_candidate(
+            previous,
+            candidate,
+            allowed_source_ids=allowed_sources,
+            max_chars=summary_max_chars,
+        )
+        return replace(
+            context,
+            messages=plan.retained_messages,
+            conversation_memory=merged,
+        )
+
+    def plan_review_compaction(
+        self,
+        messages: Sequence[Message],
+        *,
+        covered_through: int,
+        keep_recent_tasks: int = 2,
+    ) -> CompactionPlan:
+        """任务正常结束时选择较早历史，保留近期完整任务供人工检查。"""
+
+        if type(keep_recent_tasks) is not int or keep_recent_tasks < 1:
+            raise ValueError("keep_recent_tasks 必须是正整数")
+        copied = tuple(messages)
+        before_chars = self._chars(copied)
+        before_tokens, _source = self._estimate_with_anchor(copied)
+        ends = self._removable_task_prefixes(copied, covered_through)
+        # N 个任务有 N-1 个可移除端点；必须至少留下 keep_recent_tasks 个。
+        if len(ends) < keep_recent_tasks:
+            return CompactionPlan(
+                (), copied, covered_through, False,
+                before_chars, before_chars, before_tokens, before_tokens, False,
+            )
+        chosen_end = ends[-keep_recent_tasks]
+        source = copied[:chosen_end]
+        retained = copied[chosen_end:]
+        sequences = [message.message_seq for message in source if message.message_seq is not None]
+        if not sequences:
+            raise MemoryValidationError("记忆保存候选缺少稳定消息序号")
+        after_chars = self._chars(retained)
+        after_tokens, _source = self._estimate_with_anchor(retained)
+        return CompactionPlan(
+            source,
+            retained,
+            max(sequences),
+            True,
+            before_chars,
+            after_chars,
+            before_tokens,
+            after_tokens,
+            False,
         )
 
     def record_usage(
@@ -330,6 +556,84 @@ class ContextManager:
             rounds.append(messages[index:end])
             index = end
         return rounds
+
+    def _removable_task_prefixes(
+        self,
+        messages: tuple[Message, ...],
+        covered_through: int,
+    ) -> list[int]:
+        """返回从历史开头起每个可安全删除的已闭合 task block 末端。"""
+
+        task_indexes = [
+            index for index, message in enumerate(messages) if message.kind == "task"
+        ]
+        if len(task_indexes) < 2 or task_indexes[0] != 0:
+            return []
+        ends: list[int] = []
+        for start, end in zip(task_indexes[:-1], task_indexes[1:]):
+            block = list(messages[start:end])
+            non_system = [block[0], *(message for message in block[1:] if message.role != "system")]
+            if not self._is_closed_task_block(non_system):
+                break
+            sequences = [message.message_seq for message in block if message.role != "system"]
+            if (
+                not sequences
+                or any(type(sequence) is not int or sequence <= covered_through for sequence in sequences)
+            ):
+                break
+            ends.append(end)
+        return ends
+
+    def _is_closed_task_block(self, block: list[Message]) -> bool:
+        """接受已纠正的协议噪声，但必须完整覆盖且最终存在工具回合。"""
+
+        if not block or block[0].kind != "task":
+            return False
+        body = block[1:]
+        groups = self._collect_current_groups(body)
+        if sum(len(group) for group in groups) != len(body):
+            return False
+        return any(
+            self._complete_round_tail(group, 0) == len(group)
+            for group in groups
+        )
+
+    def _request_cost(
+        self,
+        messages: tuple[Message, ...],
+        *,
+        tool_chars: int,
+        tool_tokens: int,
+        output_reserve_chars: int,
+        output_reserve_tokens: int,
+    ) -> tuple[int, int]:
+        chars = self._chars(messages) + tool_chars + output_reserve_chars
+        estimated, _source = self._estimate_with_anchor(messages)
+        return chars, estimated + tool_tokens + output_reserve_tokens
+
+    def _over_ratio(self, chars: int, tokens: int, ratio: float) -> bool:
+        return bool(
+            (self.budget.max_chars is not None and chars > self.budget.max_chars * ratio)
+            or (self.budget.max_tokens is not None and tokens > self.budget.max_tokens * ratio)
+        )
+
+    @staticmethod
+    def _tool_definition_chars(tools: Sequence[ToolDefinition]) -> int:
+        if not tools:
+            return 0
+        payload = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+            for tool in tools
+        ]
+        return len(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    @staticmethod
+    def _estimate_text_tokens(character_count: int) -> int:
+        return (character_count + 3) // 4
 
     def _collect_current_groups(self, messages: list[Message]) -> list[list[Message]]:
         """保留当前任务的完整工具回合与可恢复的协议纠错反馈。"""

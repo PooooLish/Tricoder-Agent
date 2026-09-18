@@ -80,6 +80,8 @@ class FakeRuntime:
         self.diff_latest_calls = 0
         self.prepare_undo_calls = 0
         self.undo_latest_calls = 0
+        self.memory_save_calls = 0
+        self.memory_edit_calls = 0
         self.diff_result: str | None = EXPECTED_DIFF
         self.undo_preview = UndoPreview(EXPECTED_REVERSE_DIFF, ("src/app.py",))
         self.undo_execution = UndoExecution(True, ("src/app.py",))
@@ -174,6 +176,21 @@ class FakeRuntime:
 
     def retry_persist(self) -> bool:
         return self.persist_ok
+
+    def render_memory(self) -> str:
+        return "memory revision 1"
+
+    def preview_memory_save(self):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(text="save preview", revision=1)
+
+    def save_memory_preview(self, preview: object) -> None:
+        self.memory_save_calls += 1
+
+    def preview_memory_edit(self, item_id: str, text: str, scope: str):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(text=f"edit {item_id}: {text} [{scope}]", revision=1)
+
+    def apply_memory_edit(self, preview: object) -> None:
+        self.memory_edit_calls += 1
 
     def status(self) -> RuntimeStatus:
         return RuntimeStatus(
@@ -433,6 +450,24 @@ class InteractiveShellTests(unittest.TestCase):
         self.assertEqual(0, self.runtime.clear_calls)
         shell.execute("/clear")
         self.assertEqual(1, self.runtime.clear_calls)
+
+    def test_memory_view_save_and_edit_are_local_and_confirmation_bound(self) -> None:
+        shell = self.shell()
+        shell.execute("/memory")
+        self.assertIn("memory revision 1", self.ui.text)
+
+        self.ui.answers = ["no", "yes", "yes"]
+        shell.execute("/memory save")
+        self.assertEqual(0, self.runtime.memory_save_calls)
+        shell.execute("/memory save")
+        self.assertEqual(1, self.runtime.memory_save_calls)
+
+        inputs = iter(("保持接口兼容", "session"))
+        edit_shell = self.shell(lambda _prompt: next(inputs))
+        edit_shell.execute("/memory edit api")
+        self.assertEqual(1, self.runtime.memory_edit_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.provider.calls)
 
     def test_model_configuration_failure_keeps_current_selection(self) -> None:
         """模型配置失败时 Shell 仅报告错误，运行时 Session 不变。"""

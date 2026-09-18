@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -26,9 +27,19 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
 from tricoder.context.spill import SpillError, ToolResultSpillStore
+from tricoder.context.memory import (
+    ConversationMemory,
+    MemoryItem,
+    MemoryValidationError,
+    memory_source_ids,
+    memory_to_json,
+    source_id_for_sequence,
+    validate_candidate,
+)
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
 from tricoder.models import (
     ProviderConfig,
+    Message,
     RunResult,
     SessionContext,
     SessionMemory,
@@ -121,6 +132,34 @@ class RuntimeStatus:
     record: SessionRecord
     unsaved_memory: bool
     warning: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySavePreview:
+    """用户确认的确切保存候选；candidate 不进入 repr 或审计。"""
+
+    revision: int
+    persisted_revision: int | None
+    next_message_seq: int
+    text: str
+    candidate: ConversationMemory = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEditPreview:
+    """本地编辑的 revision 绑定预览。"""
+
+    revision: int
+    next_message_seq: int
+    text: str
+    candidate: ConversationMemory = field(repr=False)
+
+
+_SENSITIVE_MEMORY_PATTERN = re.compile(
+    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bsk-[A-Za-z0-9_-]{8,}|"
+    r"\b(?:api[_-]?key|token|password|secret|credential)\s*[:=])",
+    re.IGNORECASE,
+)
 
 
 class ContextAgent(Protocol):
@@ -350,12 +389,21 @@ class SessionRuntime:
             verification=("待验证" if original.memory.unknown_effects else original.memory.verification),
             permission_level=original.memory.permission_level,
         )
+        previous_conversation = original.context.conversation_memory
+        if not isinstance(previous_conversation, ConversationMemory):
+            raise SessionRuntimeError("会话记忆状态无效")
+        cleared_conversation = ConversationMemory(
+            generation=previous_conversation.generation + 1,
+        )
         self.current = replace(
             original,
             memory=memory,
             context=SessionContext(
                 modified_files=memory.modified_files,
                 verification=memory.verification,
+                conversation_memory=cleared_conversation,
+                next_message_seq=original.context.next_message_seq,
+                persisted_memory_revision=original.context.persisted_memory_revision,
             ),
         )
         self._cache_current()
@@ -368,6 +416,28 @@ class SessionRuntime:
             # 即使 SQLite 暂时不可写，也继续销毁用户明确要求清除的临时正文。
             # 内存中的清空状态与 dirty 标记会保留，供 retry_persist 后续重试。
             persistence_error = exc
+        semantic_clear_error: SessionError | OSError | None = None
+        try:
+            self.store.clear_conversation_memory(original.record.id)
+        except (SessionError, OSError) as exc:
+            semantic_clear_error = exc
+            self.current = replace(
+                self.current,
+                context=replace(self.current.context, memory_pending_clear=True),
+            )
+            self._cache_current()
+            self._unsaved_memory = True
+            self._warning = "会话记忆持久化清除失败；内存已清空，可本地重试"
+        else:
+            self.current = replace(
+                self.current,
+                context=replace(
+                    self.current.context,
+                    persisted_memory_revision=None,
+                    memory_pending_clear=False,
+                ),
+            )
+            self._cache_current()
         spill_store = (
             original.tools.context.spill_store
             if original.tools is not None
@@ -379,6 +449,12 @@ class SessionRuntime:
                 spill_store.cleanup()
             except SpillError as exc:
                 cleanup_error = exc
+        if semantic_clear_error is not None and cleanup_error is not None:
+            raise SessionRuntimeError(
+                "会话记忆持久化清除失败，且大型工具结果清理失败"
+            ) from semantic_clear_error
+        if semantic_clear_error is not None:
+            raise SessionRuntimeError("会话记忆持久化清除失败；内存已清空，可重试") from semantic_clear_error
         if persistence_error is not None and cleanup_error is not None:
             raise SessionRuntimeError(
                 "会话记忆清除未持久化，且大型工具结果清理失败"
@@ -962,7 +1038,28 @@ class SessionRuntime:
     @_idle_runtime_change
     def retry_persist(self) -> bool:
         """供退出流程再尝试一次保存，失败由调用方返回非零退出码。"""
-        return self._persist_current()
+        legacy_ok = self._persist_current()
+        context = self.current.context
+        if not context.memory_pending_clear:
+            return legacy_ok
+        try:
+            self.store.clear_conversation_memory(self.current.record.id)
+        except (SessionError, OSError):
+            self._unsaved_memory = True
+            self._warning = "会话记忆持久化清除失败；内存已清空，可本地重试"
+            return False
+        self.current = replace(
+            self.current,
+            context=replace(
+                context,
+                persisted_memory_revision=None,
+                memory_pending_clear=False,
+            ),
+        )
+        self._cache_current()
+        if legacy_ok:
+            self._clear_unsaved_warning()
+        return legacy_ok
 
     @property
     def permission_level(self) -> str:
@@ -1024,7 +1121,209 @@ class SessionRuntime:
 
     def status(self) -> RuntimeStatus:
         """返回不含任务原文、工具输出或凭据的状态快照。"""
-        return RuntimeStatus(self.current.record, self._unsaved_memory, self._warning)
+        pending_clear = self.current.context.memory_pending_clear
+        return RuntimeStatus(
+            self.current.record,
+            self._unsaved_memory or pending_clear,
+            self._warning,
+        )
+
+    def render_memory(self) -> str:
+        """本地显示当前语义记忆及保存状态，不写审计。"""
+
+        context = self.current.context
+        memory = context.conversation_memory
+        if not isinstance(memory, ConversationMemory):
+            raise SessionRuntimeError("会话记忆状态无效")
+        saved = (
+            "未保存"
+            if context.persisted_memory_revision is None
+            else f"已保存 revision {context.persisted_memory_revision}"
+        )
+        pending = "；持久化清除待重试" if context.memory_pending_clear else ""
+        return f"会话记忆（revision {memory.revision}，{saved}{pending}）\n{memory_to_json(memory)}"
+
+    @_idle_runtime_change
+    def preview_memory_save(self) -> MemorySavePreview:
+        """返回确切候选和位置；敏感标记只导致固定错误，不回显正文。"""
+
+        context = self.current.context
+        if self.current.config.memory.persistence != "reviewed_summary":
+            raise SessionRuntimeError("会话记忆持久化未启用")
+        if context.memory_pending_clear:
+            raise SessionRuntimeError("持久化清除尚未完成，禁止保存旧记忆")
+        memory = context.conversation_memory
+        if not isinstance(memory, ConversationMemory):
+            raise SessionRuntimeError("会话记忆状态无效")
+        encoded = memory_to_json(memory)
+        if _SENSITIVE_MEMORY_PATTERN.search(encoded):
+            raise SessionRuntimeError("候选可能包含敏感或私有内容；请先本地编辑或拒绝保存")
+        text = (
+            f"保存位置：{self.store.database_path}\n"
+            f"将保存字段：目标、约束、决策、待办、来源、scope、revision；"
+            f"不保存源码正文或原始工具输出。\n{encoded}"
+        )
+        return MemorySavePreview(
+            memory.revision,
+            context.persisted_memory_revision,
+            context.next_message_seq,
+            text,
+            memory,
+        )
+
+    @_idle_runtime_change
+    def save_memory_preview(self, preview: MemorySavePreview) -> None:
+        """只保存仍与预览完全相同的候选；数据库失败时保留内存候选。"""
+
+        if not isinstance(preview, MemorySavePreview):
+            raise SessionRuntimeError("记忆保存预览无效")
+        context = self.current.context
+        if self.current.config.memory.persistence != "reviewed_summary":
+            raise SessionRuntimeError("会话记忆持久化未启用")
+        if context.memory_pending_clear:
+            raise SessionRuntimeError("持久化清除尚未完成，禁止保存旧记忆")
+        if (
+            context.conversation_memory != preview.candidate
+            or context.conversation_memory.revision != preview.revision
+            or context.persisted_memory_revision != preview.persisted_revision
+            or context.next_message_seq != preview.next_message_seq
+        ):
+            raise SessionRuntimeError("候选在确认期间已变化，请重新预览")
+        try:
+            saved_revision = self.store.save_conversation_memory(
+                self.current.record.id,
+                preview.candidate,
+                preview.next_message_seq,
+                preview.persisted_revision,
+            )
+        except (SessionError, OSError) as exc:
+            raise SessionRuntimeError("会话记忆未保存，可直接重试；业务工具不会重跑") from exc
+        self.current = replace(
+            self.current,
+            context=replace(context, persisted_memory_revision=saved_revision),
+        )
+        self._cache_current()
+
+    @_idle_runtime_change
+    def preview_memory_edit(
+        self,
+        item_id: str,
+        text: str,
+        scope: str,
+    ) -> MemoryEditPreview:
+        """生成本地编辑候选；空文本表示删除，确认前不修改任何状态。"""
+
+        context = self.current.context
+        if context.memory_pending_clear:
+            raise SessionRuntimeError("持久化清除尚未完成，禁止编辑旧记忆")
+        memory = context.conversation_memory
+        if not isinstance(memory, ConversationMemory):
+            raise SessionRuntimeError("会话记忆状态无效")
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise SessionRuntimeError("记忆条目 ID 不能为空")
+        if not isinstance(text, str) or len(text) > 500:
+            raise SessionRuntimeError("记忆条目文本不能超过 500 字符")
+        if scope not in {"task", "session"}:
+            raise SessionRuntimeError("记忆 scope 只能是 task 或 session")
+        source_id = source_id_for_sequence(context.next_message_seq)
+        candidate = self._edited_memory(memory, item_id.strip(), text, scope, source_id)
+        try:
+            validate_candidate(
+                candidate,
+                allowed_source_ids=memory_source_ids(memory) | {source_id},
+                max_chars=self.current.config.memory.summary_max_chars,
+            )
+        except MemoryValidationError as exc:
+            raise SessionRuntimeError("记忆编辑候选无效") from exc
+        action = "删除" if not text.strip() else "更新"
+        preview_text = (
+            f"{action}条目 {item_id.strip()}；scope={scope}；"
+            f"确认时绑定 revision {memory.revision}。\n{memory_to_json(candidate)}"
+        )
+        return MemoryEditPreview(
+            memory.revision,
+            context.next_message_seq,
+            preview_text,
+            candidate,
+        )
+
+    @_idle_runtime_change
+    def apply_memory_edit(self, preview: MemoryEditPreview) -> None:
+        """确认后原子应用编辑并追加不含编辑正文的本地来源消息。"""
+
+        if not isinstance(preview, MemoryEditPreview):
+            raise SessionRuntimeError("记忆编辑预览无效")
+        context = self.current.context
+        memory = context.conversation_memory
+        if (
+            not isinstance(memory, ConversationMemory)
+            or memory.revision != preview.revision
+            or context.next_message_seq != preview.next_message_seq
+            or context.memory_pending_clear
+        ):
+            raise SessionRuntimeError("记忆在确认期间已变化，请重新预览")
+        source_message = Message(
+            "user",
+            "用户已确认本地记忆编辑",
+            kind="memory_edit",
+            message_seq=preview.next_message_seq,
+        )
+        self.current = replace(
+            self.current,
+            context=replace(
+                context,
+                messages=(*context.messages, source_message),
+                conversation_memory=preview.candidate,
+                next_message_seq=preview.next_message_seq + 1,
+            ),
+        )
+        self._cache_current()
+
+    @staticmethod
+    def _edited_memory(
+        memory: ConversationMemory,
+        item_id: str,
+        text: str,
+        scope: str,
+        source_id: str,
+    ) -> ConversationMemory:
+        sections: dict[str, list[MemoryItem]] = {
+            "constraints": list(memory.constraints),
+            "decisions": list(memory.decisions),
+            "open_items": list(memory.open_items),
+        }
+        goal = memory.goal
+        found: tuple[str, int, MemoryItem] | None = None
+        if goal is not None and goal.id == item_id:
+            found = ("goal", 0, goal)
+        for section, entries in sections.items():
+            for index, entry in enumerate(entries):
+                if entry.id == item_id:
+                    found = (section, index, entry)
+        if found is None:
+            raise SessionRuntimeError("找不到记忆条目")
+        section, index, old = found
+        if not text.strip():
+            if section == "goal":
+                goal = None
+            else:
+                del sections[section][index]
+        else:
+            task_id = None if scope == "session" else (old.task_id or f"task-memory-{source_id[1:]}")
+            updated = MemoryItem(old.id, text.strip(), (source_id,), scope, task_id)
+            if section == "goal":
+                goal = updated
+            else:
+                sections[section][index] = updated
+        return ConversationMemory(
+            revision=memory.revision + 1,
+            generation=memory.generation,
+            covered_through=memory.covered_through,
+            goal=goal,
+            constraints=tuple(sections["constraints"]),
+            decisions=tuple(sections["decisions"]),
+            open_items=tuple(sections["open_items"]),
+        )
 
     def preview_models(self) -> dict[str, str]:
         """只解析模型名供 UI 展示；不读取密钥文件、不校验 Key、也不构建 Provider。"""
@@ -1111,12 +1410,13 @@ class SessionRuntime:
                     raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本") from exc
                 if registry.context.change_journal is not active_journal:
                     raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本")
-            return replace(
+            active = replace(
                 candidate,
                 context=replace(candidate.context, unknown_effects=memory.unknown_effects or candidate.context.unknown_effects),
                 tools=candidate.tools or (registries[0] if registries else None),
                 journal=active_journal,
             )
+            return self._restore_conversation_memory(active)
         loaded = config or self._load_config(record.workspace, record.provider, record.model)
         workspace_policy = self._workspace_policy_factory(loaded.workspace)
         active_journal = journal or ChangeJournal()
@@ -1144,7 +1444,7 @@ class SessionRuntime:
         audit = self._audit_factory(loaded.audit_dir / f"session-{record.id}.jsonl")
         audit.prepare()
         agent = self._create_agent(loaded, tools, audit)
-        return ActiveSession(
+        active = ActiveSession(
             record,
             memory,
             SessionContext(
@@ -1159,6 +1459,26 @@ class SessionRuntime:
             active_journal,
             audit,
         )
+        return self._restore_conversation_memory(active)
+
+    def _restore_conversation_memory(self, active: ActiveSession) -> ActiveSession:
+        """仅 reviewed_summary 模式加载任务意图，不恢复批准或验证能力。"""
+
+        if active.config.memory.persistence != "reviewed_summary":
+            return active
+        loaded = self.store.load_conversation_memory(active.record.id)
+        if loaded is None:
+            return active
+        memory, next_message_seq = loaded
+        context = replace(
+            active.context,
+            conversation_memory=memory,
+            next_message_seq=next_message_seq,
+            persisted_memory_revision=memory.revision,
+            # 加载语义记忆不能恢复或提升任何可信执行状态。
+            verification_evidence=None,
+        )
+        return replace(active, context=context)
 
     def _create_agent(
         self,
@@ -1186,6 +1506,11 @@ class SessionRuntime:
             for parameter in agent_parameters.values()
         ):
             agent_kwargs["plan_enabled"] = config.plan_enabled
+        if "memory_config" in agent_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in agent_parameters.values()
+        ):
+            agent_kwargs["memory_config"] = config.memory
         return self._agent_factory(provider, tools, **agent_kwargs)
 
     def _load_config(self, workspace: Path, provider: str, model: str | None) -> AppConfig:

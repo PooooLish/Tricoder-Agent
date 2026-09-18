@@ -101,6 +101,9 @@ class Message:
     kind: str = "generic"
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
+    # 会话历史的稳定本地序号；Provider 序列化刻意忽略这些元数据。
+    message_seq: int | None = None
+    task_id: str | None = None
 
     def __post_init__(self) -> None:
         """确保不同角色只携带其允许的结构化字段。"""
@@ -117,6 +120,14 @@ class Message:
             not isinstance(self.tool_call_id, str) or not self.tool_call_id
         ):
             raise ValueError("工具调用 ID 必须是非空字符串")
+        if self.message_seq is not None and (
+            type(self.message_seq) is not int or self.message_seq <= 0
+        ):
+            raise ValueError("消息序号必须是正整数或 None")
+        if self.task_id is not None and (
+            not isinstance(self.task_id, str) or not self.task_id.strip()
+        ):
+            raise ValueError("任务 ID 必须是非空字符串或 None")
 
         if self.role == "tool":
             if self.content is None:
@@ -219,6 +230,45 @@ class AgentsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryConfig:
+    """会话语义记忆开关与有界摘要参数；默认完全关闭。"""
+
+    compaction: str = "off"
+    persistence: str = "off"
+    trigger_ratio: float = 0.80
+    target_ratio: float = 0.65
+    summary_max_chars: int = 6_000
+    summary_timeout_seconds: float = 15.0
+
+    def __post_init__(self) -> None:
+        if self.compaction not in {"off", "structured"}:
+            raise ValueError("memory.compaction 只能是 off 或 structured")
+        if self.persistence not in {"off", "reviewed_summary"}:
+            raise ValueError("memory.persistence 只能是 off 或 reviewed_summary")
+        if self.persistence == "reviewed_summary" and self.compaction != "structured":
+            raise ValueError("reviewed_summary 要求 compaction=structured")
+        if not (
+            isinstance(self.target_ratio, (int, float))
+            and not isinstance(self.target_ratio, bool)
+            and isinstance(self.trigger_ratio, (int, float))
+            and not isinstance(self.trigger_ratio, bool)
+            and 0 < self.target_ratio < self.trigger_ratio < 1
+        ):
+            raise ValueError("memory 比例必须满足 0 < target_ratio < trigger_ratio < 1")
+        if (
+            type(self.summary_max_chars) is not int
+            or not 1 <= self.summary_max_chars <= 20_000
+        ):
+            raise ValueError("memory.summary_max_chars 必须在 1 到 20000 之间")
+        if (
+            not isinstance(self.summary_timeout_seconds, (int, float))
+            or isinstance(self.summary_timeout_seconds, bool)
+            or not 0 < self.summary_timeout_seconds <= 120
+        ):
+            raise ValueError("memory.summary_timeout_seconds 必须在 0 到 120 秒之间")
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """一次 Agent 运行所需的完整配置。"""
 
@@ -239,6 +289,7 @@ class AppConfig:
     hooks: HooksConfig = field(default_factory=HooksConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +392,30 @@ class SessionContext:
     verification_evidence: VerificationEvidence | None = None
     verification_failure: WorkspaceSnapshot | None = None
     verification_required: bool = False
+    # 延迟导入会形成循环；default_factory 在实例化时再解析纯记忆类型。
+    conversation_memory: Any = field(
+        default_factory=lambda: _empty_conversation_memory()
+    )
+    next_message_seq: int = 1
+    persisted_memory_revision: int | None = None
+    memory_pending_clear: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.next_message_seq) is not int or self.next_message_seq <= 0:
+            raise ValueError("下一消息序号必须是正整数")
+        if self.persisted_memory_revision is not None and (
+            type(self.persisted_memory_revision) is not int
+            or self.persisted_memory_revision < 0
+        ):
+            raise ValueError("已持久化记忆 revision 必须是非负整数或 None")
+
+
+def _empty_conversation_memory() -> Any:
+    """在不让纯记忆模块与共享模型循环导入的前提下提供默认值。"""
+
+    from tricoder.context.memory import ConversationMemory
+
+    return ConversationMemory()
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,3 +426,7 @@ class SessionTurnResult:
     context: SessionContext
     # 仅当 Agent 已消费本轮所有已执行工具的副作用时为真；不持久化。
     file_effects_observed: bool = False
+    # 摘要请求不计入业务 usage/round/tool_calls；None 表示 Provider 未报告。
+    memory_usage: TokenUsage | None = None
+    memory_calls: int = 0
+    memory_warning: str = ""

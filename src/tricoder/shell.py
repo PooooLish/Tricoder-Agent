@@ -87,6 +87,21 @@ class RuntimeLike(Protocol):
     def retry_persist(self) -> bool:
         ...
 
+    def render_memory(self) -> str:
+        ...
+
+    def preview_memory_save(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def save_memory_preview(self, preview: object) -> None:
+        ...
+
+    def preview_memory_edit(self, item_id: str, text: str, scope: str):  # type: ignore[no-untyped-def]
+        ...
+
+    def apply_memory_edit(self, preview: object) -> None:
+        ...
+
     def status(self) -> object:
         ...
 
@@ -172,9 +187,38 @@ class InteractiveShell:
             self._handle_session(command)
         elif command.name == "permission":
             self._permission(command.argument)
+        elif command.name == "memory":
+            self._memory(command)
         elif command.name == "exit":
             return self._exit()
         return None
+
+    def _memory(self, command: ParsedCommand) -> None:
+        """记忆命令完全在本地执行，预览内容不会进入 Agent 或审计。"""
+
+        if command.subcommand is None:
+            self.ui.show_notice(self.runtime.render_memory())
+            return
+        if command.subcommand == "save":
+            preview = self.runtime.preview_memory_save()
+            self.ui.show_notice(preview.text)
+            if not self.ui.confirm("保存以上确切会话记忆候选？[y/N] "):
+                self.ui.show_notice("已取消保存会话记忆")
+                return
+            self.runtime.save_memory_preview(preview)
+            self.ui.show_notice("会话记忆已保存")
+            return
+
+        item_id = command.argument or ""
+        new_text = self.input_fn("新的记忆文本（留空表示删除）：")
+        scope = self.input_fn("作用范围 task/session [session]：").strip().lower() or "session"
+        preview = self.runtime.preview_memory_edit(item_id, new_text, scope)
+        self.ui.show_notice(preview.text)
+        if not self.ui.confirm("应用以上本地记忆编辑？[y/N] "):
+            self.ui.show_notice("已取消编辑会话记忆")
+            return
+        self.runtime.apply_memory_edit(preview)
+        self.ui.show_notice("会话记忆已更新；尚未自动保存")
 
     def _permission(self, argument: str | None) -> None:
         if argument is None:

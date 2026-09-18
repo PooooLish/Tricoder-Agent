@@ -122,6 +122,33 @@ class OptionListScreen(ModalScreen[str]):
         self.dismiss(None)
 
 
+class TextInputScreen(ModalScreen[str]):
+    """本地单字段输入；文本只交给调用方，不进入 Agent。"""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(self, title: str, placeholder: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text(self._title))
+        yield Input(placeholder=self._placeholder, id="modal-input")
+        yield Static("[dim]Enter 确认 · Esc 取消[/dim]", classes="approval-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#modal-input", Input).focus()
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.dismiss(event.value or "")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class TuiObserver(AgentObserver):
     """把后台线程中的 Agent 事件转发到 UI 线程。"""
 
@@ -555,6 +582,8 @@ class TricoderApp(App[None]):
                 self._handle_session(command.subcommand, command.argument)
             elif command.name == "permission":
                 self._permission(command.argument)
+            elif command.name == "memory":
+                self._memory(command.subcommand, command.argument)
             elif command.name == "exit":
                 self.action_quit()
         except SessionRuntimeError as exc:
@@ -566,6 +595,65 @@ class TricoderApp(App[None]):
         for name, spec in list_commands().items():
             self.log_line(f"[dim]/{name:<12}{spec.description}[/dim]")
         self.log_line("[dim]/session new <名称>     创建并切换到新会话[/dim]")
+
+    def _memory(self, subcommand: str | None, argument: str | None) -> None:
+        if self.runtime is None:
+            return
+        if subcommand is None:
+            self.log_line(_p(self.runtime.render_memory()))
+            return
+        if subcommand == "save":
+            preview = self.runtime.preview_memory_save()
+            self.log_line(_p(preview.text))
+
+            async def save_after_confirm() -> None:
+                approved = await self.push_screen_wait(
+                    ApprovalScreen("保存会话记忆", "保存以上确切候选？")
+                )
+                if not approved or self.runtime is None:
+                    self.log_line("[dim]已取消保存会话记忆[/dim]")
+                    return
+                try:
+                    self.runtime.save_memory_preview(preview)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("保存失败：", "red"), _p(exc)))
+                    return
+                self.log_line("[yellow]会话记忆已保存[/yellow]")
+
+            self.run_worker(save_after_confirm, thread=False, name="memory-save")
+            return
+
+        async def edit_memory() -> None:
+            text = await self.push_screen_wait(
+                TextInputScreen("新的记忆文本（留空表示删除）")
+            )
+            if text is None or self.runtime is None:
+                return
+            scope = await self.push_screen_wait(
+                OptionListScreen("选择记忆作用范围", ("session", "task"), "session")
+            )
+            if scope is None or self.runtime is None:
+                return
+            try:
+                preview = self.runtime.preview_memory_edit(argument or "", text, scope)
+            except SessionRuntimeError as exc:
+                self.log_line(Text.assemble(("编辑失败：", "red"), _p(exc)))
+                return
+            self.log_line(_p(preview.text))
+            approved = await self.push_screen_wait(
+                ApprovalScreen("编辑会话记忆", "应用以上确切编辑？")
+            )
+            if not approved or self.runtime is None:
+                self.log_line("[dim]已取消编辑会话记忆[/dim]")
+                return
+            try:
+                self.runtime.apply_memory_edit(preview)
+            except SessionRuntimeError as exc:
+                self.log_line(Text.assemble(("编辑失败：", "red"), _p(exc)))
+                return
+            self.log_line("[yellow]会话记忆已更新；尚未自动保存[/yellow]")
+
+        self.run_worker(edit_memory, thread=False, name="memory-edit")
 
     def _show_status(self) -> None:
         if self.runtime is None:

@@ -13,6 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tricoder.models import SessionMemory, SessionRecord
+from tricoder.context.memory import (
+    ConversationMemory,
+    MemoryValidationError,
+    memory_from_json,
+    memory_to_json,
+)
 
 
 class SessionError(ValueError):
@@ -134,6 +140,21 @@ class SessionStore:
                         model TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_memory (
+                        session_id TEXT PRIMARY KEY,
+                        schema_version INTEGER NOT NULL,
+                        revision INTEGER NOT NULL,
+                        generation INTEGER NOT NULL,
+                        covered_through INTEGER NOT NULL,
+                        next_message_seq INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                     )
                     """
                 )
@@ -396,6 +417,147 @@ class SessionStore:
     def clear_memory(self, session_id: str) -> None:
         """仅重置当前会话的摘要记忆，保留会话元数据。"""
         self.save_memory(session_id, SessionMemory())
+
+    def load_conversation_memory(
+        self,
+        session_id: str,
+    ) -> tuple[ConversationMemory, int] | None:
+        """读取独立语义记忆；损坏数据保留在库中但绝不注入模型。"""
+
+        row = self._fetchone(
+            """
+            SELECT schema_version, revision, generation, covered_through,
+                   next_message_seq, payload_json
+            FROM conversation_memory WHERE session_id = ?
+            """,
+            (session_id,),
+        )
+        if row is None:
+            return None
+        try:
+            integers = {
+                name: row[name]
+                for name in (
+                    "schema_version",
+                    "revision",
+                    "generation",
+                    "covered_through",
+                    "next_message_seq",
+                )
+            }
+            if any(type(value) is not int for value in integers.values()):
+                raise MemoryValidationError("持久化记忆整数列损坏")
+            memory = memory_from_json(
+                _require_text(row, "payload_json"),
+                allowed_source_ids=None,
+            )
+            if (
+                memory.schema_version != integers["schema_version"]
+                or memory.revision != integers["revision"]
+                or memory.generation != integers["generation"]
+                or memory.covered_through != integers["covered_through"]
+                or integers["next_message_seq"] <= memory.covered_through
+            ):
+                raise MemoryValidationError("持久化记忆列与 payload 不一致")
+        except (MemoryValidationError, TypeError, ValueError) as exc:
+            raise SessionError("会话语义记忆数据损坏") from exc
+        return memory, integers["next_message_seq"]
+
+    def save_conversation_memory(
+        self,
+        session_id: str,
+        memory: ConversationMemory,
+        next_message_seq: int,
+        expected_revision: int | None,
+    ) -> int:
+        """用数据库 revision 做 CAS 保存；失败事务不会覆盖并发候选。"""
+
+        if (
+            type(next_message_seq) is not int
+            or next_message_seq <= 0
+            or next_message_seq <= memory.covered_through
+        ):
+            raise SessionError("下一消息序号必须是正整数")
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise SessionError("预期记忆 revision 无效")
+        try:
+            payload = memory_to_json(memory)
+        except MemoryValidationError as exc:
+            raise SessionError("会话语义记忆候选无效") from exc
+        updated_at = self._clock()
+        try:
+            with self._transaction() as connection:
+                existing = connection.execute(
+                    "SELECT revision FROM conversation_memory WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if existing is None:
+                    if expected_revision is not None:
+                        raise SessionError("会话语义记忆 revision 冲突")
+                    connection.execute(
+                        """
+                        INSERT INTO conversation_memory (
+                            session_id, schema_version, revision, generation,
+                            covered_through, next_message_seq, payload_json, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            memory.schema_version,
+                            memory.revision,
+                            memory.generation,
+                            memory.covered_through,
+                            next_message_seq,
+                            payload,
+                            updated_at,
+                        ),
+                    )
+                else:
+                    current_revision = existing["revision"]
+                    if type(current_revision) is not int or current_revision != expected_revision:
+                        raise SessionError("会话语义记忆 revision 冲突")
+                    cursor = connection.execute(
+                        """
+                        UPDATE conversation_memory
+                        SET schema_version = ?, revision = ?, generation = ?,
+                            covered_through = ?, next_message_seq = ?, payload_json = ?, updated_at = ?
+                        WHERE session_id = ? AND revision = ?
+                        """,
+                        (
+                            memory.schema_version,
+                            memory.revision,
+                            memory.generation,
+                            memory.covered_through,
+                            next_message_seq,
+                            payload,
+                            updated_at,
+                            session_id,
+                            expected_revision,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise SessionError("会话语义记忆 revision 冲突")
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (updated_at, session_id),
+                )
+        except sqlite3.Error as error:
+            raise SessionError("会话语义记忆保存失败") from error
+        return memory.revision
+
+    def clear_conversation_memory(self, session_id: str) -> None:
+        """只删除指定 Session 的语义记忆，不改原执行状态表。"""
+
+        try:
+            with self._transaction() as connection:
+                connection.execute(
+                    "DELETE FROM conversation_memory WHERE session_id = ?",
+                    (session_id,),
+                )
+        except sqlite3.Error as error:
+            raise SessionError("会话语义记忆清除失败") from error
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
