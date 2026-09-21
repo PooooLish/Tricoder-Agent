@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,18 +10,10 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.task_cleanup import run_in_cleanup_thread
 from tricoder.models import ToolResult, tool_failure
 from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
-from tricoder.verification import ExecutionBinding, stable_snapshots
+from tricoder.verification import stable_snapshots
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.subprocess_env import filtered_subprocess_env
 from tricoder.subprocess_control import ProcessExecutionUncertain, run_bounded_process
-from tricoder.sandbox.execution import (
-    ExecutionBackend,
-    ExecutionBackendError,
-    ExecutionRequest,
-    ExecutionResult,
-    ExecutionUncertain,
-    LocalExecutionBackend,
-)
 
 from tricoder.tools.handlers import ToolHandler
 
@@ -31,13 +21,7 @@ from tricoder.tools.handlers import ToolHandler
 _filtered_env = filtered_subprocess_env
 
 
-def _git_toplevel(
-    workspace: Path,
-    command_policy: CommandPolicy,
-    execution_backend: ExecutionBackend | None = None,
-    *,
-    execution_workspace: Path | None = None,
-) -> Path | None:
+def _git_toplevel(workspace: Path, command_policy: CommandPolicy) -> Path | None:
     """返回 workspace 所在 git 仓库根；非 git 仓库返回 None。
 
     git 会沿目录树上溯查找 .git，因此在仓库子目录工作区运行 git 会读取
@@ -45,90 +29,30 @@ def _git_toplevel(
     """
     try:
         git_executable = command_policy.validate("git status")[0]
-        if execution_backend is None:
-            completed = subprocess.run(
-                [git_executable, "rev-parse", "--show-toplevel"],
-                cwd=workspace,
-                env=command_policy.subprocess_environment(),
-                capture_output=True,
-                text=True,
-                timeout=10,
-                shell=False,
-                check=False,
-            )
-            returncode = completed.returncode
-            stdout = completed.stdout
-        else:
-            root = (execution_workspace or workspace).resolve()
-            relative = workspace.resolve().relative_to(root).as_posix() or "."
-            completed_result = execution_backend.execute(
-                ExecutionRequest(
-                    argv=(git_executable, "rev-parse", "--show-toplevel"),
-                    cwd=relative,
-                    timeout=10,
-                    max_output_bytes=4096,
-                    environment=command_policy.subprocess_environment(),
-                )
-            )
-            if not completed_result.cleanup_confirmed:
-                return None
-            returncode = completed_result.returncode
-            stdout = completed_result.stdout
-    except (ExecutionBackendError, OSError, subprocess.TimeoutExpired, ValueError):
+        completed = subprocess.run(
+            [git_executable, "rev-parse", "--show-toplevel"],
+            cwd=workspace,
+            env=command_policy.subprocess_environment(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    if returncode != 0:
+    if completed.returncode != 0:
         return None
-    return Path(stdout.strip()).resolve()
+    return Path(completed.stdout.strip()).resolve()
 
 
 def _git_command_escapes_workspace(
     cwd: Path,
     command_policy: CommandPolicy,
-    execution_backend: ExecutionBackend | None = None,
-    *,
-    execution_workspace: Path | None = None,
 ) -> bool:
     """git 命令在 cwd 执行是否会越过工作区边界读取仓库根内容。"""
-    root = _git_toplevel(
-        cwd,
-        command_policy,
-        execution_backend,
-        execution_workspace=execution_workspace,
-    )
+    root = _git_toplevel(cwd, command_policy)
     return root is not None and root != cwd.resolve()
-
-
-def _execution_backend(context: Any) -> ExecutionBackend:
-    """返回生产装配的后端；旧调用者仍使用等价 local 适配器。"""
-
-    if context.execution_backend is not None:
-        return context.execution_backend
-    return LocalExecutionBackend(
-        context.workspace_policy.workspace,
-        process_runner=run_bounded_process,
-    )
-
-
-def _execute(
-    context: Any,
-    backend: ExecutionBackend,
-    args: list[str],
-    cwd: Path,
-    *,
-    cancellation: CancellationToken | None = None,
-) -> ExecutionResult:
-    workspace = context.workspace_policy.workspace
-    relative = cwd.relative_to(workspace).as_posix() or "."
-    return backend.execute(
-        ExecutionRequest(
-            argv=tuple(args),
-            cwd=relative,
-            timeout=context.timeout,
-            max_output_bytes=context.max_output_chars,
-            environment=context.command_policy.subprocess_environment(),
-        ),
-        cancellation=cancellation,
-    )
 
 
 class RunCommandTool(ToolHandler):
@@ -174,12 +98,9 @@ class RunCommandTool(ToolHandler):
         if not cwd.is_dir():
             return tool_failure(ErrorCode.INVALID_ARGUMENT, "命令工作目录必须是目录")
         executable = Path(args[0]).name.lower().removesuffix(".exe")
-        backend = _execution_backend(self.context)
         if executable == "git" and _git_command_escapes_workspace(
             cwd,
             self.context.command_policy,
-            backend,
-            execution_workspace=self.context.workspace_policy.workspace,
         ):
             return tool_failure(
                 ErrorCode.POLICY_DENIED,
@@ -206,22 +127,23 @@ class RunCommandTool(ToolHandler):
         previous_unknown = scope.unknown_effects
         scope.unknown_effects = True
         try:
-            completed = _execute(
-                self.context,
-                backend,
+            completed = run_bounded_process(
                 args,
-                cwd,
+                cwd=cwd,
+                env=subprocess_env,
+                timeout=self.context.timeout,
+                max_output_bytes=self.context.max_output_chars,
                 cancellation=cancellation,
             )
         except CancellationError:
             raise
-        except (ExecutionUncertain, ProcessExecutionUncertain) as exc:
+        except ProcessExecutionUncertain as exc:
             return tool_failure(ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.RESULT_UNCERTAIN,
                                 "命令执行结果或进程树清理无法确认")
-        except (ExecutionBackendError, OSError):
+        except OSError:
             scope.unknown_effects = previous_unknown
             return tool_failure(ErrorCode.EXECUTION_FAILED, "命令进程无法安全启动")
-        if not completed.cleanup_confirmed:
+        if completed.cleanup_failed:
             return tool_failure(ErrorCode.CLEANUP_FAILED, "命令进程树清理失败，结果不可信")
         if completed.timed_out:
             return tool_failure(ErrorCode.TIMEOUT, f"命令执行超过 {self.context.timeout:g} 秒")
@@ -242,38 +164,8 @@ class RunCommandTool(ToolHandler):
         stable = before is not None and after is not None and stable_snapshots(before, after)
         if stable:
             scope.unknown_effects = previous_unknown
-        execution_binding = None
-        if (
-            before is not None
-            and after is not None
-            and completed.backend == "docker"
-            and completed.image_id is not None
-            and completed.container_id is not None
-            and scope.sandbox_session_id is not None
-            and scope.sandbox_generation is not None
-        ):
-            command_digest = hashlib.sha256(
-                json.dumps(args, ensure_ascii=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            execution_binding = ExecutionBinding(
-                session_id=scope.sandbox_session_id,
-                generation=scope.sandbox_generation,
-                workspace_digest=after.digest,
-                image_id=completed.image_id,
-                container_id=completed.container_id,
-                command_digest=command_digest,
-                cleanup_confirmed=completed.cleanup_confirmed,
-            )
-        evidence = (
-            scope.issue(
-                before,
-                after,
-                completed.returncode == 0,
-                execution=execution_binding,
-            )
-            if before is not None and after is not None
-            else None
-        )
+        evidence = (scope.issue(before, after, completed.returncode == 0)
+                    if before is not None and after is not None else None)
         output = (
             f"退出码：{completed.returncode}\n"
             f"stdout:\n{completed.stdout}\n"
@@ -308,23 +200,8 @@ class GitDiffTool(ToolHandler):
     parameters = ToolHandler._schema({})
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
-        if self.context.workspace_diff is not None:
-            try:
-                output = self.context.workspace_diff().strip()
-            except Exception:
-                return tool_failure(
-                    ErrorCode.RESULT_UNCERTAIN,
-                    "执行副本差异无法安全扫描",
-                )
-            return ToolResult(True, self._bounded(output or "执行副本没有待发布文件变更"))
         workspace = self.context.workspace_policy.workspace
-        backend = _execution_backend(self.context)
-        if _git_command_escapes_workspace(
-            workspace,
-            self.context.command_policy,
-            backend,
-            execution_workspace=workspace,
-        ):
+        if _git_command_escapes_workspace(workspace, self.context.command_policy):
             return tool_failure(
                 ErrorCode.POLICY_DENIED,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
@@ -334,13 +211,19 @@ class GitDiffTool(ToolHandler):
         except PolicyError:
             return tool_failure(ErrorCode.POLICY_DENIED, "本地命令策略拒绝操作")
         try:
-            completed = _execute(self.context, backend, args, workspace)
-        except (ExecutionUncertain, ProcessExecutionUncertain) as exc:
+            completed = run_bounded_process(
+                args,
+                cwd=workspace,
+                env=self.context.command_policy.subprocess_environment(),
+                timeout=self.context.timeout,
+                max_output_bytes=self.context.max_output_chars,
+            )
+        except ProcessExecutionUncertain as exc:
             return tool_failure(ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.RESULT_UNCERTAIN,
                                 "git diff 执行结果或进程树清理无法确认")
-        except (ExecutionBackendError, OSError):
+        except OSError:
             return tool_failure(ErrorCode.EXECUTION_FAILED, "git diff 进程无法安全启动")
-        if not completed.cleanup_confirmed:
+        if completed.cleanup_failed:
             return tool_failure(ErrorCode.CLEANUP_FAILED, "git diff 进程树清理失败，结果不可信")
         if completed.timed_out:
             return tool_failure(ErrorCode.TIMEOUT, f"git diff 超过 {self.context.timeout:g} 秒")

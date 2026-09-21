@@ -84,8 +84,6 @@ class FakeRuntime:
         self.memory_edit_calls = 0
         self.memory_refresh_calls = 0
         self.memory_archive_delete_calls = 0
-        self.sandbox_apply_calls = 0
-        self.sandbox_undo_calls = 0
         self.diff_result: str | None = EXPECTED_DIFF
         self.undo_preview = UndoPreview(EXPECTED_REVERSE_DIFF, ("src/app.py",))
         self.undo_execution = UndoExecution(True, ("src/app.py",))
@@ -218,27 +216,6 @@ class FakeRuntime:
             "本次记忆未持久化" if not self.persist_ok else "",
         )
 
-    def render_sandbox_status(self) -> str:
-        return "沙箱模式：docker\n待发布文件：1"
-
-    def preview_sandbox_publish(self):  # type: ignore[no-untyped-def]
-        self.events.append("sandbox_preview")
-        return SimpleNamespace(diff=EXPECTED_DIFF, paths=("src/app.py",))
-
-    def apply_sandbox_publish(self, preview: object):  # type: ignore[no-untyped-def]
-        self.events.append("sandbox_apply")
-        self.sandbox_apply_calls += 1
-        return SimpleNamespace(ok=True)
-
-    def preview_sandbox_publish_undo(self):  # type: ignore[no-untyped-def]
-        self.events.append("sandbox_undo_preview")
-        return SimpleNamespace(diff=EXPECTED_REVERSE_DIFF, paths=("src/app.py",))
-
-    def undo_sandbox_publish(self, preview: object):  # type: ignore[no-untyped-def]
-        self.events.append("sandbox_undo")
-        self.sandbox_undo_calls += 1
-        return SimpleNamespace(ok=True)
-
 
 class FakeUI:
     """可观测的 UI 替身，输入由测试直接安排。"""
@@ -318,31 +295,6 @@ class InteractiveShellTests(unittest.TestCase):
 
         self.assertEqual(["检查模块"], self.runtime.tasks)
         self.assertEqual([self.runtime.run_result], self.ui.run_results)
-
-    def test_sandbox_apply_and_undo_show_exact_preview_before_confirmation(self) -> None:
-        self.ui.answers = ["yes", "yes"]
-        shell = self.shell()
-
-        shell.execute("/sandbox apply")
-        shell.execute("/sandbox undo")
-
-        self.assertEqual(1, self.runtime.sandbox_apply_calls)
-        self.assertEqual(1, self.runtime.sandbox_undo_calls)
-        self.assertEqual(
-            [
-                ("待写回原项目的确切变更", EXPECTED_DIFF),
-                ("已发布变更撤销预览", EXPECTED_REVERSE_DIFF),
-            ],
-            self.ui.diffs,
-        )
-        self.assertEqual(0, self.runtime.run_task_calls)
-        self.assertEqual(0, self.runtime.provider.calls)
-
-    def test_sandbox_apply_rejection_keeps_publish_unexecuted(self) -> None:
-        self.ui.answers = ["no"]
-        self.shell().execute("/sandbox apply")
-        self.assertEqual(0, self.runtime.sandbox_apply_calls)
-        self.assertIn("执行副本草稿仍保留", "\n".join(self.ui.text))
 
     def test_failed_run_result_is_still_displayed(self) -> None:
         """防止 Agent 返回未完成结果时 Shell 静默丢弃摘要与验证状态。"""

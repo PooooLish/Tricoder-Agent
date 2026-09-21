@@ -26,7 +26,6 @@ from tricoder.changes import (
 from tricoder.models import ToolDefinition, ToolResult, tool_failure
 from tricoder.patches import PatchError, parse_unified_diff
 from tricoder.policy import CommandPolicy, PolicyArgumentError, PolicyError, WorkspacePolicy
-from tricoder.sandbox.execution import ExecutionBackend
 from tricoder.verification import VerificationScope
 from tricoder.task_observation import current_task_observation
 from tricoder.tools.binding import (
@@ -127,12 +126,6 @@ class ToolContext:
     # 大型结果只写入 Session 绑定的 TriCoder 运行目录，不写目标源码目录。
     spill_store: ToolResultSpillStore | None = None
     verification_scope: VerificationScope = field(default_factory=VerificationScope)
-    # None 仅用于兼容旧测试/自定义工厂；生产装配会显式绑定 local 或 docker。
-    execution_backend: ExecutionBackend | None = None
-    # Docker 副本不包含 .git；只读差异由可信基线比较器提供。
-    workspace_diff: Callable[[], str] | None = None
-    # 同一沙箱的文件工具、命令、扫描和发布共用此锁。
-    operation_lock: object | None = None
 
 
 class ToolRegistry:
@@ -294,30 +287,6 @@ class ToolRegistry:
         cancellation: CancellationToken | None = None,
         call_id: str | None = None,
     ) -> ToolResult:
-        lock = self.context.operation_lock
-        if lock is not None:
-            with lock:  # type: ignore[attr-defined]
-                return self._execute_locked(
-                    name,
-                    arguments,
-                    cancellation=cancellation,
-                    call_id=call_id,
-                )
-        return self._execute_locked(
-            name,
-            arguments,
-            cancellation=cancellation,
-            call_id=call_id,
-        )
-
-    def _execute_locked(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        *,
-        cancellation: CancellationToken | None = None,
-        call_id: str | None = None,
-    ) -> ToolResult:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
         if self.has_pending_cleanup:
@@ -361,32 +330,6 @@ class ToolRegistry:
         call_id: str | None = None,
     ) -> ToolResult:
         """在当前事件循环中调度处理器异步入口，并共用同步安全边界。"""
-
-        lock = self.context.operation_lock
-        if lock is not None:
-            with lock:  # type: ignore[attr-defined]
-                return await self._execute_async_locked(
-                    name,
-                    arguments,
-                    cancellation=cancellation,
-                    call_id=call_id,
-                )
-        return await self._execute_async_locked(
-            name,
-            arguments,
-            cancellation=cancellation,
-            call_id=call_id,
-        )
-
-    async def _execute_async_locked(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        *,
-        cancellation: CancellationToken | None = None,
-        call_id: str | None = None,
-    ) -> ToolResult:
-        """锁内执行异步工具；Agent 仍按顺序调度，不并行持有 RLock。"""
 
         if cancellation is not None:
             cancellation.raise_if_cancelled()

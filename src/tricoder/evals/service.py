@@ -16,9 +16,6 @@ from tricoder.models import ProviderConfig, RunResult
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider
 from tricoder.tools import ToolContext, ToolRegistry
-from tricoder.sandbox.execution import build_command_policy, build_execution_backend
-from tricoder.sandbox.workspace import SandboxWorkspace
-from tricoder.verification import VerificationScope
 
 from .loader import load_suite
 from .models import EvalCase
@@ -60,15 +57,12 @@ def run_eval_command(
             env_file=args.env_file,
             model=args.model,
             base_url=args.base_url,
-            sandbox_mode=getattr(args, "sandbox", "local"),
-            sandbox_image=getattr(args, "docker_image", None),
         )
     except Exception:
         output.write("eval_error=configuration\n")
         return 2
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%S.%fz")
-    execution_environments: dict[Path, tuple[object, CommandPolicy]] = {}
     def execute_case(
         case: EvalCase,
         workspace: Path,
@@ -84,59 +78,13 @@ def run_eval_command(
         )
         audit = AuditLogger(audit_path)
         audit.prepare()
-        sandbox_workspace = (
-            SandboxWorkspace.capture_existing(workspace, session_id=f"eval-{case.id}")
-            if case_config.sandbox.mode == "docker"
-            else None
-        )
-        execution_workspace = (
-            sandbox_workspace.execution_workspace
-            if sandbox_workspace is not None
-            else workspace
-        )
-        backend = build_execution_backend(
-            case_config.sandbox,
-            execution_workspace,
-            session_id=f"eval-{case.id}",
-            generation=0,
-            state_path=(
-                sandbox_workspace.control_path
-                if sandbox_workspace is not None
-                else None
-            ),
-        )
-        command_policy = build_command_policy(case_config.sandbox, execution_workspace)
-        execution_environments[workspace.resolve()] = (backend, command_policy)
         tools = ToolRegistry(
             ToolContext(
-                workspace_policy=WorkspacePolicy(execution_workspace),
-                command_policy=command_policy,
+                workspace_policy=WorkspacePolicy(workspace),
+                command_policy=CommandPolicy(workspace),
                 approver=lambda _action, _detail: True,
                 read_only=False,
                 timeout=case_config.timeout,
-                execution_backend=backend,
-                verification_scope=VerificationScope(
-                    sandbox_session_id=(
-                        sandbox_workspace.session_id
-                        if sandbox_workspace is not None
-                        else None
-                    ),
-                    sandbox_generation=(
-                        sandbox_workspace.generation
-                        if sandbox_workspace is not None
-                        else None
-                    ),
-                ),
-                workspace_diff=(
-                    sandbox_workspace.diff_stat
-                    if sandbox_workspace is not None
-                    else None
-                ),
-                operation_lock=(
-                    sandbox_workspace.operation_lock
-                    if sandbox_workspace is not None
-                    else None
-                ),
             )
         )
         agent = CodingAgent(
@@ -158,9 +106,6 @@ def run_eval_command(
             base_config.provider.name,
             base_config.provider.model,
             execute_case,
-            verification_environment_factory=lambda workspace: execution_environments[
-                workspace.resolve()
-            ],
         )
         json_path, markdown_path = write_reports(report, run_dir)
     except Exception:

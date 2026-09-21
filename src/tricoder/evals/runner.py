@@ -12,7 +12,6 @@ from typing import Literal, TypeAlias
 from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.subprocess_control import run_bounded_process
-from tricoder.sandbox.execution import ExecutionBackend, ExecutionRequest
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase, EvalSuite, VerificationSpec
@@ -30,9 +29,6 @@ from .workspace import (
 
 CaseStatus: TypeAlias = Literal["passed", "failed", "error"]
 AgentExecutor: TypeAlias = Callable[[EvalCase, Path, Path], RunResult]
-VerificationEnvironmentFactory: TypeAlias = Callable[
-    [Path], tuple[ExecutionBackend, CommandPolicy]
-]
 
 _ERROR_FAILURE_CODES = frozenset(
     {"executor_error", "workspace_error", "verification_error"}
@@ -80,7 +76,6 @@ def run_suite(
     provider: str,
     model: str,
     agent_executor: AgentExecutor,
-    verification_environment_factory: VerificationEnvironmentFactory | None = None,
 ) -> EvalRunReport:
     """Run every case independently and return a safe structured report."""
 
@@ -97,13 +92,7 @@ def run_suite(
     audit_root.mkdir()
 
     cases = tuple(
-        _run_case(
-            case,
-            workspaces_root,
-            audit_root,
-            agent_executor,
-            verification_environment_factory,
-        )
+        _run_case(case, workspaces_root, audit_root, agent_executor)
         for case in suite.cases
     )
     return EvalRunReport(
@@ -123,7 +112,6 @@ def _run_case(
     workspaces_root: Path,
     audit_root: Path,
     agent_executor: AgentExecutor,
-    verification_environment_factory: VerificationEnvironmentFactory | None,
 ) -> EvalCaseResult:
     started = time.perf_counter()
     workspace: Path | None = None
@@ -153,7 +141,6 @@ def _run_case(
             before=before,
             audit_root=audit_root,
             agent_executor=agent_executor,
-            verification_environment_factory=verification_environment_factory,
         )
     finally:
         try:
@@ -180,7 +167,6 @@ def _run_prepared_case(
     before: dict[str, FileFingerprint],
     audit_root: Path,
     agent_executor: AgentExecutor,
-    verification_environment_factory: VerificationEnvironmentFactory | None,
 ) -> EvalCaseResult:
     run_result: RunResult | None = None
     modified_files: tuple[str, ...] = ()
@@ -227,14 +213,8 @@ def _run_prepared_case(
 
     try:
         install_verifier(case, workspace)
-        environment = (
-            verification_environment_factory(workspace)
-            if verification_environment_factory is not None
-            else None
-        )
         verifications = tuple(
-            _run_verification(spec, workspace, environment=environment)
-            for spec in case.verifications
+            _run_verification(spec, workspace) for spec in case.verifications
         )
     except (OSError, WorkspaceSafetyError):
         return _case_result(
@@ -258,12 +238,9 @@ def _run_prepared_case(
 
 
 def _run_verification(
-    spec: VerificationSpec,
-    workspace: Path,
-    *,
-    environment: tuple[ExecutionBackend, CommandPolicy] | None = None,
+    spec: VerificationSpec, workspace: Path
 ) -> VerificationResult:
-    policy = environment[1] if environment is not None else CommandPolicy(workspace)
+    policy = CommandPolicy(workspace)
     try:
         args = policy.validate(spec.command)
     except PolicyError:
@@ -282,32 +259,13 @@ def _run_verification(
         )
 
     try:
-        if environment is None:
-            completed = run_bounded_process(
-                args,
-                cwd=workspace,
-                env=policy.subprocess_environment(),
-                timeout=spec.timeout,
-                max_output_bytes=_VERIFICATION_MAX_OUTPUT_BYTES,
-            )
-            returncode = completed.returncode
-            cleanup_failed = completed.cleanup_failed
-            output_exceeded = completed.output_exceeded
-            timed_out = completed.timed_out
-        else:
-            completed_backend = environment[0].execute(
-                ExecutionRequest(
-                    argv=tuple(args),
-                    cwd=".",
-                    timeout=spec.timeout,
-                    max_output_bytes=_VERIFICATION_MAX_OUTPUT_BYTES,
-                    environment=policy.subprocess_environment(),
-                )
-            )
-            returncode = completed_backend.returncode
-            cleanup_failed = not completed_backend.cleanup_confirmed
-            output_exceeded = completed_backend.output_exceeded
-            timed_out = completed_backend.timed_out
+        completed = run_bounded_process(
+            args,
+            cwd=workspace,
+            env=policy.subprocess_environment(),
+            timeout=spec.timeout,
+            max_output_bytes=_VERIFICATION_MAX_OUTPUT_BYTES,
+        )
     except Exception:
         return VerificationResult(
             spec.name,
@@ -316,14 +274,14 @@ def _run_verification(
             error_code="verification_error",
         )
 
-    if cleanup_failed or output_exceeded:
+    if completed.cleanup_failed or completed.output_exceeded:
         return VerificationResult(
             spec.name,
             exit_code=None,
             passed=False,
             error_code="verification_error",
         )
-    if timed_out:
+    if completed.timed_out:
         return VerificationResult(
             spec.name,
             exit_code=None,
@@ -331,10 +289,10 @@ def _run_verification(
             error_code="verification_timeout",
         )
 
-    passed = returncode == 0
+    passed = completed.returncode == 0
     return VerificationResult(
         spec.name,
-        exit_code=returncode,
+        exit_code=completed.returncode,
         passed=passed,
         error_code=None,
     )

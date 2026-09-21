@@ -16,7 +16,6 @@ from tricoder.models import (
     MCPConfig,
     MCPServerConfig,
     MemoryConfig,
-    SandboxConfig,
     ProviderConfig,
     SkillsConfig,
     WorktreeConfig,
@@ -554,8 +553,6 @@ def load_config(
     timeout: float | None = None,
     read_only: bool = False,
     plan_enabled: bool | None = None,
-    sandbox_mode: str | None = None,
-    sandbox_image: str | None = None,
 ) -> AppConfig:
     """按“命令行 > 环境变量 > 项目配置 > 默认值”加载配置。"""
 
@@ -686,34 +683,6 @@ def load_config(
         process_env,
     )
     memory = _parse_memory_config(project, env)
-    try:
-        sandbox = SandboxConfig(
-            mode=(sandbox_mode or "local").strip().lower(),
-            image=sandbox_image,
-        )
-    except (AttributeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
-    if sandbox.mode == "docker":
-        if resolved_audit_dir.is_relative_to(resolved_workspace):
-            raise ConfigError("Docker 模式的审计目录不能位于目标工作区内")
-        enabled_families: list[str] = []
-        if extensions.enabled:
-            enabled_families.append("extensions")
-        if mcp.enabled or any(server.enabled for server in mcp.servers):
-            enabled_families.append("MCP")
-        if skills.enabled:
-            enabled_families.append("skills")
-        if hooks.enabled:
-            enabled_families.append("hooks")
-        if worktree.enabled:
-            enabled_families.append("worktree")
-        if agents.enabled:
-            enabled_families.append("agents")
-        if enabled_families:
-            names = "、".join(enabled_families)
-            raise ConfigError(
-                f"Docker 模式尚未隔离 {names}；已在启动前拒绝，未运行扩展进程"
-            )
 
     return AppConfig(
         workspace=resolved_workspace,
@@ -739,5 +708,4 @@ def load_config(
         worktree=worktree,
         agents=agents,
         memory=memory,
-        sandbox=sandbox,
     )

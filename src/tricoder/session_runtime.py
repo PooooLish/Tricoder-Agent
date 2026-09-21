@@ -62,19 +62,6 @@ from tricoder.sessions import (
     safe_requirement_summary,
     validate_session_name,
 )
-from tricoder.sandbox.execution import (
-    ExecutionBackend,
-    build_command_policy,
-    build_execution_backend,
-)
-from tricoder.sandbox.workspace import SandboxWorkspace, SandboxWorkspaceError
-from tricoder.sandbox.publish import (
-    PublishExecution,
-    PublishPreview,
-    PublishUndoPreview,
-    SandboxPublishError,
-    SandboxPublisher,
-)
 from tricoder.tools import ToolContext, ToolRegistry, UndoConflictError
 from tricoder.verification import VerificationScope
 from tricoder.task_observation import current_task_observation, task_observation_scope
@@ -130,8 +117,6 @@ class RuntimeOptions:
     timeout: float | None = None
     read_only: bool = False
     plan_enabled: bool | None = None
-    sandbox_mode: str | None = None
-    sandbox_image: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,8 +131,6 @@ class ActiveSession:
     tools: ToolRegistry | None = None
     journal: ChangeJournal = field(default_factory=ChangeJournal)
     audit: AuditLogger | None = None
-    sandbox_workspace: SandboxWorkspace | None = None
-    sandbox_publisher: SandboxPublisher | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +275,6 @@ class SessionRuntime:
         approver: Callable[[str, str], bool] | None = None,
         observer: AgentObserver | None = None,
         mcp_manager_factory: Callable[..., object] | None = None,
-        execution_backend_factory: Callable[..., ExecutionBackend] = build_execution_backend,
     ) -> None:
         self.store = store
         self.options = options or RuntimeOptions()
@@ -308,7 +290,6 @@ class SessionRuntime:
         self._approver = approver or (lambda _action, _detail: False)
         self._observer = observer
         self._mcp_manager_factory = mcp_manager_factory
-        self._execution_backend_factory = execution_backend_factory
         self._unsaved_memory = False
         self._warning = ""
         self._memory_dirty = False
@@ -528,13 +509,6 @@ class SessionRuntime:
     def change_model(self, provider: str) -> ActiveSession:
         """先验证新配置并构建完整候选，最后才写入会话模型并替换当前值。"""
         original = self.current
-        current_backend = (
-            original.tools.context.execution_backend
-            if original.tools is not None
-            else None
-        )
-        if getattr(current_backend, "uncertain_container_id", None) is not None:
-            raise SessionRuntimeError("容器清理状态不确定，禁止在同一副本上重建执行后端")
         try:
             config = self._load_config(original.record.workspace, provider, self.options.model)
             candidate_record = replace(
@@ -1027,100 +1001,6 @@ class SessionRuntime:
                 f"无法显示，任务文件状态冲突：{'、'.join(latest.tainted_paths)}"
             )
         return render_change_set_diff(latest)
-
-    def render_sandbox_status(self) -> str:
-        """展示执行边界和待发布状态，不暴露源码或容器日志。"""
-
-        active = self.current
-        sandbox = active.sandbox_workspace
-        publisher = active.sandbox_publisher
-        if sandbox is None or publisher is None:
-            return "沙箱模式：local（项目代码直接在当前工作区受控执行）"
-        backend = active.tools.context.execution_backend if active.tools is not None else None
-        image_id = getattr(backend, "image_id", None) or active.config.sandbox.image or "未确认"
-        cleanup = (
-            "不确定，已冻结"
-            if getattr(backend, "uncertain_container_id", None) is not None
-            else "已确认或尚未执行"
-        )
-        pending = len(sandbox.changed_paths())
-        return (
-            "沙箱模式：docker\n"
-            f"原工作区：{sandbox.original_workspace}\n"
-            f"执行副本：{sandbox.execution_workspace}\n"
-            f"Session/generation：{sandbox.session_id}/{sandbox.generation}\n"
-            f"镜像：{image_id}\n"
-            f"容器清理：{cleanup}\n"
-            f"待发布文件：{pending}\n"
-            "Agent 完成不等于已写回原项目"
-        )
-
-    @_idle_runtime_change
-    def preview_sandbox_publish(self) -> PublishPreview:
-        publisher = self._sandbox_publisher()
-        try:
-            return publisher.prepare()
-        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
-            raise SessionRuntimeError(str(exc)) from exc
-
-    @_idle_runtime_change
-    def apply_sandbox_publish(self, preview: PublishPreview) -> PublishExecution:
-        publisher = self._sandbox_publisher(require_writable=True)
-        if self.current.memory.unknown_effects or self.current.context.unknown_effects:
-            raise SessionRuntimeError("文件影响未确认，禁止发布到原项目")
-        backend = self.current.tools.context.execution_backend if self.current.tools is not None else None
-        if getattr(backend, "uncertain_container_id", None) is not None:
-            raise SessionRuntimeError("容器清理状态不确定，禁止发布到原项目")
-        try:
-            execution = publisher.apply(preview)
-        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
-            raise SessionRuntimeError(str(exc)) from exc
-        self._audit_publish("apply", execution)
-        return execution
-
-    @_idle_runtime_change
-    def preview_sandbox_publish_undo(self) -> PublishUndoPreview:
-        publisher = self._sandbox_publisher(require_writable=True)
-        try:
-            return publisher.prepare_undo()
-        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
-            raise SessionRuntimeError(str(exc)) from exc
-
-    @_idle_runtime_change
-    def undo_sandbox_publish(self, preview: PublishUndoPreview) -> PublishExecution:
-        publisher = self._sandbox_publisher(require_writable=True)
-        try:
-            execution = publisher.undo(preview)
-        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
-            raise SessionRuntimeError(str(exc)) from exc
-        self._audit_publish("undo", execution)
-        if execution.ok:
-            self.current = self._invalidate_verification(self.current, force=True)
-            self._cache_current()
-        return execution
-
-    def _sandbox_publisher(self, *, require_writable: bool = False) -> SandboxPublisher:
-        publisher = self.current.sandbox_publisher
-        if publisher is None:
-            raise SessionRuntimeError("当前会话未启用 Docker 沙箱")
-        if require_writable and self.current.config.read_only:
-            raise SessionRuntimeError("只读模式禁止写回原项目")
-        return publisher
-
-    def _audit_publish(self, action: str, execution: PublishExecution) -> None:
-        if self.current.audit is None:
-            return
-        self.current.audit.log(
-            {
-                "event": "sandbox_publish",
-                "action": action,
-                "status": "succeeded" if execution.ok else "failed",
-                "paths": execution.paths,
-                "file_count": len(execution.paths),
-                "conflict_count": len(execution.conflicts),
-                "compensation_failed": execution.compensation_failed,
-            }
-        )
 
     @_idle_runtime_change
     def prepare_undo(self) -> UndoPreview:
@@ -1951,31 +1831,7 @@ class SessionRuntime:
             )
             return self._restore_conversation_memory(active)
         loaded = config or self._load_config(record.workspace, record.provider, record.model)
-        sandbox_workspace = None
-        execution_workspace = loaded.workspace
-        if loaded.sandbox.mode == "docker":
-            try:
-                sandbox_workspace = SandboxWorkspace.prepare(
-                    loaded.workspace,
-                    self.store.database_path.parent / "runtime" / "docker-sandbox",
-                    session_id=record.id,
-                    generation=0,
-                )
-            except SandboxWorkspaceError as exc:
-                raise SessionRuntimeError("无法准备 Docker 会话副本") from exc
-            execution_workspace = sandbox_workspace.execution_workspace
-        workspace_policy = self._workspace_policy_factory(execution_workspace)
-        execution_backend = self._execution_backend_factory(
-            loaded.sandbox,
-            execution_workspace,
-            session_id=record.id,
-            generation=0,
-            state_path=(
-                sandbox_workspace.control_path.with_name("container-state.json")
-                if sandbox_workspace is not None
-                else None
-            ),
-        )
+        workspace_policy = self._workspace_policy_factory(loaded.workspace)
         active_journal = journal or ChangeJournal()
         spill_store = ToolResultSpillStore(
             self.store.database_path.parent / "runtime" / "tool-results",
@@ -1987,40 +1843,13 @@ class SessionRuntime:
         tools = self._tool_registry_factory(
             ToolContext(
                 workspace_policy=workspace_policy,
-                command_policy=build_command_policy(
-                    loaded.sandbox,
-                    execution_workspace,
-                    local_factory=self._command_policy_factory,
-                ),
+                command_policy=self._command_policy_factory(loaded.workspace),
                 approver=self._effective_approver,
                 auto_approve_git=self._auto_approve_git_command,
                 read_only=loaded.read_only,
                 timeout=loaded.timeout,
                 change_journal=active_journal,
                 spill_store=spill_store,
-                execution_backend=execution_backend,
-                verification_scope=VerificationScope(
-                    sandbox_session_id=(
-                        sandbox_workspace.session_id
-                        if sandbox_workspace is not None
-                        else None
-                    ),
-                    sandbox_generation=(
-                        sandbox_workspace.generation
-                        if sandbox_workspace is not None
-                        else None
-                    ),
-                ),
-                workspace_diff=(
-                    sandbox_workspace.diff_stat
-                    if sandbox_workspace is not None
-                    else None
-                ),
-                operation_lock=(
-                    sandbox_workspace.operation_lock
-                    if sandbox_workspace is not None
-                    else None
-                ),
             )
         )
         if loaded.audit_dir is None:
@@ -2028,11 +1857,6 @@ class SessionRuntime:
         audit = self._audit_factory(loaded.audit_dir / f"session-{record.id}.jsonl")
         audit.prepare()
         agent = self._create_agent(loaded, tools, audit)
-        sandbox_publisher = (
-            SandboxPublisher(sandbox_workspace)
-            if sandbox_workspace is not None
-            else None
-        )
         active = ActiveSession(
             record,
             memory,
@@ -2047,8 +1871,6 @@ class SessionRuntime:
             tools,
             active_journal,
             audit,
-            sandbox_workspace,
-            sandbox_publisher,
         )
         return self._restore_conversation_memory(active)
 
@@ -2123,8 +1945,6 @@ class SessionRuntime:
             timeout=self.options.timeout,
             read_only=self.options.read_only,
             plan_enabled=self.options.plan_enabled,
-            sandbox_mode=self.options.sandbox_mode,
-            sandbox_image=self.options.sandbox_image,
         )
 
     def _mark_unsaved(self) -> None:

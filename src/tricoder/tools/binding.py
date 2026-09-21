@@ -5,30 +5,11 @@ from __future__ import annotations
 import os
 import secrets
 import stat
-from contextlib import contextmanager
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from tricoder.changes import FileIdentity
 from tricoder.policy import PolicyError
-
-
-_preserve_newlines: ContextVar[bool] = ContextVar(
-    "preserve_bound_file_newlines",
-    default=False,
-)
-
-
-@contextmanager
-def preserve_newlines():  # type: ignore[no-untyped-def]
-    """仅让受控发布事务精确保留 CRLF/LF；普通工具保持历史兼容语义。"""
-
-    token = _preserve_newlines.set(True)
-    try:
-        yield
-    finally:
-        _preserve_newlines.reset(token)
 
 
 def _stat_identity(metadata: os.stat_result) -> FileIdentity:
@@ -134,8 +115,7 @@ class _PosixDirectoryBinding(_DirectoryBinding):
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= os.O_NOFOLLOW
         descriptor = os.open(name, flags, dir_fd=self._fd)
-        newline = "" if _preserve_newlines.get() else None
-        with os.fdopen(descriptor, "r", encoding="utf-8", newline=newline) as file:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as file:
             metadata = os.fstat(file.fileno())
             content = file.read()
         return content, _stat_identity(metadata), metadata.st_mode
@@ -336,8 +316,7 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
             self._close_handle(handle)
 
     def read_text(self, name: str) -> tuple[str, FileIdentity, int]:
-        newline = "" if _preserve_newlines.get() else None
-        with (self.parent / name).open("r", encoding="utf-8", newline=newline) as file:
+        with (self.parent / name).open("r", encoding="utf-8") as file:
             metadata = os.fstat(file.fileno())
             content = file.read()
         return content, _stat_identity(metadata), metadata.st_mode

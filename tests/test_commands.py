@@ -162,19 +162,6 @@ class CommandParserTests(unittest.TestCase):
         self.assertTrue(specs["undo"].needs_confirmation)
         self.assertFalse(specs["status"].needs_confirmation)
 
-    def test_sandbox_commands_are_local_and_have_fixed_subcommands(self) -> None:
-        self.assertEqual(
-            ParsedCommand("sandbox", "status", None), parse_command("/sandbox")
-        )
-        for subcommand in ("status", "diff", "apply", "undo"):
-            self.assertEqual(
-                ParsedCommand("sandbox", subcommand, None),
-                parse_command(f"/sandbox {subcommand}"),
-            )
-        for text in ("/sandbox run", "/sandbox apply now"):
-            with self.subTest(text=text), self.assertRaises(CommandError):
-                parse_command(text)
-
 
 if __name__ == "__main__":
     unittest.main()
