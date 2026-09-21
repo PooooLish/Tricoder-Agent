@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from tricoder.subprocess_env import (
@@ -219,6 +219,8 @@ class CommandPolicy:
         workspace: Path | None = None,
         *,
         environ: Mapping[str, str] | None = None,
+        executable_resolver: Callable[[str], str] | None = None,
+        allow_git: bool = True,
     ) -> None:
         self._workspace_policy = (
             WorkspacePolicy(workspace) if workspace is not None else None
@@ -230,6 +232,8 @@ class CommandPolicy:
             environ,
             excluded_paths=tuple(excluded_paths),
         )
+        self._executable_resolver = executable_resolver
+        self._allow_git = allow_git
 
     def validate(self, command: str) -> list[str]:
         """返回可交给 `subprocess` 的参数数组，否则抛出策略错误。
@@ -266,6 +270,8 @@ class CommandPolicy:
         if executable in self._DISALLOWED_DIRECT_TOOLS:
             raise PolicyError(f"请通过 python -m 运行 {executable}，禁止直接调用")
         if executable in {"git", "git.exe"}:
+            if not self._allow_git:
+                raise PolicyError("当前执行模式不支持 git 子进程；请使用内置 git_diff")
             validated = self._validate_git(args)
             return [self._resolve_executable("git"), *validated[1:]]
         raise PolicyError(f"可执行程序不在允许列表中：{raw_executable}")
@@ -325,6 +331,11 @@ class CommandPolicy:
     def _resolve_executable(self, name: str) -> str:
         """把纯名称解析为可信绝对路径；失败即安全拒绝。"""
         try:
+            if self._executable_resolver is not None:
+                resolved = self._executable_resolver(name)
+                if not isinstance(resolved, str) or not resolved or "\x00" in resolved:
+                    raise ValueError("可信执行程序解析器返回了无效路径")
+                return resolved
             if name == "python":
                 return trusted_python_executable()
             return trusted_path_executable(name, self._subprocess_env)

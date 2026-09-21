@@ -98,7 +98,8 @@ class TerminalUI:
         )
         table.add_row("工作区", Text(str(config.workspace)))
         table.add_row("密钥来源", Text(config.key_source))
-        table.add_row("模式", "只读" if config.read_only else "可编辑 · 人工审批")
+        access = "只读" if config.read_only else "可编辑 · 人工审批"
+        table.add_row("模式", f"{access} · 执行 {config.sandbox.mode}")
         self.console.print(
             Panel(
                 table,
@@ -215,6 +216,14 @@ class TerminalUI:
         memory = getattr(active, "memory", None)
         table.add_row("上次文件状态检查", Text(getattr(memory, "verification", "未运行")))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
+        # 兼容测试/扩展中只实现旧配置字段的轻量对象；生产 AppConfig 始终
+        # 显式携带 sandbox，缺失时只能展示旧行为对应的 local，不能猜测 Docker。
+        sandbox = getattr(config, "sandbox", None)
+        table.add_row("执行模式", Text(getattr(sandbox, "mode", "local")))
+        sandbox_workspace = getattr(active, "sandbox_workspace", None)
+        if sandbox_workspace is not None:
+            table.add_row("执行副本", Text(str(sandbox_workspace.execution_workspace)))
+            table.add_row("发布状态", "Agent 完成不等于已写回原项目")
         table.add_row("上下文消息", str(len(getattr(context, "messages", ()))))
         if status.unsaved_memory:  # type: ignore[attr-defined]
             table.add_row("记忆", Text(status.warning or "本次记忆未持久化", style="yellow"))  # type: ignore[attr-defined]

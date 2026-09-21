@@ -584,12 +584,83 @@ class TricoderApp(App[None]):
                 self._permission(command.argument)
             elif command.name == "memory":
                 self._memory(command.subcommand, command.argument)
+            elif command.name == "sandbox":
+                self._sandbox(command.subcommand)
             elif command.name == "exit":
                 self.action_quit()
         except SessionRuntimeError as exc:
             self.log_line(
                 Text.assemble(("会话操作失败：", "red"), _p(exc))
             )
+
+    def _sandbox(self, subcommand: str | None) -> None:
+        if self.runtime is None:
+            return
+        if subcommand == "status":
+            for line in self.runtime.render_sandbox_status().splitlines():
+                self.log_line(_p(line))
+            return
+        if subcommand == "diff":
+            preview = self.runtime.preview_sandbox_publish()
+            self.log_line("[bold]Docker 副本待发布变更：[/bold]")
+            for line in preview.diff.splitlines():
+                self.log_line(_p(line))
+            return
+        if subcommand == "apply":
+            preview = self.runtime.preview_sandbox_publish()
+            self.log_line("[bold]待写回原项目的确切变更：[/bold]")
+            for line in preview.diff.splitlines():
+                self.log_line(_p(line))
+
+            async def apply_after_confirm() -> None:
+                approved = await self.push_screen_wait(
+                    ApprovalScreen("写回原项目", "将以上 Docker 副本变更写回原项目？")
+                )
+                if not approved or self.runtime is None:
+                    self.log_line("[dim]已取消写回；执行副本草稿仍保留[/dim]")
+                    return
+                try:
+                    result = await asyncio.to_thread(
+                        self.runtime.apply_sandbox_publish,
+                        preview,
+                    )
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("写回失败：", "red"), _p(exc)))
+                    return
+                if result.ok:
+                    self.log_line("[yellow]已写回原项目；验证仅适用于容器环境[/yellow]")
+                else:
+                    self.log_line("[red]写回未完整完成，请检查发布状态[/red]")
+
+            self.run_worker(apply_after_confirm, thread=False, name="sandbox-apply")
+            return
+
+        preview = self.runtime.preview_sandbox_publish_undo()
+        self.log_line("[bold]已发布变更撤销预览：[/bold]")
+        for line in preview.diff.splitlines():
+            self.log_line(_p(line))
+
+        async def undo_after_confirm() -> None:
+            approved = await self.push_screen_wait(
+                ApprovalScreen("撤销发布", "撤销最近一次原项目写回？")
+            )
+            if not approved or self.runtime is None:
+                self.log_line("[dim]已取消发布撤销[/dim]")
+                return
+            try:
+                result = await asyncio.to_thread(
+                    self.runtime.undo_sandbox_publish,
+                    preview,
+                )
+            except SessionRuntimeError as exc:
+                self.log_line(Text.assemble(("发布撤销失败：", "red"), _p(exc)))
+                return
+            if result.ok:
+                self.log_line("[yellow]已撤销原项目写回；执行副本草稿仍保留[/yellow]")
+            else:
+                self.log_line("[red]发布撤销未完整完成[/red]")
+
+        self.run_worker(undo_after_confirm, thread=False, name="sandbox-undo")
 
     def _show_help(self) -> None:
         for name, spec in list_commands().items():
@@ -758,6 +829,9 @@ class TricoderApp(App[None]):
         self.log_line(
             Text.assemble(("权限", "cyan"), " ", _p(self.runtime.permission_level))
         )
+        if config.sandbox.mode == "docker":
+            for line in self.runtime.render_sandbox_status().splitlines():
+                self.log_line(_p(line))
 
     def _clear_current(self) -> None:
         # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。

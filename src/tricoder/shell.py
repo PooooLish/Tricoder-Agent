@@ -117,6 +117,21 @@ class RuntimeLike(Protocol):
     def status(self) -> object:
         ...
 
+    def render_sandbox_status(self) -> str:
+        ...
+
+    def preview_sandbox_publish(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def apply_sandbox_publish(self, preview: object):  # type: ignore[no-untyped-def]
+        ...
+
+    def preview_sandbox_publish_undo(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def undo_sandbox_publish(self, preview: object):  # type: ignore[no-untyped-def]
+        ...
+
 
 class InteractiveShell:
     """维护输入循环并在本地分发命令的轻量交互层。"""
@@ -201,9 +216,42 @@ class InteractiveShell:
             self._permission(command.argument)
         elif command.name == "memory":
             self._memory(command)
+        elif command.name == "sandbox":
+            self._sandbox(command)
         elif command.name == "exit":
             return self._exit()
         return None
+
+    def _sandbox(self, command: ParsedCommand) -> None:
+        """发布命令始终先展示确切 diff，再单独确认原项目写回。"""
+
+        if command.subcommand == "status":
+            self.ui.show_notice(self.runtime.render_sandbox_status())
+            return
+        if command.subcommand == "diff":
+            preview = self.runtime.preview_sandbox_publish()
+            self.ui.show_diff(preview.diff, title="Docker 副本待发布变更")
+            return
+        if command.subcommand == "apply":
+            preview = self.runtime.preview_sandbox_publish()
+            self.ui.show_diff(preview.diff, title="待写回原项目的确切变更")
+            if not self.ui.confirm("将以上变更写回原项目？[y/N] "):
+                self.ui.show_notice("已取消写回；执行副本草稿仍保留")
+                return
+            result = self.runtime.apply_sandbox_publish(preview)
+            if not result.ok:
+                raise SessionRuntimeError("写回未完成；原项目未完整更新")
+            self.ui.show_notice("已写回原项目；验证结论仅适用于容器环境")
+            return
+        preview = self.runtime.preview_sandbox_publish_undo()
+        self.ui.show_diff(preview.diff, title="已发布变更撤销预览")
+        if not self.ui.confirm("撤销最近一次原项目写回？[y/N] "):
+            self.ui.show_notice("已取消发布撤销")
+            return
+        result = self.runtime.undo_sandbox_publish(preview)
+        if not result.ok:
+            raise SessionRuntimeError("发布撤销未完成")
+        self.ui.show_notice("已撤销最近一次原项目写回；执行副本草稿仍保留")
 
     def _memory(self, command: ParsedCommand) -> None:
         """记忆命令完全在本地执行，预览内容不会进入 Agent 或审计。"""

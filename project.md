@@ -1,12 +1,17 @@
 # Project: tricoder-cli
 
-## 2026-09-21 Docker 沙箱可行性与实施交接（待实施）
+## 2026-09-21 Docker 沙箱实施（P0—P5 代码与模拟验证已完成）
 
-- 方案：`docs/superpowers/plans/2026-09-21-docker-sandbox-implementation.md`。
-- 结论：架构可行；采用独立工作副本、容器执行、确认后回写。需覆盖 CLI、SessionRuntime、Eval 及 MCP/扩展边界。
-- 环境：当前 PATH 未找到 Docker，未验证 daemon、镜像、挂载或实际隔离；未安装、拉取或启动容器。
-- 本次仅创建方案并更新交接记录，未修改功能代码或运行功能回归。
-- 下一步：按 P0—P5 实施；保留现有未提交修改，先完成可独立实施的接口与模拟测试，再在获授权的 Docker 环境完成真实验收。
+- 方案：`docs/superpowers/plans/2026-09-21-docker-sandbox-implementation.md`；实现记录：`runtime/docker-sandbox-implementation/`。
+- 开始前按用户授权把既有会话记忆工作树提交为 `37bf05f` 并快进推送到 `origin/main`；完成验证后按后续授权在 `main` 创建单一 Docker 实现提交，本轮未推送。
+- P0/P1：新增显式 `SandboxConfig`、local/docker 执行后端与统一 CLI/SessionRuntime/Eval 装配。默认 local 完全保留；Docker CLI、daemon、镜像或策略失败绝不回退宿主执行。Docker 模式在启动前拒绝尚未隔离的 extensions/MCP/Skills/Hooks/Worktree/子 Agent。
+- P2：新增 Session/generation 独立工作副本和不含源码正文的控制清单。复制前排除敏感/生成路径，活动审计目录与 Session 数据库不得位于项目内；拒绝链接、reparse point、硬链接、特殊文件和资源超限。文件工具、命令、差异扫描与发布共用同一副本和锁，Docker 模式禁用所有 Git 子进程，以可信基线实现 `git_diff`。
+- P3：Docker CLI 后端固定本地 unix/npipe engine、已存在 Linux 镜像的实际 image ID、单一副本挂载及 network/read-only-root/capabilities/user/CPU/memory/PID/tmpfs/log 限制。create 前写入本地所有权记录和唯一标签；取消、超时、输出洪泛/磁盘软限额会操作真实容器，必须 stop→inspect→rm→inspect absent。清理不确定冻结副本；重启只按精确 Session/generation/token 标签恢复所属容器，不枚举或 prune。
+- P4：Docker 验证证据额外绑定 Session/generation、副本摘要、实际 image/container ID、命令摘要和清理状态。新增 `/sandbox status|diff|apply|undo`；发布预览绑定完整副本和原文件版本，首版只支持有界 UTF-8 文本新建/修改。并发冲突、不支持变更和过期预览整批拒绝，多文件失败使用既有安全补偿，发布撤销与副本内 `/undo` 分离。
+- P5：一次性 CLI 在 Agent 完成后另行展示并确认写回，拒绝时原项目不变且返回非零；chat/TUI 显示模式、副本与“完成不等于发布”；Eval 的 case 与隐藏 verifier 共用选定后端；`/clear` 保留未发布草稿，重启只恢复草稿、不恢复审批或验证能力。README 已同步用法、边界与回退。
+- 最终离线验证（Windows / Python 3.11.6）：Docker 专项 `Ran 40`，OK，2 项因 Windows 不支持 `mkfifo`/当前账户无 symlink 权限跳过；全项目 `Ran 1223 tests in 175.120s`，OK，8 项平台/权限跳过；`compileall` 与 `git diff --check` 通过。模拟测试包括输出洪泛后的容器删除、daemon 清理不确定冻结、发布冲突/补偿、只读与跨 Session 门禁。
+- 环境与真实验证：重新检查仍未在 PATH 或常见 Docker Desktop 路径找到 Docker；按授权限制未安装 Docker、拉取/构建镜像或启动真实容器。因此代码已实现、纯模拟生命周期和本地文件事务已验证，但 daemon、真实 bind mount、后台子进程、OOM/PID、镜像用户权限和内核隔离仍未实机证明。
+- 回退：启动时省略 Docker 参数或显式使用 `--sandbox local` 并新开会话；不要删除状态数据库或未发布副本。若容器清理状态不确定，先恢复 Docker 环境并让精确所有权记录完成清理，不要手工全局 prune。
 
 ## 2026-09-21 会话记忆第二轮审查修复（S1—S3 已完成）
 
@@ -98,8 +103,10 @@ Hcode capabilities through the approved native-adaptation roadmap.
 
 ## Non-goals
 
-- No OS-level sandbox implementation in the current migration; human approval
-  plus policy remain the primary boundary.
+- Docker mode is an explicit, defense-in-depth execution boundary, not a claim
+  of absolute OS isolation; local mode still relies on approval plus policy.
+- No remote Docker engine, automatic image pull/build, privileged container,
+  Docker-socket mount, hard disk quota, or automatic host-environment validation.
 - No Hcode Remote/WebSocket server or full free-text conversation persistence.
 - No dependency addition, external binary, or source-code reuse before its
   explicit approval and dependency/license gate.

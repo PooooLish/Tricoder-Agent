@@ -22,9 +22,17 @@ from tricoder.models import AppConfig, ProviderConfig, RunResult, SessionContext
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
 from tricoder.session_runtime import RuntimeOptions, SessionRuntime, SessionRuntimeError
+from tricoder.sandbox.execution import (
+    ExecutionBackendError,
+    build_command_policy,
+    build_execution_backend,
+)
+from tricoder.sandbox.workspace import SandboxWorkspace, SandboxWorkspaceError
+from tricoder.sandbox.publish import SandboxPublishError, SandboxPublisher
 from tricoder.sessions import SessionError, SessionStore, default_sessions_db
 from tricoder.shell import InteractiveShell
 from tricoder.tools import ToolContext, ToolRegistry
+from tricoder.verification import VerificationScope
 from tricoder.ui import TerminalUI
 
 
@@ -74,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
         timeout=None,
         read_only=False,
         no_plan=False,
+        sandbox="local",
+        docker_image=None,
     )
 
     doctor = subparsers.add_parser("doctor", help="检查本地配置，不发送 API 请求")
@@ -112,6 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="关闭颜色，适合 CI 或重定向输出",
     )
+    _add_sandbox_options(eval_command)
     run.add_argument("--max-rounds", type=int, help="最大模型调用轮数")
     run.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     run.add_argument("--timeout", type=float, help="API 与命令超时秒数")
@@ -149,6 +160,22 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         "--no-color",
         action="store_true",
         help="关闭颜色和动画，适合 CI 或重定向输出",
+    )
+    _add_sandbox_options(parser)
+
+
+def _add_sandbox_options(parser: argparse.ArgumentParser) -> None:
+    """沙箱必须由启动者显式选择；镜像不从项目配置隐式获取。"""
+
+    parser.add_argument(
+        "--sandbox",
+        choices=("local", "docker"),
+        default="local",
+        help="项目代码执行模式，默认 local",
+    )
+    parser.add_argument(
+        "--docker-image",
+        help="Docker 模式使用的已存在镜像引用（不会自动拉取或构建）",
     )
 
 
@@ -227,12 +254,19 @@ def main(
             timeout=getattr(args, "timeout", None),
             read_only=getattr(args, "read_only", False),
             plan_enabled=False if getattr(args, "no_plan", False) else None,
+            sandbox_mode=getattr(args, "sandbox", "local"),
+            sandbox_image=getattr(args, "docker_image", None),
         )
     except ConfigError as exc:
         ui.show_error("配置错误", str(exc).replace("tool_protocol", "工具协议"))
         return 2
 
     if args.command == "doctor":
+        try:
+            build_execution_backend(config.sandbox, config.workspace)
+        except (ExecutionBackendError, OSError, ValueError):
+            ui.show_error("配置错误", "Docker 执行后端不可用；未回退到本地执行")
+            return 2
         key_name = provider_key_env(args.provider)
         ui.show_doctor(config, key_name)
         console.print(f"工具协议：{config.tool_protocol}")
@@ -249,6 +283,32 @@ def main(
         ui.show_error("配置错误", "无法准备可写的审计日志")
         return 2
 
+    sandbox_workspace = None
+    execution_workspace = config.workspace
+    try:
+        if config.sandbox.mode == "docker":
+            sandbox_workspace = SandboxWorkspace.prepare(
+                config.workspace,
+                config.audit_dir / "runtime" / "docker-sandbox",
+                session_id=f"run-{run_id.replace('.', '-')}",
+                generation=0,
+            )
+            execution_workspace = sandbox_workspace.execution_workspace
+        execution_backend = build_execution_backend(
+            config.sandbox,
+            execution_workspace,
+            session_id=f"run-{run_id.replace('.', '-')}",
+            generation=0,
+            state_path=(
+                sandbox_workspace.control_path.with_name("container-state.json")
+                if sandbox_workspace is not None
+                else None
+            ),
+        )
+    except (ExecutionBackendError, SandboxWorkspaceError, OSError, ValueError):
+        ui.show_error("配置错误", "Docker 执行环境不可用；未回退到本地执行")
+        return 2
+
     spill_store = None
     if _mcp_effectively_enabled(config):
         try:
@@ -262,12 +322,35 @@ def main(
     provider = provider_factory(config.provider, config.timeout)
     tools = ToolRegistry(
         ToolContext(
-            workspace_policy=WorkspacePolicy(config.workspace),
-            command_policy=CommandPolicy(config.workspace),
+            workspace_policy=WorkspacePolicy(execution_workspace),
+            command_policy=build_command_policy(config.sandbox, execution_workspace),
             approver=ui.approve,
             read_only=config.read_only,
             timeout=config.timeout,
             spill_store=spill_store,
+            execution_backend=execution_backend,
+            verification_scope=VerificationScope(
+                sandbox_session_id=(
+                    sandbox_workspace.session_id
+                    if sandbox_workspace is not None
+                    else None
+                ),
+                sandbox_generation=(
+                    sandbox_workspace.generation
+                    if sandbox_workspace is not None
+                    else None
+                ),
+            ),
+            workspace_diff=(
+                sandbox_workspace.diff_stat
+                if sandbox_workspace is not None
+                else None
+            ),
+            operation_lock=(
+                sandbox_workspace.operation_lock
+                if sandbox_workspace is not None
+                else None
+            ),
         )
     )
     agent = CodingAgent(
@@ -312,6 +395,35 @@ def main(
                 ui.show_error("清理失败", "大型工具结果暂存未能安全清理")
     if spill_cleanup_failed:
         return 1
+    if sandbox_workspace is not None and sandbox_workspace.changed_paths():
+        if (
+            tools.context.verification_scope.unknown_effects
+            or getattr(execution_backend, "uncertain_container_id", None) is not None
+        ):
+            ui.show_error(
+                "无法发布 Docker 草稿",
+                "文件影响或容器执行结果未确认，已拒绝写回原项目",
+            )
+            return 1
+        publisher = SandboxPublisher(sandbox_workspace)
+        try:
+            preview = publisher.prepare()
+        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
+            ui.show_error("无法发布 Docker 草稿", str(exc))
+            return 1
+        ui.show_diff(preview.diff, title="待写回原项目的确切变更")
+        if not ui.confirm("将以上 Docker 副本变更写回原项目？[y/N] "):
+            ui.show_notice("已取消写回；原项目未修改，执行副本草稿仍保留")
+            return 1
+        try:
+            published = publisher.apply(preview)
+        except (SandboxPublishError, SandboxWorkspaceError, OSError, UnicodeError, ValueError) as exc:
+            ui.show_error("写回失败", str(exc))
+            return 1
+        if not published.ok:
+            ui.show_error("写回失败", "原项目未完整更新；请检查发布状态")
+            return 1
+        ui.show_notice("已写回原项目；验证结论仅适用于所选容器镜像")
     ui.show_complete(result, audit_path)
     return 0 if result.ok else 1
 
@@ -401,6 +513,8 @@ def _run_chat(
                 timeout=args.timeout,
                 read_only=args.read_only,
                 plan_enabled=False if args.no_plan else None,
+                sandbox_mode=args.sandbox,
+                sandbox_image=args.docker_image,
             ),
             provider_factory=provider_factory,
             approver=ui.approve,
@@ -451,6 +565,8 @@ def _run_tui(
                 timeout=args.timeout,
                 read_only=args.read_only,
                 plan_enabled=False if args.no_plan else None,
+                sandbox_mode=args.sandbox,
+                sandbox_image=args.docker_image,
             ),
             provider_factory=provider_factory,
             approver=approver,

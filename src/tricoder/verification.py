@@ -34,6 +34,19 @@ class WorkspaceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionBinding:
+    """Docker 验证证据的执行身份，不包含命令正文或源码。"""
+
+    session_id: str
+    generation: int
+    workspace_digest: str = field(repr=False)
+    image_id: str
+    container_id: str
+    command_digest: str = field(repr=False)
+    cleanup_confirmed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class VerificationEvidence:
     task_id: str
     command_id: str
@@ -41,9 +54,17 @@ class VerificationEvidence:
     after: WorkspaceSnapshot
     passed: bool
     _authority: object | None = field(default=None, repr=False, compare=False)
+    execution: ExecutionBinding | None = None
 
     def is_valid_for(self, current: WorkspaceSnapshot) -> bool:
-        return self.passed and stable_snapshots(self.before, self.after, current)
+        execution_valid = (
+            self.execution is None
+            or (
+                self.execution.cleanup_confirmed
+                and self.execution.workspace_digest == current.digest
+            )
+        )
+        return self.passed and execution_valid and stable_snapshots(self.before, self.after, current)
 
 
 def stable_snapshots(*snapshots: WorkspaceSnapshot) -> bool:
@@ -74,6 +95,8 @@ class VerificationScope:
     scan_timeout: float = field(default=10.0, repr=False)
     _authority: object = field(default_factory=object, repr=False)
     unknown_effects: bool = False
+    sandbox_session_id: str | None = None
+    sandbox_generation: int | None = None
 
     def begin_task(self) -> None:
         self.task_id = secrets.token_hex(16)
@@ -89,9 +112,17 @@ class VerificationScope:
             _audit_files=self.audit_files,
         )
 
-    def issue(self, before: WorkspaceSnapshot, after: WorkspaceSnapshot, passed: bool) -> VerificationEvidence:
+    def issue(
+        self,
+        before: WorkspaceSnapshot,
+        after: WorkspaceSnapshot,
+        passed: bool,
+        *,
+        execution: ExecutionBinding | None = None,
+    ) -> VerificationEvidence:
         return VerificationEvidence(self.task_id, secrets.token_hex(16), before, after,
-                                    passed and stable_snapshots(before, after), self._authority)
+                                    passed and stable_snapshots(before, after), self._authority,
+                                    execution)
 
     def owns(self, evidence: VerificationEvidence | None) -> bool:
         return type(evidence) is VerificationEvidence and evidence._authority is self._authority

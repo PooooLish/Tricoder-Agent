@@ -269,6 +269,32 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SandboxConfig:
+    """项目代码执行模式；Docker 必须由调用者显式选择镜像。"""
+
+    mode: str = "local"
+    image: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"local", "docker"}:
+            raise ValueError("sandbox.mode 只能是 local 或 docker")
+        if self.mode == "local":
+            if self.image is not None:
+                raise ValueError("local 模式不能配置 Docker 镜像")
+            return
+        if not isinstance(self.image, str) or not self.image.strip():
+            raise ValueError("docker 模式必须显式指定镜像")
+        image = self.image.strip()
+        if (
+            image != self.image
+            or len(image) > 255
+            or image.startswith("-")
+            or any(character.isspace() or character == "\x00" for character in image)
+        ):
+            raise ValueError("Docker 镜像引用格式无效")
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """一次 Agent 运行所需的完整配置。"""
 
@@ -290,6 +316,7 @@ class AppConfig:
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 @dataclass(frozen=True, slots=True)

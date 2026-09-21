@@ -16,6 +16,7 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 - **异步与可取消**：异步 Agent 是规范执行路径；取消信号可停止 Provider 读取、重试退避、后续工具和运行中的受管命令，且不会执行尚未完整生成的工具调用。
 - **token-aware 上下文**：优先使用 Provider 的真实 usage 作为前缀锚点，缺失时按 UTF-8 字节保守估算；压缩始终以完整任务块和工具回合为单位。
 - **大型结果安全暂存**：超过内联上限的工具输出写入 Session 隔离的 TriCoder 运行目录，模型只接收有界预览和不含本机路径的引用。
+- **可选 Docker 执行沙箱**：默认仍为 `local`；显式选择 `--sandbox docker` 后，文件工具与命令统一使用 Session 独立副本，项目命令在受限容器内执行，原项目只会在完整差异预览和再次确认后写回。
 - **统一 Extension Host**：扩展以安全 descriptor 和显式工具来源接入；生命周期失败隔离、名称冲突双方拒绝、内置工具优先，真实扩展默认关闭。
 
 ## Provider 用量与 KV Cache 指标
@@ -280,6 +281,19 @@ python -m tricoder run "修复重复提交问题并运行测试" `
   --max-context-chars 60000
 ```
 
+显式使用已经存在的本地 Linux 镜像（TriCoder 不会安装 Docker、拉取或构建镜像）：
+
+```powershell
+python -m tricoder run "修复 app.py 并运行 unittest" `
+  --workspace . `
+  --sandbox docker `
+  --docker-image "python@sha256:<64位镜像摘要>"
+```
+
+Docker 模式启动前会拒绝远程 `DOCKER_HOST`/显式 context 覆盖、位于项目内的活动审计目录、未隔离的 MCP/Skills/Hooks/Worktree/子 Agent，以及声明额外 volumes 的非 Linux 镜像。镜像必须已经存在并包含 `/usr/local/bin/python` 及任务依赖。每条命令使用新容器，固定 `network=none`、只读根文件系统、非 root 用户、`cap-drop=ALL`、`no-new-privileges`、有限 CPU/内存/PID/tmpfs 和有界日志；唯一可写宿主挂载是筛选后的执行副本。Docker 不可用或清理无法确认时会失败关闭，绝不回退到宿主机执行项目代码。
+
+容器完成只代表所选镜像内的副本运行结束，不代表代码已经写回，也不代表 Windows/Linux/macOS 原生环境均通过。一次性 `run` 会展示完整写回 diff 并再次要求确认；拒绝写回时返回非零码并保留草稿。交互模式使用 `/sandbox` 命令管理。当前开发机未安装 Docker，因此真实 daemon、镜像、挂载、OOM/PID 与内核隔离尚未完成实机验收；仓库测试只覆盖模拟 Docker CLI 生命周期，不能替代真实隔离证明。
+
 只读分析不会编辑文件或执行命令：
 
 ```powershell
@@ -321,6 +335,10 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/memory archive` | 只列出当前目标归档的 ID、类别、状态和容量，不显示正文。 |
 | `/memory archive delete <条目ID>` | 预览并确认删除一条归档；只改内存候选，需再次 `/memory save` 才能跨重启生效。 |
 | `/memory save` | 预览数据库位置、覆盖边界和精确 JSON；确认后以 Session、generation、原始状态及数据库 revision 比较写入。 |
+| `/sandbox` 或 `/sandbox status` | 显示 local/docker 模式、原工作区、执行副本、Session/generation、镜像、清理状态和待发布数量。 |
+| `/sandbox diff` | 本地显示执行副本相对发布基线的完整待写回文本差异，不修改原项目。 |
+| `/sandbox apply` | 再次生成并展示绑定当前 Session/generation 的精确预览；仅在确认后重验副本、原文件内容/身份并写回。删除、重命名、二进制、权限变化和新目录整批拒绝。 |
+| `/sandbox undo` | 独立预览并撤销最近一次原项目写回；不等同于 `/undo`，不会丢弃执行副本草稿。 |
 | `/clear` | 仅在输入 `y` 或 `yes` 后清除当前 Session 的运行时上下文、旧安全摘要和结构化语义记忆。 |
 | `/diff` | 本地展示当前 Session 最近一次非空任务的正向 unified diff，不发送给 Provider。 |
 | `/undo` | 先本地展示当前 Session 最近一次非空任务的完整反向 unified diff；仅在输入 `y` 或 `yes` 后尝试撤销整组变更。任何外部内容、权限模式或文件身份冲突都会拒绝全部写入；`--read-only` 会在预览或确认前拒绝撤销。 |
@@ -330,13 +348,15 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/session rename <名称>` | 重命名当前 Session。 |
 | `/permission` | 查看当前权限级别（strict / relaxed / fullaccess），级别随会话记忆持久化，重启或切换会话自动恢复。 |
 | `/permission relaxed` | 切换为 relaxed：仅不返回文件正文的 Git 元数据查询（受限的 `status`、`diff --stat`、`diff --name-only`）自动放行；`show`、`log`、补丁 diff 及一切能执行代码的命令继续要求人工审批；文件写入仍人工审批。 |
-| `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；**这不是进程沙盒**——命令仍受 `CommandPolicy` 白名单、`--read-only`、敏感路径与 git 仓库根边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
+| `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；在默认 `local` 模式下**这不是进程沙盒**。Docker 模式仍保留命令白名单、容器限制、敏感路径、发布确认与清理门禁，fullaccess 不能绕过这些边界。 |
 | `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |
 | `/exit` | 保存安全记忆并退出。 |
 
 `/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先构建并验证目标配置、策略、工具和 Agent；任何一步失败都会保留原 Session 和原工作区。
 
 `/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据、验证/审批安全状态和审计记录；它会清除当前会话的消息历史、可持久化摘要、结构化语义记忆，以及该 Session 的临时大型工具结果。语义记忆清除失败时不会恢复旧内容，本进程会标记“持久化清除待重试”并阻止 `/memory save`、编辑和旧记忆加载。
+
+Docker 模式下，`/clear` 也不会删除尚未发布的代码副本。重启会恢复完整草稿，但不会恢复旧审批或旧验证能力；再次执行、验证或发布前仍需重新核验。发布撤销账本只驻留当前进程，重启后草稿仍在，但不能自动恢复上次进程的 `/sandbox undo` 能力。
 
 内置文件工具失败不等于没有改动：已确认的残留路径仍会计入任务与会话状态，并使旧验证变为“待验证”。如果文件身份变化或后态无法核实，Session 会保留“文件影响未确认”（UNKNOWN）标记；该标记跨轮次及重启保存，当前 Session 的普通任务和撤销均被阻止。请先自行检查实际文件，再通过 `/clear` 的明确确认解除阻断；拒绝确认会保留阻断，清除记录不会恢复或撤销文件。`/status` 会显示未确认提示。
 
@@ -440,6 +460,10 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 ## 运行边界
 
 - 文件写入和命令执行都需要在终端明确输入 `y` 或 `yes` 审批；`--read-only` 会禁止这两类操作。
+- `--sandbox local` 是默认兼容模式，命令仍由受管宿主进程执行；只有显式 `--sandbox docker --docker-image ...` 才启用容器边界。Docker 失败不会回退 local。
+- Docker 副本在复制前排除 `.env*`、凭据路径、`.git`、虚拟环境、会话数据库和生成缓存；活动审计目录与 Session 数据库不得放在项目内。链接、reparse point、硬链接、特殊文件、文件数或字节预算超限都会拒绝整个副本。磁盘大小监测是有竞态的软限制，不是文件系统硬配额。
+- Docker 模式首版不复制 `.git`，`git_diff` 使用可信基线统计；`run_command` 中所有 Git 子进程都被拒绝。容器只接收固定非敏感环境，不接收 Provider Key、会话数据库或 Docker socket。
+- 原项目写回只支持有界 UTF-8 文本的新建和修改，且新文件父目录必须已经存在。确认后若副本或原文件发生变化会拒绝；多文件中途失败会尝试逆序补偿，补偿不确定时冻结后续发布。
 - `/permission relaxed` 与 `/permission fullaccess` 是显式降级：relaxed 仅自动放行受限的 Git 元数据查询，
   fullaccess 自动放行全部非危险工具（**明确不是进程沙盒**）；两者都**不放松**命令白名单、
   `--read-only`、敏感路径与 git 仓库根边界，默认 `strict` 模式下所有操作都审批。
@@ -494,7 +518,9 @@ python -m tricoder eval evals/smoke --dry-run --no-color
 
 真实运行的隔离工作副本、结构化结果和 Markdown 报告位于
 `runtime/evals/<run-id>/`。Eval 使用的 `fullaccess` 仅代表 TriCoder 自动批准策略
-允许的工具，**不是操作系统沙盒**；命令白名单、工作区边界和敏感环境变量过滤仍然
+允许的工具；默认 local 模式**不是操作系统沙盒**。可为 `eval` 显式增加
+`--sandbox docker --docker-image ...`，此时 case 工作区和隐藏 verifier 都使用同一受限
+容器后端，Docker 失败不会回退 local。命令白名单、工作区边界和敏感环境变量过滤始终
 生效。内置 smoke suite 的自动测试只验证离线框架与 fixture 合约，不代表已完成三家
 真实 Provider 的质量验证；真实运行会使用本机配置并可能产生费用。
 

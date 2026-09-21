@@ -47,15 +47,20 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
         "查看结构化记忆，或执行 refresh、预览确认 edit/save",
         takes_argument=True,
     ),
+    "sandbox": CommandSpec(
+        "查看 Docker 沙箱，或预览/确认发布及撤销已发布变更",
+        takes_argument=True,
+    ),
     "exit": CommandSpec("保存安全记忆并退出"),
 }
 
 _SESSION_SUBCOMMANDS = {"new", "current", "rename"}
 _MEMORY_SUBCOMMANDS = {"save", "edit", "refresh", "archive"}
+_SANDBOX_SUBCOMMANDS = {"status", "diff", "apply", "undo"}
 # 简单命令集合由注册表派生；session/permission 是带参数命令。
 _SIMPLE_COMMANDS = frozenset(
     name for name, spec in _COMMAND_SPECS.items()
-    if name not in {"session", "permission", "memory"}
+    if name not in {"session", "permission", "memory", "sandbox"}
 )
 
 
@@ -99,6 +104,14 @@ def parse_command(text: str) -> ParsedCommand:
         if argument is not None and argument not in {"strict", "relaxed", "fullaccess"}:
             raise CommandError("permission 只能是 strict、relaxed 或 fullaccess")
         return ParsedCommand("permission", None, argument)
+
+    if name == "sandbox":
+        if not remainder:
+            return ParsedCommand("sandbox", "status", None)
+        subcommand = remainder.strip().lower()
+        if " " in subcommand or subcommand not in _SANDBOX_SUBCOMMANDS:
+            raise CommandError("sandbox 只支持 status、diff、apply 或 undo")
+        return ParsedCommand("sandbox", subcommand, None)
 
     if name == "memory":
         if not remainder:
