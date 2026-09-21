@@ -44,14 +44,14 @@ _COMMAND_SPECS: dict[str, CommandSpec] = {
         takes_argument=True,
     ),
     "memory": CommandSpec(
-        "查看结构化记忆，或预览确认 edit/save",
+        "查看结构化记忆，或执行 refresh、预览确认 edit/save",
         takes_argument=True,
     ),
     "exit": CommandSpec("保存安全记忆并退出"),
 }
 
 _SESSION_SUBCOMMANDS = {"new", "current", "rename"}
-_MEMORY_SUBCOMMANDS = {"save", "edit"}
+_MEMORY_SUBCOMMANDS = {"save", "edit", "refresh", "archive"}
 # 简单命令集合由注册表派生；session/permission 是带参数命令。
 _SIMPLE_COMMANDS = frozenset(
     name for name, spec in _COMMAND_SPECS.items()
@@ -108,10 +108,26 @@ def parse_command(text: str) -> ParsedCommand:
         argument = memory_parts[1].strip() if len(memory_parts) == 2 else None
         if subcommand not in _MEMORY_SUBCOMMANDS:
             raise CommandError(f"不支持的记忆子命令：{memory_parts[0]}。")
-        if subcommand == "save":
+        if subcommand in {"save", "refresh"}:
             if argument:
-                raise CommandError("命令 /memory save 不接受参数。")
-            return ParsedCommand("memory", "save", None)
+                raise CommandError(f"命令 /memory {subcommand} 不接受参数。")
+            return ParsedCommand("memory", subcommand, None)
+        if subcommand == "archive":
+            if argument is None:
+                return ParsedCommand("memory", "archive", None)
+            archive_parts = argument.split()
+            if (
+                len(archive_parts) == 2
+                and archive_parts[0].lower() == "delete"
+            ):
+                return ParsedCommand(
+                    "memory",
+                    "archive-delete",
+                    archive_parts[1],
+                )
+            raise CommandError(
+                "命令只支持 /memory archive 或 /memory archive delete <条目ID>。"
+            )
         if not argument:
             raise CommandError("命令 /memory edit 需要条目 ID。")
         if len(argument.split()) != 1:

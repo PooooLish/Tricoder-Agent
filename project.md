@@ -1,5 +1,39 @@
 # Project: tricoder-cli
 
+## 2026-09-21 Docker 沙箱可行性与实施交接（待实施）
+
+- 方案：`docs/superpowers/plans/2026-09-21-docker-sandbox-implementation.md`。
+- 结论：架构可行；采用独立工作副本、容器执行、确认后回写。需覆盖 CLI、SessionRuntime、Eval 及 MCP/扩展边界。
+- 环境：当前 PATH 未找到 Docker，未验证 daemon、镜像、挂载或实际隔离；未安装、拉取或启动容器。
+- 本次仅创建方案并更新交接记录，未修改功能代码或运行功能回归。
+- 下一步：按 P0—P5 实施；保留现有未提交修改，先完成可独立实施的接口与模拟测试，再在获授权的 Docker 环境完成真实验收。
+
+## 2026-09-21 会话记忆第二轮审查修复（S1—S3 已完成）
+
+- 文档：`docs/superpowers/plans/2026-09-21-session-memory-review-round2.md`；证据：`runtime/session-memory-review-round2/`。
+- S1：新增只由可信成功任务推进的完成水位；保存预览与最终提交统一拒绝覆盖不足/越界候选。`/memory refresh` 只运行无工具摘要、最多两批，不重跑业务工具或直接写库；失败、取消、迟到结果、部分批次和压缩来源断层均不提交。`/memory` 与保存预览显示候选、运行时、已保存 revision 及覆盖范围。
+- S2：决策 `old → new` 的同 ID/同替代关系重放保持幂等，归档清理后仍可凭活跃替代元数据识别；冲突替代关系和未知旧 ID 继续拒绝。相同终结语义即使来自新消息来源也不重复归档。
+- S3：新增 `/memory archive` 和 `/memory archive delete <条目ID>`。列表只显示 ID/类别/状态与条目、字符容量；删除使用 Session/generation/revision/原始快照/消息序号绑定的精确预览，确认只改当前内存目标，不改活跃条目或可信执行状态，也不自动保存。再次 `/memory save` 后删除才跨重启生效。
+- 连续流程覆盖 A 候选→B 摘要失败→保存拒绝→刷新→保存→替代重放→40 条归档→确认删除→再保存→重启。该流程还发现并修复 `summary_max_chars > 6000` 时可保存但按默认上限加载失败的问题；Runtime 现用当前配置读取，SQLite schema 未变化。
+- 最终新鲜验证（Windows / Python 3.11.6）：记忆专项 `Ran 84`；Context `Ran 9`；SessionRuntime `Ran 59`；CLI/Shell/TUI `Ran 61`；全项目 `Ran 1180 tests in 186.769s`，OK，6 项为既有 Windows symlink/reparse 权限跳过；`compileall` 和 `git diff --check` 均 exit 0。TUI 测试出现约 0.109—0.125 秒慢回调诊断但无失败。
+- 兼容性：语义记忆仍默认关闭；`persistence=off` 不新增摘要请求或加载已保存语义记忆。schema v2 与旧行兼容规则不变，无数据库迁移。关闭功能不能恢复此前已压缩掉的原始历史。
+- 真实 Provider 补充验证：OpenAI、DeepSeek、GLM 的真实 Key 配置、网络和 native 工具协议均可用；三家无工具结构化记忆摘要均通过严格解析。DeepSeek 的 `fix-subtract` 隔离 Eval 完整通过。OpenAI 与 GLM 的同一 Eval 都完成正确文件修改且隐藏验证通过，但分别因 8 轮内未调用 `finish`、触发命令策略拒绝而以 `agent_failed` 结束；两家的最小 `read_file → finish` 真实任务均通过。因此不能表述为“三家完整 Coding Eval 全绿”。
+- 仍未验证：真实用户数据库、手工交互式 TUI、Linux/macOS、Python 3.12。真实验证未回显/保存 Key；未安装依赖、未提交或推送。
+- 回退：把 `[memory]` 的 `compaction` 与 `persistence` 设为 `off` 并新开会话；不要删除数据表或覆盖工作区。已确认保存的数据会保留但不加载。
+
+## 2026-09-20 会话记忆审查修复（R1—R4 已完成）
+
+- 文档：`docs/superpowers/plans/2026-09-20-session-memory-review-fixes.md`。
+- 修复前真实复现：编辑预览缺少会话绑定；收尾候选未覆盖最近任务；20 条待办后新增条目合并失败。跨会话问题在 runtime 接口层复现；CLI 同步确认期间没有切换入口，TUI 异步确认窗口由 runtime 绑定校验兜底。
+- R1 已完成：编辑和保存预览绑定 Session、generation、原始记忆快照、消息序号及持久化版本；最终提交重新校验候选结构与敏感内容。4 项原始缺陷复现和 2 项提交边界复现均先失败后通过；R1 最终 8 项及 56 项邻接回归通过。CLI 同步确认下未发现直接切换入口，TUI 异步模态期间仍由 runtime 绑定兜底。证据见 `runtime/session-memory-review/progress.md`。
+- R2 已完成：运行时压缩摘要与 `review_memory_candidate` 保存候选分离；保存覆盖位置之后的全部闭合任务，包括最后一个已完成任务，同时不删除近期内存历史。输入超限只按完整任务最多拆成两批，两批仍不足时拒绝标称完整保存且不发布部分候选。保存预览使用独立候选，确认后写库，重启再加载为运行时记忆。修复前单/双任务复现失败，修复后记忆专项 50 项通过。
+- R3 已完成：schema v2 增加 `state`、`replaces_id` 与有界归档；运行时压缩保持保守合并，待保存候选支持同 ID 更新、待办终结、决策替代和新任务目标归档。每类活跃项上限 20、归档上限 40；超限拒绝并保留旧记忆/历史。`/memory edit` 在 CLI/TUI 中可选择固定枚举状态，编辑待保存候选不会提前替换运行时正式记忆。
+- 数据库兼容：v1 行读取时在内存映射为 v2（旧待办→pending，目标/约束/决策→active），不会后台回写；下一次用户确认保存才以 v2 写入。未知版本或列/payload 不一致继续拒绝。
+- R4 已完成：新增假 Provider 连续流程，覆盖任务 A→任务 B 修正→模型切换→保存→重启恢复→会话隔离→clear，并断言真实 context/SQLite 状态和调用次数。README 已同步保存覆盖、状态/归档、额外调用和恢复边界。
+- 最终新鲜验证（Windows / Python 3.11.6）：记忆专项 62 项通过；全项目 `Ran 1154 tests in 152.584s`，OK，6 项均为既有 Windows symlink/reparse 权限跳过；`compileall` 与 `git diff --check` exit 0。证据见 `runtime/session-memory-review/`。
+- 未验证：真实 Provider 摘要质量、Linux/macOS、Python 3.12、真实用户数据库迁移。未安装依赖、未读取密钥/真实数据库、未调用真实模型、未提交或推送。
+- 下一步：在非敏感测试会话手工试用 structured/reviewed_summary；根据真实摘要质量决定是否继续优化候选差异展示和归档选择界面。
+
 ## 2026-09-19 真实 Provider 会话记忆兼容性修复
 
 - 真实试用确认业务工具任务成功，但收尾记忆候选被严格解析器拒绝；旧 UI 只显示统一警告，无法区分 JSON、截断、超时和 Provider 故障。

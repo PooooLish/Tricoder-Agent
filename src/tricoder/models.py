@@ -396,13 +396,25 @@ class SessionContext:
     conversation_memory: Any = field(
         default_factory=lambda: _empty_conversation_memory()
     )
+    # 独立的待保存候选可以覆盖仍保留在内存中的近期完整任务；它不会自动
+    # 注入下一轮模型请求，也不会改变运行时压缩边界。
+    review_memory_candidate: Any | None = None
     next_message_seq: int = 1
+    # 仅由 Agent 在可信成功终态推进；本地记忆编辑不会改变该水位。
+    # 保存入口据此判断候选是否覆盖最新已完成任务，即使对应原始消息已被压缩。
+    latest_completed_task_seq: int = 0
     persisted_memory_revision: int | None = None
     memory_pending_clear: bool = False
 
     def __post_init__(self) -> None:
         if type(self.next_message_seq) is not int or self.next_message_seq <= 0:
             raise ValueError("下一消息序号必须是正整数")
+        if (
+            type(self.latest_completed_task_seq) is not int
+            or self.latest_completed_task_seq < 0
+            or self.latest_completed_task_seq >= self.next_message_seq
+        ):
+            raise ValueError("最新完成任务序号必须位于已分配消息范围内")
         if self.persisted_memory_revision is not None and (
             type(self.persisted_memory_revision) is not int
             or self.persisted_memory_revision < 0
@@ -430,3 +442,12 @@ class SessionTurnResult:
     memory_usage: TokenUsage | None = None
     memory_calls: int = 0
     memory_warning: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRefreshResult:
+    """显式整理待保存候选的结果；不携带业务任务或工具执行结果。"""
+
+    context: SessionContext
+    memory_usage: TokenUsage | None = None
+    memory_calls: int = 0

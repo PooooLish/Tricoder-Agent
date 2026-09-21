@@ -82,6 +82,8 @@ class FakeRuntime:
         self.undo_latest_calls = 0
         self.memory_save_calls = 0
         self.memory_edit_calls = 0
+        self.memory_refresh_calls = 0
+        self.memory_archive_delete_calls = 0
         self.diff_result: str | None = EXPECTED_DIFF
         self.undo_preview = UndoPreview(EXPECTED_REVERSE_DIFF, ("src/app.py",))
         self.undo_execution = UndoExecution(True, ("src/app.py",))
@@ -186,7 +188,22 @@ class FakeRuntime:
     def save_memory_preview(self, preview: object) -> None:
         self.memory_save_calls += 1
 
-    def preview_memory_edit(self, item_id: str, text: str, scope: str):  # type: ignore[no-untyped-def]
+    def refresh_memory(self):  # type: ignore[no-untyped-def]
+        self.memory_refresh_calls += 1
+        return SimpleNamespace(memory_calls=1)
+
+    def render_memory_archive(self) -> str:
+        return "archive done-1 | open_items | done | 1/40"
+
+    def preview_memory_archive_delete(self, item_id: str):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(text=f"delete archive {item_id}")
+
+    def apply_memory_archive_delete(self, preview: object) -> None:
+        self.memory_archive_delete_calls += 1
+
+    def preview_memory_edit(
+        self, item_id: str, text: str, scope: str, state: str | None = None,
+    ):  # type: ignore[no-untyped-def]
         return SimpleNamespace(text=f"edit {item_id}: {text} [{scope}]", revision=1)
 
     def apply_memory_edit(self, preview: object) -> None:
@@ -462,12 +479,37 @@ class InteractiveShellTests(unittest.TestCase):
         shell.execute("/memory save")
         self.assertEqual(1, self.runtime.memory_save_calls)
 
-        inputs = iter(("保持接口兼容", "session"))
+        inputs = iter(("保持接口兼容", "session", "active"))
         edit_shell = self.shell(lambda _prompt: next(inputs))
         edit_shell.execute("/memory edit api")
         self.assertEqual(1, self.runtime.memory_edit_calls)
         self.assertEqual(0, self.runtime.run_task_calls)
         self.assertEqual(0, self.runtime.provider.calls)
+
+    def test_memory_refresh_is_local_and_does_not_enter_business_task_loop(self) -> None:
+        shell = self.shell()
+
+        shell.execute("/memory refresh")
+
+        self.assertEqual(1, self.runtime.memory_refresh_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertTrue(any("刷新" in item for item in self.ui.text))
+
+    def test_memory_archive_view_and_delete_require_exact_confirmation(self) -> None:
+        shell = self.shell()
+        shell.execute("/memory archive")
+        self.assertTrue(any("done-1" in item for item in self.ui.text))
+
+        self.ui.answers = ["no", "yes"]
+        shell.execute("/memory archive delete done-1")
+        self.assertEqual(0, self.runtime.memory_archive_delete_calls)
+        shell.execute("/memory archive delete done-1")
+
+        self.assertEqual(1, self.runtime.memory_archive_delete_calls)
+        self.assertEqual(0, self.runtime.run_task_calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertTrue(any("尚未自动保存" in item for item in self.ui.text))
 
     def test_model_configuration_failure_keeps_current_selection(self) -> None:
         """模型配置失败时 Shell 仅报告错误，运行时 Session 不变。"""

@@ -10,6 +10,7 @@ from tricoder.context.memory import (
     ConversationMemory,
     MemoryValidationError,
     merge_candidate,
+    merge_review_candidate,
     source_id_for_sequence,
 )
 from tricoder.models import Message, SessionContext, TokenUsage, ToolDefinition
@@ -65,6 +66,16 @@ class CompactionPlan:
     before_estimated_tokens: int
     after_estimated_tokens: int
     over_hard_limit: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SaveCandidatePlan:
+    """保存候选计划；只选择来源，不删除任何运行时历史。"""
+
+    source_messages: tuple[Message, ...]
+    covered_through: int
+    needs_summary: bool
     reason: str | None = None
 
 
@@ -322,6 +333,117 @@ class ContextManager:
             after_tokens,
             False,
         )
+
+    def plan_save_candidate(
+        self,
+        messages: Sequence[Message],
+        *,
+        covered_through: int,
+    ) -> SaveCandidatePlan:
+        """选择保存边界之后的全部已完成任务，不改变近期内存历史。"""
+
+        if type(covered_through) is not int or covered_through < 0:
+            raise ValueError("covered_through 必须是非负整数")
+        copied = tuple(messages)
+        task_indexes = [
+            index for index, message in enumerate(copied) if message.kind == "task"
+        ]
+        if not task_indexes:
+            return SaveCandidatePlan((), covered_through, False, "没有已完成任务")
+        if any(
+            message.role != "system" and message.kind != "memory_edit"
+            for message in copied[: task_indexes[0]]
+        ):
+            return SaveCandidatePlan((), covered_through, False, "任务历史起点无效")
+
+        selected: list[Message] = []
+        selected_sequences: list[int] = []
+        for position, start in enumerate(task_indexes):
+            end = task_indexes[position + 1] if position + 1 < len(task_indexes) else len(copied)
+            block = list(copied[start:end])
+            checked = [
+                message
+                for message in block
+                if message.role != "system" and message.kind != "memory_edit"
+            ]
+            if not self._is_closed_task_block(checked):
+                return SaveCandidatePlan(
+                    (),
+                    covered_through,
+                    False,
+                    "存在未闭合的任务或工具调用组",
+                )
+            sequences = [
+                message.message_seq
+                for message in checked
+                if message.message_seq is not None
+            ]
+            if not sequences or any(type(sequence) is not int for sequence in sequences):
+                raise MemoryValidationError("记忆保存候选缺少稳定消息序号")
+            if max(sequences) <= covered_through:
+                continue
+            if min(sequences) <= covered_through:
+                raise MemoryValidationError("保存覆盖边界落在完整任务内部")
+            selected.extend(block)
+            selected_sequences.extend(sequences)
+
+        if not selected:
+            return SaveCandidatePlan((), covered_through, False, "没有新的已完成任务")
+        return SaveCandidatePlan(
+            tuple(selected),
+            max(selected_sequences),
+            True,
+        )
+
+    def merge_save_candidate(
+        self,
+        previous: ConversationMemory,
+        current_messages: Sequence[Message],
+        plan: SaveCandidatePlan,
+        candidate: ConversationMemory,
+        *,
+        summary_max_chars: int = 6_000,
+    ) -> ConversationMemory:
+        """重新核对来源后合并保存候选，但不删除或替换运行时消息。"""
+
+        if not plan.needs_summary or not plan.source_messages:
+            raise MemoryValidationError("保存计划没有可合并的来源消息")
+        copied = tuple(current_messages)
+        source_count = len(plan.source_messages)
+        if not any(
+            copied[index : index + source_count] == plan.source_messages
+            for index in range(len(copied) - source_count + 1)
+        ):
+            raise MemoryValidationError("保存候选来源已变化")
+        if candidate.covered_through != plan.covered_through:
+            raise MemoryValidationError("保存候选覆盖位置与计划不一致")
+        allowed_sources = {
+            source_id_for_sequence(message.message_seq)
+            for message in plan.source_messages
+            if message.message_seq is not None
+        }
+        return merge_review_candidate(
+            previous,
+            candidate,
+            allowed_source_ids=allowed_sources,
+            max_chars=summary_max_chars,
+        )
+
+    def split_save_source_batches(
+        self,
+        source_messages: Sequence[Message],
+    ) -> tuple[tuple[Message, ...], ...]:
+        """在完整任务边界把积压来源最多拆成两个连续批次。"""
+
+        copied = tuple(source_messages)
+        task_indexes = [
+            index for index, message in enumerate(copied) if message.kind == "task"
+        ]
+        if len(task_indexes) <= 1 or task_indexes[0] != 0:
+            return (copied,) if copied else ()
+        split_task = len(task_indexes) // 2
+        split_index = task_indexes[split_task]
+        return copied[:split_index], copied[split_index:]
 
     def record_usage(
         self,

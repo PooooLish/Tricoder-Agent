@@ -120,10 +120,30 @@ class CommandParserTests(unittest.TestCase):
             ParsedCommand("memory", "save", None), parse_command("/memory save")
         )
         self.assertEqual(
+            ParsedCommand("memory", "refresh", None),
+            parse_command("/memory refresh"),
+        )
+        self.assertEqual(
+            ParsedCommand("memory", "archive", None),
+            parse_command("/memory archive"),
+        )
+        self.assertEqual(
+            ParsedCommand("memory", "archive-delete", "done-1"),
+            parse_command("/memory archive delete done-1"),
+        )
+        self.assertEqual(
             ParsedCommand("memory", "edit", "constraint-api"),
             parse_command("/memory edit constraint-api"),
         )
-        for text in ("/memory save extra", "/memory edit", "/memory unknown"):
+        for text in (
+            "/memory save extra",
+            "/memory refresh extra",
+            "/memory archive extra",
+            "/memory archive delete",
+            "/memory archive delete done-1 extra",
+            "/memory edit",
+            "/memory unknown",
+        ):
             with self.subTest(text=text), self.assertRaises(CommandError):
                 parse_command(text)
 

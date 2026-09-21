@@ -441,6 +441,53 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("strict", app.runtime.permission_level)
 
+    async def test_memory_archive_command_renders_runtime_metadata(self) -> None:
+        """TUI 的归档查看命令调用只读 Runtime 入口。"""
+
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with mock.patch.object(
+                app.runtime,
+                "render_memory_archive",
+                return_value="ARCHIVE-METADATA-MARKER",
+            ) as render:
+                await self._submit(pilot, "/memory archive")
+                for _ in range(10):
+                    await pilot.pause()
+
+        render.assert_called_once_with()
+        self.assertTrue(
+            any("ARCHIVE-METADATA-MARKER" in line for line in app._lines)
+        )
+
+    async def test_memory_archive_delete_requires_confirmation(self) -> None:
+        """TUI 只有在用户确认确切预览后才应用单条归档删除。"""
+
+        app = self._make_app([])
+        preview = mock.Mock(text="ARCHIVE-DELETE-PREVIEW")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with mock.patch.object(
+                app.runtime,
+                "preview_memory_archive_delete",
+                return_value=preview,
+            ) as build_preview, mock.patch.object(
+                app.runtime,
+                "apply_memory_archive_delete",
+            ) as apply_preview:
+                await self._submit(pilot, "/memory archive delete done-1")
+                await self._wait_approval(pilot)
+                apply_preview.assert_not_called()
+                await pilot.press("y")
+                for _ in range(30):
+                    await pilot.pause()
+                    if apply_preview.called:
+                        break
+
+        build_preview.assert_called_once_with("done-1")
+        apply_preview.assert_called_once_with(preview)
+
     async def test_planning_failure_error_is_visible_outside_rounds(self) -> None:
         """规划阶段错误在尚无轮次时仍显示在总日志，不被折叠块吞掉。"""
 

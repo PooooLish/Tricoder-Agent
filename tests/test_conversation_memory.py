@@ -30,8 +30,9 @@ def item(
     *sources: str,
     scope: str = "session",
     task_id: str | None = None,
+    state: str = "active",
 ) -> MemoryItem:
-    return MemoryItem(item_id, text, tuple(sources), scope, task_id)
+    return MemoryItem(item_id, text, tuple(sources), scope, task_id, state=state)
 
 
 class ConversationMemoryTests(unittest.TestCase):
@@ -43,7 +44,12 @@ class ConversationMemoryTests(unittest.TestCase):
             goal=item("goal", "完成会话记忆", "m1"),
             constraints=(item("constraint-api", "不改公共接口", "m2"),),
             decisions=(item("decision-db", "使用独立 SQLite 表", "m3"),),
-            open_items=(item("todo-tests", "补充重启测试", "m8", scope="task", task_id="task-7"),),
+            open_items=(
+                item(
+                    "todo-tests", "补充重启测试", "m8", scope="task",
+                    task_id="task-7", state="pending",
+                ),
+            ),
         )
 
         encoded = memory_to_json(memory)

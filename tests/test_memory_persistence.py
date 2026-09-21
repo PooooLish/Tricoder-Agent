@@ -8,7 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from tricoder.context.memory import ConversationMemory, MemoryItem, memory_to_json
+from tricoder.context.memory import (
+    ConversationMemory,
+    MemoryItem,
+    memory_to_json,
+    merge_review_candidate,
+)
 from tricoder.models import (
     AppConfig,
     MemoryConfig,
@@ -117,6 +122,64 @@ class MemoryPersistenceStoreTests(unittest.TestCase):
             ),
         )
         self.assertEqual((second, 5), restarted.load_conversation_memory(record.id))
+
+    def test_v1_database_row_loads_in_memory_and_next_save_upgrades_to_v2(self) -> None:
+        """旧行先兼容读取；只有用户后续保存时才升级持久化 schema。"""
+
+        store = SessionStore(self.database, id_factory=lambda: "session-1")
+        store.initialize(self.workspace)
+        record = store.create("one", self.workspace, "openai", "test")
+        v1_payload = {
+            "schema_version": 1,
+            "revision": 1,
+            "generation": 0,
+            "covered_through": 2,
+            "goal": None,
+            "constraints": [],
+            "decisions": [],
+            "open_items": [
+                {
+                    "id": "todo",
+                    "text": "旧待办",
+                    "source_ids": ["m1"],
+                    "scope": "session",
+                    "task_id": None,
+                }
+            ],
+        }
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute(
+                "INSERT INTO conversation_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.id, 1, 1, 0, 2, 3,
+                    json.dumps(v1_payload, ensure_ascii=False), "now",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        loaded, next_sequence = store.load_conversation_memory(record.id) or (None, None)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(2, loaded.schema_version)
+        self.assertEqual("pending", loaded.open_items[0].state)
+        self.assertEqual(3, next_sequence)
+
+        store.save_conversation_memory(
+            record.id, loaded, next_message_seq=3, expected_revision=1
+        )
+        connection = sqlite3.connect(self.database)
+        try:
+            schema_version, payload_json = connection.execute(
+                "SELECT schema_version, payload_json FROM conversation_memory WHERE session_id = ?",
+                (record.id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(2, schema_version)
+        self.assertEqual(2, json.loads(payload_json)["schema_version"])
 
     def test_corrupt_or_unknown_payload_is_not_loaded_or_deleted(self) -> None:
         store = SessionStore(self.database, id_factory=lambda: "session-1")
@@ -270,7 +333,9 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
         updated = replace(
             self.saved,
             revision=2,
-            open_items=(MemoryItem("todo", "补充重启测试", ("m2",), "session"),),
+            open_items=(
+                MemoryItem("todo", "补充重启测试", ("m2",), "session", state="pending"),
+            ),
         )
         runtime.current = replace(
             runtime.current,
@@ -302,7 +367,12 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
         sensitive = replace(
             updated,
             revision=3,
-            open_items=(MemoryItem("secret", "api_key=SECRET-SENTINEL", ("m2",), "session"),),
+            open_items=(
+                MemoryItem(
+                    "secret", "api_key=SECRET-SENTINEL", ("m2",), "session",
+                    state="pending",
+                ),
+            ),
         )
         runtime.current = replace(
             runtime.current,
@@ -324,14 +394,53 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
         self.assertEqual("保持公共接口兼容", current.conversation_memory.constraints[0].text)
         self.assertEqual(("m3",), current.conversation_memory.constraints[0].source_ids)
         self.assertEqual(4, current.next_message_seq)
+        self.assertEqual(2, current.latest_completed_task_seq)
         self.assertEqual((self.saved, 3), self.store.load_conversation_memory(self.record.id))
+
+    def test_local_edit_can_finish_todo_without_promoting_review_candidate(self) -> None:
+        """终结状态进入归档；编辑待保存候选时不污染运行时上下文。"""
+
+        runtime = self._runtime("reviewed_summary")
+        review = replace(
+            self.saved,
+            revision=2,
+            covered_through=4,
+            open_items=(
+                MemoryItem("todo", "补生命周期测试", ("m4",), "session", state="pending"),
+            ),
+        )
+        runtime.current = replace(
+            runtime.current,
+            context=replace(
+                runtime.current.context,
+                review_memory_candidate=review,
+                next_message_seq=5,
+            ),
+        )
+
+        preview = runtime.preview_memory_edit(
+            "todo", "补生命周期测试", "session", "done"
+        )
+        runtime.apply_memory_edit(preview)
+
+        context = runtime.current.context
+        self.assertEqual(self.saved, context.conversation_memory)
+        self.assertIsNotNone(context.review_memory_candidate)
+        candidate = context.review_memory_candidate
+        assert isinstance(candidate, ConversationMemory)
+        self.assertEqual((), candidate.open_items)
+        self.assertEqual("done", candidate.archived[0].item.state)
+        self.assertEqual(3, candidate.revision)
+        self.assertEqual(6, context.next_message_seq)
 
     def test_database_save_failure_keeps_exact_candidate_for_direct_retry(self) -> None:
         runtime = self._runtime("reviewed_summary")
         candidate = replace(
             self.saved,
             revision=2,
-            open_items=(MemoryItem("todo", "继续验证", ("m2",), "session"),),
+            open_items=(
+                MemoryItem("todo", "继续验证", ("m2",), "session", state="pending"),
+            ),
         )
         runtime.current = replace(
             runtime.current,
@@ -374,6 +483,57 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
 
         self.assertEqual(expected, runtime.current.context.conversation_memory)
         self.assertEqual(target_id, runtime.current.record.id)
+
+    def test_repeated_decision_replacement_remains_idempotent_after_restart(self) -> None:
+        """替代关系持久化后仍可安全重放，不依赖进程内临时状态。"""
+
+        old = MemoryItem("decision-old", "使用旧方案", ("m1",), "session")
+        replacement = MemoryItem(
+            "decision-new",
+            "使用新方案",
+            ("m3",),
+            "session",
+            replaces_id="decision-old",
+        )
+        before = ConversationMemory(
+            revision=1,
+            generation=2,
+            covered_through=2,
+            decisions=(old,),
+        )
+        first = merge_review_candidate(
+            before,
+            ConversationMemory(
+                revision=before.revision,
+                generation=before.generation,
+                covered_through=3,
+                decisions=(replacement,),
+            ),
+            allowed_source_ids={"m3"},
+        )
+        self.store.save_conversation_memory(
+            self.record.id,
+            first,
+            next_message_seq=4,
+            expected_revision=1,
+        )
+        restarted = self._runtime("reviewed_summary")
+        restored = restarted.current.context.conversation_memory
+
+        repeated = merge_review_candidate(
+            restored,
+            ConversationMemory(
+                revision=restored.revision,
+                generation=restored.generation,
+                covered_through=4,
+                decisions=(replacement,),
+            ),
+            allowed_source_ids=set(),
+        )
+
+        self.assertEqual((replacement,), repeated.decisions)
+        self.assertEqual(first.archived, repeated.archived)
+        self.assertEqual(4, repeated.covered_through)
 
 
 if __name__ == "__main__":

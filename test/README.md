@@ -21,3 +21,38 @@
    然后用 `run_command` 执行 `python hello.py` 验证输出。
 
 通过以上三步即可体验完整的读取、审批修改与命令执行流程。
+
+## 贪吃蛇小游戏
+
+本目录提供了一个控制台版贪吃蛇游戏。
+
+### 文件
+
+- `snake_game.py` — 游戏主体：核心逻辑 `SnakeGame`、终端渲染 `TerminalRenderer`、入口 `main()`
+- `test_snake_game.py` — 核心逻辑的自动测试
+
+### 启动游戏
+
+```bash
+python snake_game.py
+```
+
+### 操作方式
+
+| 按键 | 功能 |
+|------|------|
+| 方向键 / W A S D | 控制蛇移动 |
+| `r` | 重新开始 |
+| `q` | 退出游戏 |
+
+### 游戏规则
+
+- 蛇每吃到一个食物（`*`）长度增长 1，分数 +1
+- 撞墙或撞到自己则游戏结束
+- 填满整个棋盘即可获胜
+
+### 运行测试
+
+```bash
+python -m pytest test_snake_game.py
+```

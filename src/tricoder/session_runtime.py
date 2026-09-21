@@ -27,8 +27,15 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
 from tricoder.context.spill import SpillError, ToolResultSpillStore
+from tricoder.context.summarizer import (
+    MemorySummaryError,
+    memory_summary_failure_code,
+    memory_summary_failure_label,
+)
 from tricoder.context.memory import (
+    ArchivedMemoryItem,
     ConversationMemory,
+    MAX_ARCHIVED_ITEMS,
     MemoryItem,
     MemoryValidationError,
     memory_source_ids,
@@ -39,6 +46,7 @@ from tricoder.context.memory import (
 from tricoder.config import AppConfig, ConfigError, load_config, preview_provider_models
 from tricoder.models import (
     ProviderConfig,
+    MemoryRefreshResult,
     Message,
     RunResult,
     SessionContext,
@@ -138,10 +146,14 @@ class RuntimeStatus:
 class MemorySavePreview:
     """用户确认的确切保存候选；candidate 不进入 repr 或审计。"""
 
+    session_id: str
+    generation: int
     revision: int
     persisted_revision: int | None
     next_message_seq: int
     text: str
+    original_memory: ConversationMemory = field(repr=False)
+    original_review_candidate: ConversationMemory | None = field(repr=False)
     candidate: ConversationMemory = field(repr=False)
 
 
@@ -149,9 +161,30 @@ class MemorySavePreview:
 class MemoryEditPreview:
     """本地编辑的 revision 绑定预览。"""
 
+    session_id: str
+    generation: int
     revision: int
     next_message_seq: int
     text: str
+    original_memory: ConversationMemory = field(repr=False)
+    original_review_candidate: ConversationMemory | None = field(repr=False)
+    targets_review_candidate: bool
+    candidate: ConversationMemory = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryArchiveDeletePreview:
+    """归档逐项删除的确切预览；只删除归档，不触碰同名活跃内容。"""
+
+    session_id: str
+    generation: int
+    revision: int
+    next_message_seq: int
+    text: str
+    original_memory: ConversationMemory = field(repr=False)
+    original_review_candidate: ConversationMemory | None = field(repr=False)
+    targets_review_candidate: bool
+    archived_item: ArchivedMemoryItem = field(repr=False)
     candidate: ConversationMemory = field(repr=False)
 
 
@@ -184,6 +217,14 @@ class ContextAgent(Protocol):
         event_sink: EventSink | None = None,
     ):  # type: ignore[no-untyped-def]
         """在调用方事件循环内运行任务。"""
+
+    def refresh_review_memory(
+        self,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> MemoryRefreshResult:
+        """仅整理待保存候选，不进入业务工具循环。"""
 
 
 ActiveSessionFactory = Callable[[SessionRecord, SessionMemory, RuntimeOptions], ActiveSession]
@@ -535,6 +576,72 @@ class SessionRuntime:
         finally:
             if cleanup.has_pending:
                 self._pending_cleanup.append(cleanup)
+            self._finish_task_ownership()
+
+    def refresh_memory(self) -> MemoryRefreshResult:
+        """串行刷新待保存候选；失败或取消时不提交迟到或部分结果。"""
+
+        if not self._task_lock.acquire(blocking=False):
+            raise SessionRuntimeError("已有 Agent 任务正在运行")
+        if self._pending_cleanup:
+            self._task_lock.release()
+            raise SessionRuntimeError("旧任务资源清理尚未确认，禁止刷新会话记忆")
+        if self._task_active:
+            self._task_lock.release()
+            raise SessionRuntimeError("已有 Agent 任务正在运行")
+        original = self.current
+        try:
+            with self._task_state_lock:
+                if self._shutdown_requested:
+                    raise SessionRuntimeError("Runtime 正在退出，禁止刷新会话记忆")
+                self._task_cancellation = CancellationToken()
+                self._task_active = True
+                self._task_accepts_cancellation = True
+            self._task_session_id = original.record.id
+            refresh = getattr(original.agent, "refresh_review_memory", None)
+            if not callable(refresh):
+                raise SessionRuntimeError("当前 Agent 不支持会话记忆刷新")
+            try:
+                result = refresh(
+                    original.context,
+                    cancellation=self._task_cancellation,
+                )
+            except CancellationError as exc:
+                raise SessionRuntimeError("会话记忆刷新已取消；原候选保持不变") from exc
+            except MemorySummaryError as exc:
+                label = memory_summary_failure_label(
+                    memory_summary_failure_code(exc)
+                )
+                raise SessionRuntimeError(
+                    f"会话记忆刷新失败（{label}）；原候选保持不变"
+                ) from exc
+            except MemoryValidationError as exc:
+                raise SessionRuntimeError(
+                    "会话记忆刷新结果无效；原候选保持不变"
+                ) from exc
+            if not isinstance(result, MemoryRefreshResult):
+                raise SessionRuntimeError("会话记忆刷新结果类型无效")
+            with self._task_state_lock:
+                cancelled = bool(
+                    self._task_cancellation is not None
+                    and self._task_cancellation.is_cancelled
+                )
+                self._task_accepts_cancellation = False
+            if cancelled:
+                raise SessionRuntimeError("会话记忆刷新已取消；原候选保持不变")
+            if (
+                self.current.record.id != original.record.id
+                or self.current.context != original.context
+            ):
+                raise SessionRuntimeError("会话状态在刷新期间已变化，拒绝提交候选")
+            candidate = result.context.review_memory_candidate
+            if not isinstance(candidate, ConversationMemory):
+                raise SessionRuntimeError("会话记忆刷新未生成有效候选")
+            self._require_complete_memory_candidate(result.context, candidate)
+            self.current = replace(original, context=result.context)
+            self._cache_current()
+            return result
+        finally:
             self._finish_task_ownership()
 
     def _finish_task_ownership(self) -> None:
@@ -1135,13 +1242,83 @@ class SessionRuntime:
         memory = context.conversation_memory
         if not isinstance(memory, ConversationMemory):
             raise SessionRuntimeError("会话记忆状态无效")
+        review_candidate = context.review_memory_candidate
+        if review_candidate is not None and not isinstance(
+            review_candidate, ConversationMemory
+        ):
+            raise SessionRuntimeError("会话记忆保存候选状态无效")
+        displayed = review_candidate or memory
         saved = (
             "未保存"
             if context.persisted_memory_revision is None
             else f"已保存 revision {context.persisted_memory_revision}"
         )
         pending = "；持久化清除待重试" if context.memory_pending_clear else ""
-        return f"会话记忆（revision {memory.revision}，{saved}{pending}）\n{memory_to_json(memory)}"
+        display_label = "待保存候选" if review_candidate is not None else "运行时记忆"
+        target = context.latest_completed_task_seq
+        if displayed.covered_through == target:
+            coverage = f"覆盖状态：完整（消息 {displayed.covered_through}）"
+        elif displayed.covered_through < target:
+            coverage = (
+                "候选覆盖不足："
+                f"当前到消息 {displayed.covered_through}，目标到消息 {target}"
+            )
+        else:
+            coverage = (
+                "覆盖边界无效："
+                f"当前到消息 {displayed.covered_through}，目标到消息 {target}"
+            )
+        return (
+            f"会话记忆（显示：{display_label} revision {displayed.revision}；"
+            f"运行时 revision {memory.revision}；{saved}{pending}；{coverage}）\n"
+            f"{memory_to_json(displayed)}"
+        )
+
+    def render_memory_archive(self) -> str:
+        """列出当前目标归档的必要元信息和容量，不显示条目正文。"""
+
+        context = self.current.context
+        memory = context.conversation_memory
+        review_candidate = context.review_memory_candidate
+        if not isinstance(memory, ConversationMemory) or (
+            review_candidate is not None
+            and not isinstance(review_candidate, ConversationMemory)
+        ):
+            raise SessionRuntimeError("会话记忆状态无效")
+        displayed = review_candidate or memory
+        target = "待保存候选" if review_candidate is not None else "运行时记忆"
+        encoded_chars = len(memory_to_json(displayed))
+        limit = self.current.config.memory.summary_max_chars
+        lines = [
+            f"归档目标：{target}",
+            f"归档容量：{len(displayed.archived)}/{MAX_ARCHIVED_ITEMS}；"
+            f"字符容量：{encoded_chars}/{limit}",
+        ]
+        if not displayed.archived:
+            lines.append("当前没有归档条目")
+        else:
+            lines.extend(
+                f"- {entry.item.id} | {entry.section} | {entry.item.state}"
+                for entry in displayed.archived
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _require_complete_memory_candidate(
+        context: SessionContext,
+        candidate: ConversationMemory,
+    ) -> None:
+        """保存只能覆盖到 Agent 已确认成功结束的最新任务水位。"""
+
+        target = context.latest_completed_task_seq
+        if candidate.covered_through < target:
+            raise SessionRuntimeError(
+                "会话记忆候选覆盖不足："
+                f"当前覆盖到消息 {candidate.covered_through}，"
+                f"最新已完成任务到消息 {target}；请先运行 /memory refresh"
+            )
+        if candidate.covered_through > target:
+            raise SessionRuntimeError("会话记忆候选覆盖边界无效，请重新刷新")
 
     @_idle_runtime_change
     def preview_memory_save(self) -> MemorySavePreview:
@@ -1155,20 +1332,33 @@ class SessionRuntime:
         memory = context.conversation_memory
         if not isinstance(memory, ConversationMemory):
             raise SessionRuntimeError("会话记忆状态无效")
-        encoded = memory_to_json(memory)
+        review_candidate = context.review_memory_candidate
+        if review_candidate is not None and not isinstance(
+            review_candidate, ConversationMemory
+        ):
+            raise SessionRuntimeError("会话记忆保存候选状态无效")
+        candidate = review_candidate or memory
+        self._require_complete_memory_candidate(context, candidate)
+        encoded = memory_to_json(candidate)
         if _SENSITIVE_MEMORY_PATTERN.search(encoded):
             raise SessionRuntimeError("候选可能包含敏感或私有内容；请先本地编辑或拒绝保存")
         text = (
             f"保存位置：{self.store.database_path}\n"
+            f"覆盖状态：完整；候选到消息 {candidate.covered_through}；"
+            f"最新已完成任务到消息 {context.latest_completed_task_seq}\n"
             f"将保存字段：目标、约束、决策、待办、来源、scope、revision；"
             f"不保存源码正文或原始工具输出。\n{encoded}"
         )
         return MemorySavePreview(
-            memory.revision,
-            context.persisted_memory_revision,
-            context.next_message_seq,
-            text,
-            memory,
+            session_id=self.current.record.id,
+            generation=memory.generation,
+            revision=memory.revision,
+            persisted_revision=context.persisted_memory_revision,
+            next_message_seq=context.next_message_seq,
+            text=text,
+            original_memory=memory,
+            original_review_candidate=review_candidate,
+            candidate=candidate,
         )
 
     @_idle_runtime_change
@@ -1182,16 +1372,42 @@ class SessionRuntime:
             raise SessionRuntimeError("会话记忆持久化未启用")
         if context.memory_pending_clear:
             raise SessionRuntimeError("持久化清除尚未完成，禁止保存旧记忆")
+        memory = context.conversation_memory
+        current_candidate = context.review_memory_candidate or memory
         if (
-            context.conversation_memory != preview.candidate
-            or context.conversation_memory.revision != preview.revision
+            not isinstance(memory, ConversationMemory)
+            or self.current.record.id != preview.session_id
+            or memory != preview.original_memory
+            or memory.generation != preview.generation
+            or memory.revision != preview.revision
+            or context.review_memory_candidate != preview.original_review_candidate
+            or preview.candidate != current_candidate
             or context.persisted_memory_revision != preview.persisted_revision
             or context.next_message_seq != preview.next_message_seq
         ):
             raise SessionRuntimeError("候选在确认期间已变化，请重新预览")
+        self._require_complete_memory_candidate(context, current_candidate)
+        allowed_sources = memory_source_ids(memory) | memory_source_ids(current_candidate)
+        allowed_sources.update(
+            source_id_for_sequence(message.message_seq)
+            for message in context.messages
+            if message.message_seq is not None
+        )
+        try:
+            validate_candidate(
+                preview.candidate,
+                allowed_source_ids=allowed_sources,
+                expected_generation=preview.generation,
+                max_chars=self.current.config.memory.summary_max_chars,
+            )
+            encoded = memory_to_json(preview.candidate)
+        except MemoryValidationError as exc:
+            raise SessionRuntimeError("会话记忆保存候选无效") from exc
+        if _SENSITIVE_MEMORY_PATTERN.search(encoded):
+            raise SessionRuntimeError("候选可能包含敏感或私有内容；请重新预览")
         try:
             saved_revision = self.store.save_conversation_memory(
-                self.current.record.id,
+                preview.session_id,
                 preview.candidate,
                 preview.next_message_seq,
                 preview.persisted_revision,
@@ -1210,6 +1426,7 @@ class SessionRuntime:
         item_id: str,
         text: str,
         scope: str,
+        state: str | None = None,
     ) -> MemoryEditPreview:
         """生成本地编辑候选；空文本表示删除，确认前不修改任何状态。"""
 
@@ -1219,32 +1436,50 @@ class SessionRuntime:
         memory = context.conversation_memory
         if not isinstance(memory, ConversationMemory):
             raise SessionRuntimeError("会话记忆状态无效")
+        review_candidate = context.review_memory_candidate
+        if review_candidate is not None and not isinstance(
+            review_candidate, ConversationMemory
+        ):
+            raise SessionRuntimeError("会话记忆保存候选状态无效")
+        base = review_candidate or memory
         if not isinstance(item_id, str) or not item_id.strip():
             raise SessionRuntimeError("记忆条目 ID 不能为空")
         if not isinstance(text, str) or len(text) > 500:
             raise SessionRuntimeError("记忆条目文本不能超过 500 字符")
         if scope not in {"task", "session"}:
             raise SessionRuntimeError("记忆 scope 只能是 task 或 session")
+        if state is not None and state not in {
+            "active", "pending", "done", "cancelled", "superseded",
+        }:
+            raise SessionRuntimeError("记忆 state 无效")
         source_id = source_id_for_sequence(context.next_message_seq)
-        candidate = self._edited_memory(memory, item_id.strip(), text, scope, source_id)
+        candidate = self._edited_memory(
+            base, item_id.strip(), text, scope, source_id, state
+        )
         try:
             validate_candidate(
                 candidate,
-                allowed_source_ids=memory_source_ids(memory) | {source_id},
+                allowed_source_ids=memory_source_ids(base) | {source_id},
                 max_chars=self.current.config.memory.summary_max_chars,
             )
         except MemoryValidationError as exc:
             raise SessionRuntimeError("记忆编辑候选无效") from exc
         action = "删除" if not text.strip() else "更新"
+        state_text = state or "保持原状态"
         preview_text = (
-            f"{action}条目 {item_id.strip()}；scope={scope}；"
-            f"确认时绑定 revision {memory.revision}。\n{memory_to_json(candidate)}"
+            f"{action}条目 {item_id.strip()}；scope={scope}；state={state_text}；"
+            f"确认时绑定 revision {base.revision}。\n{memory_to_json(candidate)}"
         )
         return MemoryEditPreview(
-            memory.revision,
-            context.next_message_seq,
-            preview_text,
-            candidate,
+            session_id=self.current.record.id,
+            generation=base.generation,
+            revision=base.revision,
+            next_message_seq=context.next_message_seq,
+            text=preview_text,
+            original_memory=memory,
+            original_review_candidate=review_candidate,
+            targets_review_candidate=review_candidate is not None,
+            candidate=candidate,
         )
 
     @_idle_runtime_change
@@ -1255,28 +1490,179 @@ class SessionRuntime:
             raise SessionRuntimeError("记忆编辑预览无效")
         context = self.current.context
         memory = context.conversation_memory
+        review_candidate = context.review_memory_candidate
+        base = review_candidate or memory
         if (
             not isinstance(memory, ConversationMemory)
-            or memory.revision != preview.revision
+            or not isinstance(base, ConversationMemory)
+            or self.current.record.id != preview.session_id
+            or memory != preview.original_memory
+            or review_candidate != preview.original_review_candidate
+            or base.generation != preview.generation
+            or base.revision != preview.revision
+            or (review_candidate is not None) != preview.targets_review_candidate
             or context.next_message_seq != preview.next_message_seq
             or context.memory_pending_clear
         ):
             raise SessionRuntimeError("记忆在确认期间已变化，请重新预览")
+        source_id = source_id_for_sequence(preview.next_message_seq)
+        try:
+            validate_candidate(
+                preview.candidate,
+                allowed_source_ids=memory_source_ids(base) | {source_id},
+                expected_generation=preview.generation,
+                max_chars=self.current.config.memory.summary_max_chars,
+            )
+        except MemoryValidationError as exc:
+            raise SessionRuntimeError("记忆编辑候选无效") from exc
+        if (
+            preview.candidate.revision != preview.revision + 1
+            or preview.candidate.covered_through != base.covered_through
+        ):
+            raise SessionRuntimeError("记忆编辑候选无效")
         source_message = Message(
             "user",
             "用户已确认本地记忆编辑",
             kind="memory_edit",
             message_seq=preview.next_message_seq,
         )
-        self.current = replace(
-            self.current,
-            context=replace(
-                context,
-                messages=(*context.messages, source_message),
-                conversation_memory=preview.candidate,
-                next_message_seq=preview.next_message_seq + 1,
-            ),
+        next_context = replace(
+            context,
+            messages=(*context.messages, source_message),
+            next_message_seq=preview.next_message_seq + 1,
         )
+        if preview.targets_review_candidate:
+            next_context = replace(
+                next_context,
+                review_memory_candidate=preview.candidate,
+            )
+        else:
+            next_context = replace(
+                next_context,
+                conversation_memory=preview.candidate,
+            )
+        self.current = replace(self.current, context=next_context)
+        self._cache_current()
+
+    @_idle_runtime_change
+    def preview_memory_archive_delete(
+        self,
+        item_id: str,
+    ) -> MemoryArchiveDeletePreview:
+        """生成归档逐项删除预览；确认前不修改内存或数据库。"""
+
+        context = self.current.context
+        if context.memory_pending_clear:
+            raise SessionRuntimeError("持久化清除尚未完成，禁止整理旧记忆")
+        memory = context.conversation_memory
+        review_candidate = context.review_memory_candidate
+        if not isinstance(memory, ConversationMemory) or (
+            review_candidate is not None
+            and not isinstance(review_candidate, ConversationMemory)
+        ):
+            raise SessionRuntimeError("会话记忆状态无效")
+        normalized_id = item_id.strip() if isinstance(item_id, str) else ""
+        if not normalized_id:
+            raise SessionRuntimeError("归档条目 ID 不能为空")
+        base = review_candidate or memory
+        matches = [
+            (index, entry)
+            for index, entry in enumerate(base.archived)
+            if entry.item.id == normalized_id
+        ]
+        if len(matches) != 1:
+            raise SessionRuntimeError("找不到唯一的归档记忆条目")
+        index, archived_item = matches[0]
+        remaining = (*base.archived[:index], *base.archived[index + 1 :])
+        candidate = replace(
+            base,
+            revision=base.revision + 1,
+            archived=remaining,
+        )
+        try:
+            validate_candidate(
+                candidate,
+                allowed_source_ids=memory_source_ids(base),
+                expected_generation=base.generation,
+                max_chars=self.current.config.memory.summary_max_chars,
+            )
+        except MemoryValidationError as exc:
+            raise SessionRuntimeError("归档删除候选无效") from exc
+        target = "待保存候选" if review_candidate is not None else "运行时记忆"
+        after_chars = len(memory_to_json(candidate))
+        text = (
+            f"删除归档条目 {normalized_id}；类别={archived_item.section}；"
+            f"state={archived_item.item.state}；目标={target}。\n"
+            f"删除后容量：归档 {len(candidate.archived)}/{MAX_ARCHIVED_ITEMS}；"
+            f"字符容量 {after_chars}/{self.current.config.memory.summary_max_chars}。\n"
+            "确认只更新当前内存候选，不立即改写数据库；"
+            "如需跨重启生效，请再次执行 /memory save。"
+        )
+        return MemoryArchiveDeletePreview(
+            session_id=self.current.record.id,
+            generation=base.generation,
+            revision=base.revision,
+            next_message_seq=context.next_message_seq,
+            text=text,
+            original_memory=memory,
+            original_review_candidate=review_candidate,
+            targets_review_candidate=review_candidate is not None,
+            archived_item=archived_item,
+            candidate=candidate,
+        )
+
+    @_idle_runtime_change
+    def apply_memory_archive_delete(
+        self,
+        preview: MemoryArchiveDeletePreview,
+    ) -> None:
+        """确认后删除仍与预览完全一致的一条归档；不自动保存数据库。"""
+
+        if not isinstance(preview, MemoryArchiveDeletePreview):
+            raise SessionRuntimeError("归档删除预览无效")
+        context = self.current.context
+        memory = context.conversation_memory
+        review_candidate = context.review_memory_candidate
+        base = review_candidate or memory
+        if (
+            not isinstance(memory, ConversationMemory)
+            or not isinstance(base, ConversationMemory)
+            or self.current.record.id != preview.session_id
+            or memory != preview.original_memory
+            or review_candidate != preview.original_review_candidate
+            or base.generation != preview.generation
+            or base.revision != preview.revision
+            or (review_candidate is not None) != preview.targets_review_candidate
+            or context.next_message_seq != preview.next_message_seq
+            or context.memory_pending_clear
+        ):
+            raise SessionRuntimeError("记忆在确认期间已变化，请重新预览")
+        try:
+            index = base.archived.index(preview.archived_item)
+        except ValueError as exc:
+            raise SessionRuntimeError("归档条目在确认期间已变化，请重新预览") from exc
+        expected = replace(
+            base,
+            revision=base.revision + 1,
+            archived=(*base.archived[:index], *base.archived[index + 1 :]),
+        )
+        if preview.candidate != expected:
+            raise SessionRuntimeError("归档删除候选无效，请重新预览")
+        try:
+            validate_candidate(
+                preview.candidate,
+                allowed_source_ids=memory_source_ids(base),
+                expected_generation=preview.generation,
+                max_chars=self.current.config.memory.summary_max_chars,
+            )
+        except MemoryValidationError as exc:
+            raise SessionRuntimeError("归档删除候选无效") from exc
+        next_context = (
+            replace(context, review_memory_candidate=preview.candidate)
+            if preview.targets_review_candidate
+            else replace(context, conversation_memory=preview.candidate)
+        )
+        self.current = replace(self.current, context=next_context)
         self._cache_current()
 
     @staticmethod
@@ -1286,6 +1672,7 @@ class SessionRuntime:
         text: str,
         scope: str,
         source_id: str,
+        state: str | None,
     ) -> ConversationMemory:
         sections: dict[str, list[MemoryItem]] = {
             "constraints": list(memory.constraints),
@@ -1303,6 +1690,7 @@ class SessionRuntime:
         if found is None:
             raise SessionRuntimeError("找不到记忆条目")
         section, index, old = found
+        archived = list(memory.archived)
         if not text.strip():
             if section == "goal":
                 goal = None
@@ -1310,8 +1698,32 @@ class SessionRuntime:
                 del sections[section][index]
         else:
             task_id = None if scope == "session" else (old.task_id or f"task-memory-{source_id[1:]}")
-            updated = MemoryItem(old.id, text.strip(), (source_id,), scope, task_id)
-            if section == "goal":
+            next_state = old.state if state is None else state
+            allowed_states = {
+                "goal": {"active", "superseded"},
+                "constraints": {"active"},
+                "decisions": {"active", "superseded"},
+                "open_items": {"pending", "done", "cancelled"},
+            }[section]
+            if next_state not in allowed_states:
+                raise SessionRuntimeError("所选 state 不适用于该记忆类别")
+            updated = MemoryItem(
+                old.id,
+                text.strip(),
+                (source_id,),
+                scope,
+                task_id,
+                state=next_state,
+                replaces_id=old.replaces_id if next_state == "active" else None,
+            )
+            terminal = next_state in {"done", "cancelled", "superseded"}
+            if terminal:
+                archived.append(ArchivedMemoryItem(section, updated))
+                if section == "goal":
+                    goal = None
+                else:
+                    del sections[section][index]
+            elif section == "goal":
                 goal = updated
             else:
                 sections[section][index] = updated
@@ -1323,6 +1735,7 @@ class SessionRuntime:
             constraints=tuple(sections["constraints"]),
             decisions=tuple(sections["decisions"]),
             open_items=tuple(sections["open_items"]),
+            archived=tuple(archived),
         )
 
     def preview_models(self) -> dict[str, str]:
@@ -1466,7 +1879,10 @@ class SessionRuntime:
 
         if active.config.memory.persistence != "reviewed_summary":
             return active
-        loaded = self.store.load_conversation_memory(active.record.id)
+        loaded = self.store.load_conversation_memory(
+            active.record.id,
+            max_chars=active.config.memory.summary_max_chars,
+        )
         if loaded is None:
             return active
         memory, next_message_seq = loaded
@@ -1474,6 +1890,7 @@ class SessionRuntime:
             active.context,
             conversation_memory=memory,
             next_message_seq=next_message_seq,
+            latest_completed_task_seq=memory.covered_through,
             persisted_memory_revision=memory.revision,
             # 加载语义记忆不能恢复或提升任何可信执行状态。
             verification_evidence=None,

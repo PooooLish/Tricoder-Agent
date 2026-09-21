@@ -13,7 +13,7 @@ from tricoder.context.memory import (
     MemoryValidationError,
     memory_from_json,
     memory_source_ids,
-    memory_to_json,
+    memory_to_prompt_json,
     source_id_for_sequence,
 )
 from tricoder.core.cancellation import CancellationError, CancellationToken
@@ -37,14 +37,17 @@ kind=protocol_feedback 是协议纠错噪声，不得整理成目标、约束、
 只输出一个 JSON 对象，不得使用 Markdown、代码围栏或附加说明。对象必须精确包含：
 {"goal":null,"constraints":[],"decisions":[],"open_items":[]}
 goal 为 null 或条目；其余字段为条目数组。每个条目必须精确包含：
-{"id":"稳定短标识","text":"简洁事实","source_ids":["m1"],"scope":"task 或 session","task_id":null}
+{"id":"稳定短标识","text":"简洁事实","source_ids":["m1"],"scope":"task 或 session","task_id":null,"state":"active","replaces_id":null}
 scope 为 task 时 task_id 必须取对应历史 task_id；scope 为 session 时 task_id 必须为 null。
+目标、约束和有效决策使用 active；待办使用 pending/done/cancelled；被替代的目标或决策使用
+superseded。新决策替代旧决策时，使用 active 并在 replaces_id 中填写旧条目 ID。
 不要输出 schema_version、revision、generation 或 covered_through；这些可信字段由程序填写。"""
 
 _SEMANTIC_FIELDS = frozenset({"goal", "constraints", "decisions", "open_items"})
 _LEGACY_FIELDS = _SEMANTIC_FIELDS | frozenset(
     {"schema_version", "revision", "generation", "covered_through"}
 )
+_FULL_V2_FIELDS = _LEGACY_FIELDS | frozenset({"archived"})
 
 _FAILURE_LABELS = {
     "source_invalid": "摘要来源无效",
@@ -61,6 +64,10 @@ _FAILURE_LABELS = {
     "unavailable": "摘要器不可用",
     "budget": "上下文预算无法满足",
     "commit": "候选提交校验失败",
+    "coverage": "候选覆盖不完整",
+    "disabled": "会话记忆持久化未启用",
+    "pending_clear": "持久化清除尚未完成",
+    "audit": "记忆摘要审计失败",
     "unknown": "未知摘要错误",
 }
 
@@ -99,6 +106,25 @@ class MemorySummarizer:
             raise ValueError("MemorySummarizer 只用于 structured 模式")
         self.provider = provider
         self.config = config
+
+    def source_input_fits(
+        self,
+        previous: ConversationMemory,
+        source_messages: Sequence[Message],
+    ) -> bool:
+        """在网络调用前复用真实请求编码判断单批输入是否可接受。"""
+
+        numbered = [message for message in source_messages if message.message_seq is not None]
+        if not numbered:
+            return False
+        covered_through = max(message.message_seq or 0 for message in numbered)
+        try:
+            self._request_messages(previous, source_messages, covered_through)
+        except MemorySummaryError as exc:
+            if exc.code == "input_limit":
+                return False
+            raise
+        return True
 
     async def summarize(
         self,
@@ -191,7 +217,7 @@ class MemorySummarizer:
         fields = set(payload)
         if fields == _SEMANTIC_FIELDS:
             semantic = payload
-        elif fields == _LEGACY_FIELDS:
+        elif fields in {_LEGACY_FIELDS, _FULL_V2_FIELDS}:
             # 兼容旧提示生成的完整对象，但绝不信任其中的版本和覆盖字段。
             semantic = {name: payload[name] for name in _SEMANTIC_FIELDS}
         else:
@@ -208,7 +234,15 @@ class MemorySummarizer:
             "constraints": semantic["constraints"],
             "decisions": semantic["decisions"],
             "open_items": semantic["open_items"],
+            "archived": [],
         }
+        try:
+            trusted_payload = _normalize_semantic_items(trusted_payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MemorySummaryError(
+                "记忆摘要候选字段校验失败",
+                code="invalid_candidate",
+            ) from exc
         try:
             return memory_from_json(
                 json.dumps(trusted_payload, ensure_ascii=False, separators=(",", ":")),
@@ -243,7 +277,7 @@ class MemorySummarizer:
         ]
         payload = json.dumps(
             {
-                "previous": json.loads(memory_to_json(previous)),
+                "previous": json.loads(memory_to_prompt_json(previous)),
                 "covered_through": covered_through,
                 "history": history,
             },
@@ -276,3 +310,34 @@ def _unwrap_single_json_fence(raw: str) -> str:
             return stripped
         return inner
     return stripped
+
+
+def _normalize_semantic_items(payload: dict[str, object]) -> dict[str, object]:
+    """兼容旧 Provider 的 v1 条目，同时对未知字段保持严格拒绝。"""
+
+    def normalize(value: object, default_state: str) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise TypeError("记忆条目必须是对象")
+        legacy = {"id", "text", "source_ids", "scope", "task_id"}
+        current = legacy | {"state", "replaces_id"}
+        fields = set(value)
+        if fields == legacy:
+            return {**value, "state": default_state, "replaces_id": None}
+        if fields != current:
+            raise ValueError("记忆条目字段无效")
+        return value
+
+    normalized = dict(payload)
+    normalized["goal"] = normalize(normalized["goal"], "active")
+    for section, default_state in (
+        ("constraints", "active"),
+        ("decisions", "active"),
+        ("open_items", "pending"),
+    ):
+        entries = normalized[section]
+        if not isinstance(entries, list):
+            raise TypeError("记忆类别必须是数组")
+        normalized[section] = [normalize(entry, default_state) for entry in entries]
+    return normalized

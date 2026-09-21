@@ -14,6 +14,8 @@ from pathlib import Path
 
 from tricoder.models import SessionMemory, SessionRecord
 from tricoder.context.memory import (
+    DEFAULT_SUMMARY_MAX_CHARS,
+    MEMORY_SCHEMA_VERSION,
     ConversationMemory,
     MemoryValidationError,
     memory_from_json,
@@ -421,6 +423,8 @@ class SessionStore:
     def load_conversation_memory(
         self,
         session_id: str,
+        *,
+        max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
     ) -> tuple[ConversationMemory, int] | None:
         """读取独立语义记忆；损坏数据保留在库中但绝不注入模型。"""
 
@@ -447,13 +451,23 @@ class SessionStore:
             }
             if any(type(value) is not int for value in integers.values()):
                 raise MemoryValidationError("持久化记忆整数列损坏")
+            raw_payload = _require_text(row, "payload_json")
+            payload = json.loads(raw_payload)
+            if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+                raise MemoryValidationError("持久化记忆 schema_version 损坏")
+            stored_schema_version = payload["schema_version"]
+            if (
+                stored_schema_version != integers["schema_version"]
+                or stored_schema_version not in {1, MEMORY_SCHEMA_VERSION}
+            ):
+                raise MemoryValidationError("持久化记忆列与 payload 版本不一致")
             memory = memory_from_json(
-                _require_text(row, "payload_json"),
+                raw_payload,
                 allowed_source_ids=None,
+                max_chars=max_chars,
             )
             if (
-                memory.schema_version != integers["schema_version"]
-                or memory.revision != integers["revision"]
+                memory.revision != integers["revision"]
                 or memory.generation != integers["generation"]
                 or memory.covered_through != integers["covered_through"]
                 or integers["next_message_seq"] <= memory.covered_through

@@ -623,6 +623,55 @@ class TricoderApp(App[None]):
             self.run_worker(save_after_confirm, thread=False, name="memory-save")
             return
 
+        if subcommand == "refresh":
+            async def refresh_memory() -> None:
+                if self.runtime is None:
+                    return
+                self.log_line("[dim]正在刷新会话记忆候选…[/dim]")
+                try:
+                    refreshed = await asyncio.to_thread(self.runtime.refresh_memory)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("刷新失败：", "red"), _p(exc)))
+                    return
+                self.log_line(
+                    f"[yellow]会话记忆候选已刷新；本次记忆请求 "
+                    f"{refreshed.memory_calls} 次[/yellow]"
+                )
+                if self.runtime is not None:
+                    self.log_line(_p(self.runtime.render_memory()))
+
+            self.run_worker(refresh_memory, thread=False, name="memory-refresh")
+            return
+        if subcommand == "archive":
+            self.log_line(_p(self.runtime.render_memory_archive()))
+            return
+        if subcommand == "archive-delete":
+            preview = self.runtime.preview_memory_archive_delete(argument or "")
+            self.log_line(_p(preview.text))
+
+            async def delete_archive_after_confirm() -> None:
+                approved = await self.push_screen_wait(
+                    ApprovalScreen("删除归档记忆", "删除以上确切归档条目？")
+                )
+                if not approved or self.runtime is None:
+                    self.log_line("[dim]已取消删除归档记忆[/dim]")
+                    return
+                try:
+                    self.runtime.apply_memory_archive_delete(preview)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("删除失败：", "red"), _p(exc)))
+                    return
+                self.log_line(
+                    "[yellow]归档记忆已从当前候选删除；尚未自动保存[/yellow]"
+                )
+
+            self.run_worker(
+                delete_archive_after_confirm,
+                thread=False,
+                name="memory-archive-delete",
+            )
+            return
+
         async def edit_memory() -> None:
             text = await self.push_screen_wait(
                 TextInputScreen("新的记忆文本（留空表示删除）")
@@ -634,8 +683,20 @@ class TricoderApp(App[None]):
             )
             if scope is None or self.runtime is None:
                 return
+            selected_state = await self.push_screen_wait(
+                OptionListScreen(
+                    "选择记忆状态",
+                    ("保持原状态", "active", "pending", "done", "cancelled", "superseded"),
+                    "保持原状态",
+                )
+            )
+            if selected_state is None or self.runtime is None:
+                return
+            state = None if selected_state == "保持原状态" else selected_state
             try:
-                preview = self.runtime.preview_memory_edit(argument or "", text, scope)
+                preview = self.runtime.preview_memory_edit(
+                    argument or "", text, scope, state
+                )
             except SessionRuntimeError as exc:
                 self.log_line(Text.assemble(("编辑失败：", "red"), _p(exc)))
                 return

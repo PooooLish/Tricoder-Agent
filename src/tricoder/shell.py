@@ -96,6 +96,18 @@ class RuntimeLike(Protocol):
     def save_memory_preview(self, preview: object) -> None:
         ...
 
+    def refresh_memory(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def render_memory_archive(self) -> str:
+        ...
+
+    def preview_memory_archive_delete(self, item_id: str):  # type: ignore[no-untyped-def]
+        ...
+
+    def apply_memory_archive_delete(self, preview: object) -> None:
+        ...
+
     def preview_memory_edit(self, item_id: str, text: str, scope: str):  # type: ignore[no-untyped-def]
         ...
 
@@ -208,11 +220,34 @@ class InteractiveShell:
             self.runtime.save_memory_preview(preview)
             self.ui.show_notice("会话记忆已保存")
             return
+        if command.subcommand == "refresh":
+            refreshed = self.runtime.refresh_memory()
+            self.ui.show_notice(
+                f"会话记忆候选已刷新；本次记忆请求 {refreshed.memory_calls} 次"
+            )
+            return
+        if command.subcommand == "archive":
+            self.ui.show_notice(self.runtime.render_memory_archive())
+            return
+        if command.subcommand == "archive-delete":
+            preview = self.runtime.preview_memory_archive_delete(
+                command.argument or ""
+            )
+            self.ui.show_notice(preview.text)
+            if not self.ui.confirm("删除以上归档记忆条目？[y/N] "):
+                self.ui.show_notice("已取消删除归档记忆")
+                return
+            self.runtime.apply_memory_archive_delete(preview)
+            self.ui.show_notice("归档记忆已从当前候选删除；尚未自动保存")
+            return
 
         item_id = command.argument or ""
         new_text = self.input_fn("新的记忆文本（留空表示删除）：")
         scope = self.input_fn("作用范围 task/session [session]：").strip().lower() or "session"
-        preview = self.runtime.preview_memory_edit(item_id, new_text, scope)
+        state = self.input_fn(
+            "状态 active/pending/done/cancelled/superseded [保持原状态]："
+        ).strip().lower() or None
+        preview = self.runtime.preview_memory_edit(item_id, new_text, scope, state)
         self.ui.show_notice(preview.text)
         if not self.ui.confirm("应用以上本地记忆编辑？[y/N] "):
             self.ui.show_notice("已取消编辑会话记忆")

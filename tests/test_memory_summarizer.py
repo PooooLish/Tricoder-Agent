@@ -54,6 +54,32 @@ class StreamProvider:
 
 
 class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_input_preflight_matches_request_limit_without_calling_provider(self) -> None:
+        """保存分批可在网络前判断输入上限，预检本身不得调用 Provider。"""
+
+        provider = StreamProvider((ProviderCompleted("stop"),))
+        summarizer = MemorySummarizer(
+            provider,
+            MemoryConfig(compaction="structured"),
+        )
+        small = source_messages()
+        oversized = (
+            Message(
+                "user",
+                "x" * 40_000,
+                kind="task",
+                message_seq=1,
+                task_id="task-1",
+            ),
+            Message("assistant", "完成", message_seq=2, task_id="task-1"),
+        )
+
+        self.assertTrue(summarizer.source_input_fits(ConversationMemory(), small))
+        self.assertFalse(
+            summarizer.source_input_fits(ConversationMemory(), oversized)
+        )
+        self.assertEqual([], provider.calls)
+
     async def test_valid_json_uses_no_tools_and_reports_memory_usage_separately(self) -> None:
         candidate = ConversationMemory(
             covered_through=2,
@@ -426,7 +452,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
         self.assertEqual([], summarizer.calls)
         self.assertEqual(1, provider.calls)
 
-    def test_reviewed_mode_builds_unsaved_end_candidate_and_keeps_two_recent_tasks(self) -> None:
+    def test_reviewed_mode_builds_independent_candidate_and_keeps_runtime_history(self) -> None:
         context, _budget = self._context_and_budget()
         summarizer = RecordingSummarizer()
         provider = FinishProvider()
@@ -444,10 +470,12 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
 
         self.assertTrue(turn.result.ok)
         self.assertEqual(1, len(summarizer.calls))
-        self.assertEqual(1, turn.context.conversation_memory.revision)
+        self.assertEqual(0, turn.context.conversation_memory.revision)
+        self.assertIsNotNone(turn.context.review_memory_candidate)
+        self.assertEqual(1, turn.context.review_memory_candidate.revision)
         self.assertIsNone(turn.context.persisted_memory_revision)
         task_messages = [message for message in turn.context.messages if message.kind == "task"]
-        self.assertEqual(2, len(task_messages))
+        self.assertEqual(4, len(task_messages))
 
     def test_review_failure_reports_safe_category_and_audits_no_model_text(self) -> None:
         """真实摘要失败应可诊断，但不得泄露原始响应或影响业务结果。"""

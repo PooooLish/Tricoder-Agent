@@ -1,6 +1,6 @@
 # TriCoder 前五项可靠性改进任务计划书
 
-版本：2026-09-16 · 状态：实施完成并通过独立整体复审（T1–T5、I01–I07 已通过）
+版本：2026-09-14 · 状态：计划已编写，生产实现尚未开始
 
 **目标：**让工具失败、批次停止、任务取消和文件验证使用一致的事实，避免“文件已经改变，但任务仍显示没改动或验证通过”。
 
@@ -56,11 +56,11 @@
 
 ### 开始实施前的准备
 
-- [x] 阅读仓库 AGENTS.md、README.md、pyproject.toml 和上面关联设计。
-- [x] 保存 HEAD、工作区差异和测试环境版本。当前已有用户改动在 `test/` 演示目录，不能清理、覆盖或混入本次修复。
-- [x] 使用已有项目 `.venv`；若不可用，先报告原因，不自动安装依赖或借用不明环境。
-- [x] 在仓库自己的 `runtime/reliability-top5/` 保存测试日志和不含敏感信息的证据；测试临时目录只放虚构文本和测试进程。
-- [x] 先跑一次全量基线，将既有失败与新增失败分开。修改前后必须使用一致环境比较。
+- [ ] 阅读仓库 AGENTS.md、README.md、pyproject.toml 和上面关联设计。
+- [ ] 保存 HEAD、工作区差异和测试环境版本。当前已有用户改动在 `test/` 演示目录，不能清理、覆盖或混入本次修复。
+- [ ] 使用已有项目 `.venv`；若不可用，先报告原因，不自动安装依赖或借用不明环境。
+- [ ] 在仓库自己的 `runtime/reliability-top5/` 保存测试日志和不含敏感信息的证据；测试临时目录只放虚构文本和测试进程。
+- [ ] 先跑一次全量基线，将既有失败与新增失败分开。修改前后必须使用一致环境比较。
 
 下列命令均为**实施时要执行的命令，本次仅写入计划**：
 
@@ -170,8 +170,8 @@ UNKNOWN 表示需要核对的状态，不表示已经确认文件遭到破坏。
 
 ### 实施步骤
 
-- [x] T1.1 先保留 `test_failed_result_does_not_record_legacy_or_multi_file_paths` 的不可信路径场景。新增另一组使用真实 ToolRegistry 与真实文件写入的残留用例，明确不是靠假路径证明问题。
-- [x] T1.2 添加 FileEffects 和状态转换测试；以下测试放入拟新增 test_effect_state.py，确认新增文件尚未实现时因缺少接口失败。
+- [ ] T1.1 先保留 `test_failed_result_does_not_record_legacy_or_multi_file_paths` 的不可信路径场景。新增另一组使用真实 ToolRegistry 与真实文件写入的残留用例，明确不是靠假路径证明问题。
+- [ ] T1.2 添加 FileEffects 和状态转换测试；以下测试放入拟新增 test_effect_state.py，确认新增文件尚未实现时因缺少接口失败。
 
 ```python
 import unittest
@@ -190,12 +190,12 @@ class EffectStateTests(unittest.TestCase):
         self.assertTrue(updated.unknown_effects)
 ```
 
-- [x] T1.3 在 write.py 的发布、补偿及补偿失败出口补证据。保留既有目录绑定和身份核验；核对不清楚的对象标 UNKNOWN，不把外部快照纳入可撤销记录。
-- [x] T1.4 在 Registry 做来源校验：内置写工具的可信证据可消费；扩展返回的 FileEffects 一律不直接采纳；旧的成功内置路径只在完成路径核验后走兼容分支。
-- [x] T1.5 Agent 每个结果先更新副作用，再处理错误或 finish。增加临时结束条件：`unknown_effects` 为真时不得返回成功。
-- [x] T1.6 Runtime 在异常与取消时读取活动账本对账，保留原异常；封存时 tainted 不得因零净变化丢失。取消前已完成写入也必须反映到任务结果或状态。
-- [x] T1.7 接入上节 SessionMemory／SQLite 的最小状态字段及 clear 确认，先在临时数据库验证迁移与重启阻断。
-- [x] T1.8 跑下列用例，核对实际磁盘、返回值、会话状态、账本四者一致；审查 diff，记录结果。
+- [ ] T1.3 在 write.py 的发布、补偿及补偿失败出口补证据。保留既有目录绑定和身份核验；核对不清楚的对象标 UNKNOWN，不把外部快照纳入可撤销记录。
+- [ ] T1.4 在 Registry 做来源校验：内置写工具的可信证据可消费；扩展返回的 FileEffects 一律不直接采纳；旧的成功内置路径只在完成路径核验后走兼容分支。
+- [ ] T1.5 Agent 每个结果先更新副作用，再处理错误或 finish。增加临时结束条件：`unknown_effects` 为真时不得返回成功。
+- [ ] T1.6 Runtime 在异常与取消时读取活动账本对账，保留原异常；封存时 tainted 不得因零净变化丢失。取消前已完成写入也必须反映到任务结果或状态。
+- [ ] T1.7 接入上节 SessionMemory／SQLite 的最小状态字段及 clear 确认，先在临时数据库验证迁移与重启阻断。
+- [ ] T1.8 跑下列用例，核对实际磁盘、返回值、会话状态、账本四者一致；审查 diff，记录结果。
 
 ### 验收用例
 
@@ -276,8 +276,8 @@ class ToolError:
 
 ### 实施步骤与契约测试
 
-- [x] T2.1 枚举工具所有 `ToolResult(False, ...)` 和异常出口，按上表逐一归类。建立测试表，不按 output 中出现的词做分类。
-- [x] T2.2 写以下真实入口测试；ToolContext 使用临时工作区，审批明确拒绝，无模型调用。
+- [ ] T2.1 枚举工具所有 `ToolResult(False, ...)` 和异常出口，按上表逐一归类。建立测试表，不按 output 中出现的词做分类。
+- [ ] T2.2 写以下真实入口测试；ToolContext 使用临时工作区，审批明确拒绝，无模型调用。
 
 ```python
 import tempfile
@@ -302,9 +302,9 @@ class ToolErrorTests(unittest.TestCase):
             self.assertFalse(result.error.retryable)
 ```
 
-- [x] T2.3 修改错误产生点与 `_safe_execution_failure`。成功结果不得携带 error；失败结果缺 error 的旧内置路径可暂按 EXECUTION_FAILED 兼容并逐步补齐；旧扩展失败默认不确定，不能从其原始文字猜恢复策略。
-- [x] T2.4 更新两种协议的序列化、CLI／TUI 展示和审计；取消仍通过 CancellationError 传播，Agent 在边界统一形成 CANCELLED，不吞掉 KeyboardInterrupt 或 asyncio 取消。
-- [x] T2.5 检查参数、审批、超时、非零退出、无效扩展返回、未知内置异常、日志敏感假标记七组用例。使用虚构敏感标记验证不泄露，不读取真实凭据。
+- [ ] T2.3 修改错误产生点与 `_safe_execution_failure`。成功结果不得携带 error；失败结果缺 error 的旧内置路径可暂按 EXECUTION_FAILED 兼容并逐步补齐；旧扩展失败默认不确定，不能从其原始文字猜恢复策略。
+- [ ] T2.4 更新两种协议的序列化、CLI／TUI 展示和审计；取消仍通过 CancellationError 传播，Agent 在边界统一形成 CANCELLED，不吞掉 KeyboardInterrupt 或 asyncio 取消。
+- [ ] T2.5 检查参数、审批、超时、非零退出、无效扩展返回、未知内置异常、日志敏感假标记七组用例。使用虚构敏感标记验证不泄露，不读取真实凭据。
 
 ```powershell
 & '.\.venv\Scripts\python.exe' -B -m unittest tests.test_tool_errors tests.test_tools tests.test_protocols tests.test_mcp_tool_adapter tests.test_models -q
@@ -340,9 +340,9 @@ def should_stop_task(error: ToolError | None, effects: FileEffects) -> bool:
 
 ### 实施步骤
 
-- [x] T3.1 用现有 ScriptedProvider／原生 ToolCall 测试样式创建三动作响应：创建 A、测试 A、finish；注入第一个动作失败，先记录当前第二个动作是否执行。
-- [x] T3.2 实现单个统一的“回填剩余动作”入口，复用 finish 和 cancel 已有消息配对思路；每个调用 ID 恰好得到一个结果。
-- [x] T3.3 添加以下停止判定测试，再接入真实内层循环。纯函数测试不能替代上一步的 Agent 集成用例。
+- [ ] T3.1 用现有 ScriptedProvider／原生 ToolCall 测试样式创建三动作响应：创建 A、测试 A、finish；注入第一个动作失败，先记录当前第二个动作是否执行。
+- [ ] T3.2 实现单个统一的“回填剩余动作”入口，复用 finish 和 cancel 已有消息配对思路；每个调用 ID 恰好得到一个结果。
+- [ ] T3.3 添加以下停止判定测试，再接入真实内层循环。纯函数测试不能替代上一步的 Agent 集成用例。
 
 ```python
 import unittest
@@ -361,8 +361,8 @@ class BatchDecisionTests(unittest.TestCase):
         self.assertTrue(should_stop_task(error, FileEffects(EffectState.UNKNOWN)))
 ```
 
-- [x] T3.4 同步更新事件语义：被跳过动作不发 ToolExecutionStarted，不算实际执行次数，不触发审批；另发完成／跳过信息时明确 skipped，不能伪造成执行成功。
-- [x] T3.5 保留 legacy 单动作兼容、finish 后不执行后续动作、取消后不再请求模型。补回归后更新 README 的串行批次说明。
+- [ ] T3.4 同步更新事件语义：被跳过动作不发 ToolExecutionStarted，不算实际执行次数，不触发审批；另发完成／跳过信息时明确 skipped，不能伪造成执行成功。
+- [ ] T3.5 保留 legacy 单动作兼容、finish 后不执行后续动作、取消后不再请求模型。补回归后更新 README 的串行批次说明。
 
 ### 验收用例
 
@@ -403,9 +403,9 @@ Runtime 提供 `current_task_cancellation() -> CancellationToken | None`，在�
 
 ### 实施步骤与测试
 
-- [x] T4.1 在现有实现复现各场景，记录“已复现／测试已通过／环境不可验证”。不把所有场景都写成 bug。
-- [x] T4.2 实现 ApprovalWait：一个锁保护结果的单次写入，一个 Event 唤醒等待；每次等待至多 50ms 检查取消；300 秒默认超时可由构造参数替换，测试不等待真实 300 秒。
-- [x] T4.3 给弹窗协程加 finally 释放请求；应用退出时先拒绝所有待决审批再取消任务。线程投递 UI 失败也要关闭请求；迟到的批准不得让已关闭请求重新生效。
+- [ ] T4.1 在现有实现复现各场景，记录“已复现／测试已通过／环境不可验证”。不把所有场景都写成 bug。
+- [ ] T4.2 实现 ApprovalWait：一个锁保护结果的单次写入，一个 Event 唤醒等待；每次等待至多 50ms 检查取消；300 秒默认超时可由构造参数替换，测试不等待真实 300 秒。
+- [ ] T4.3 给弹窗协程加 finally 释放请求；应用退出时先拒绝所有待决审批再取消任务。线程投递 UI 失败也要关闭请求；迟到的批准不得让已关闭请求重新生效。
 
 ```python
 import unittest
@@ -425,10 +425,10 @@ class ApprovalWaitTests(unittest.TestCase):
         self.assertFalse(ApprovalWait().wait(token, timeout=0.01))
 ```
 
-- [x] T4.4 明确批准／取消竞争顺序：审批单次完成只是返回决定；真正执行前必须再次检查取消令牌。不要持有任务状态锁等待 UI 或进程退出。
-- [x] T4.5 对进程和 MCP 采用既有清理机制，增加“任务清理共用截止时间”，建议测试目标 5 秒加调度余量 2 秒。各资源只使用剩余时间，不能每个资源重新获得完整 5 秒。正常取消与清理失败分别记录。
-- [x] T4.6 清理超时后返回明确 cleanup_failed，并保持失败任务状态；不得留无所有者的后台清理。延后清理必须进入 Runtime 持有的资源登记，退出时再次处理。下一任务不得共享仍被旧任务占用的执行资源。
-- [x] T4.7 用真实本地测试进程验证主进程、普通后代、持有输出管道的后代；MCP 用仓库 fake server，测试合作关闭和拒绝关闭。未能验证的平台明确保留限制。
+- [ ] T4.4 明确批准／取消竞争顺序：审批单次完成只是返回决定；真正执行前必须再次检查取消令牌。不要持有任务状态锁等待 UI 或进程退出。
+- [ ] T4.5 对进程和 MCP 采用既有清理机制，增加“任务清理共用截止时间”，建议测试目标 5 秒加调度余量 2 秒。各资源只使用剩余时间，不能每个资源重新获得完整 5 秒。正常取消与清理失败分别记录。
+- [ ] T4.6 清理超时后返回明确 cleanup_failed，并保持失败任务状态；不得留无所有者的后台清理。延后清理必须进入 Runtime 持有的资源登记，退出时再次处理。下一任务不得共享仍被旧任务占用的执行资源。
+- [ ] T4.7 用真实本地测试进程验证主进程、普通后代、持有输出管道的后代；MCP 用仓库 fake server，测试合作关闭和拒绝关闭。未能验证的平台明确保留限制。
 
 ### 验收条件
 
@@ -503,9 +503,7 @@ class VerificationEvidence:
 | 文件写入、外部文件变化、扫描范围变化 | 证据失效，待验证 |
 | 检查命令失败 | 失败，记录本次检查对应状态 |
 | 同一版本先失败后成功 | 第一版保留当前保守规则，不静默改成通过 |
-| 已证明新的文件版本：完整、同 scope 快照的 digest 明确不同，或本地确认写入 | 清除旧版本失败约束，重新等待验证 |
-| incomplete、不同 scope 或无法比较 | 通过证据失效，但不解除已有失败约束 |
-| 工具结果后通知/审计异常 | 异常仍原样抛；本地任务通道保留新失败与 UNKNOWN，不恢复旧通过 |
+| 新的文件版本 | 清除旧版本失败约束，重新等待验证 |
 | 检查过程本身修改受覆盖文件 | 不采纳通过结果，提示文件状态变化 |
 | 取消、清理失败、UNKNOWN 未解决 | 不允许成功 |
 | 重启恢复字符串“通过”，但无内存证据 | 降为待验证；不能把 SQLite 字符串当有效证据 |
@@ -520,7 +518,7 @@ class VerificationEvidence:
 
 ### 实施步骤
 
-- [x] T5.1 新增 [tests/test_verification_evidence.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/tests/test_verification_evidence.py)，先覆盖比较规则与扫描边界。以下为最小证据测试。
+- [ ] T5.1 新增 [tests/test_verification_evidence.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/tests/test_verification_evidence.py)，先覆盖比较规则与扫描边界。以下为最小证据测试。
 
 ```python
 import unittest
@@ -540,18 +538,12 @@ class VerificationEvidenceTests(unittest.TestCase):
         self.assertFalse(evidence.is_valid_for(incomplete))
 ```
 
-- [x] T5.2 实现安全扫描；使用已有 WorkspacePolicy 和安全文件访问规则。一次扫描不等于原子快照：前后复核身份和文件清单；发现变化就失败，不尝试读到“差不多稳定”为止。
-- [x] T5.3 在 [tools/command.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/src/tricoder/tools/command.py:83) 执行前、清理完成后采集快照。只对认可的检查命令生成 VerificationEvidence。实际按 brief 收紧：变化/覆盖不全保持 UNKNOWN，不把外部命令差异伪造为有源码归属凭据的内置工具账本；快照不能证明无网络等外部副作用。
-- [x] T5.4 解决 T1 的保守兼容：一般外部命令与非只读 MCP/扩展保持 UNKNOWN；认可检查命令在进程和资源已退出、前后完整一致时，允许就受覆盖文件形成 NONE。命令清理失败或范围不全仍为 UNKNOWN。该判断由本地执行层完成，不能由模型声明命令是只读来触发。
-- [x] T5.5 在 [agent.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/src/tricoder/agent.py:738) 的 finish 前重新扫描，核对证据仍有效；新写入立即清除证据。UNKNOWN、取消、清理失败是独立阻断条件，不被一次验证通过覆盖。
-- [x] T5.6 Runtime、SessionContext 传递证据，数据库恢复降级。实际撤销的证据状态在 Runtime 收尾失效；`tools/undo.py` 仅负责文件事务，无须加入 Session 状态或持久化证据。
-- [x] T5.7 更新 CLI、TUI 与状态展示，明确区分“命令退出成功”“文件状态验证有效”“业务需求已验收”。保留字符串接口兼容，但核心成功条件只信任本地证据。
-- [x] T5 fix round 1：R1/R2/R3 公开入口先 RED 后 GREEN；真实 scanner 一次性 PermissionError 覆盖入口/检查前/finish，新增每任务本地事实对账并保留 T1 消费确认、T3 配对首异常及 T4 终态撤销。报告见 `runtime/reliability-top5/task-5-report.md`，状态为修复完成待定向复审，不是最终验收通过。
-- [x] T5 fix round 2：N1/N2/N3 公开入口 RED→GREEN；以真实提交/首次 taint 修订游标替代 whole-task 布尔重放，Registry 在可抛后处理前发布共享纯验证 transition，获批后非只读外部 dispatch 先登记 UNKNOWN。保留旧断言、真实未消费写入与未批准/预取消控制，详见报告 Fix round 2；修复完成待定向复审。
-- [x] T5 fix round 3：F1/F2/M1 正式 RED→GREEN；Runtime 在任意 Agent 前 seed 原状态/游标 0，正常/异常都合并本地发布并验证 scope authority；Agent 合成取消前刷新新失败；净零新提交仍立即失效旧证据，begin/seal 与修订读取共用短锁。保留所有原断言，新增 custom/伪造/迟到发布/并发控制；详见报告 Fix round 3，修复完成待定向复审，不提前关闭 V08。
-- [x] T5 fix round 4：仅修复 I1/I2；修改前机械复制/核对 118 文件基线。Runtime 最终 token 取消独立拒绝成功（纯读不伪造 required）；scope-owned evidence 需对结束前当前快照有效，不完整/普通扫描异常保守失败。7 项新测试保留旧断言，Native/structured 取消仍原样经过异常收尾，同步扫描保留 task owner/cleanup scope。65/385/152/356 项门禁非跳过项通过；修复完成待定向复审，不关闭 T5 或 I01–I07。
-- [x] T5 fix round 5：两个 Important 正式 RED→GREEN；私有取消接收标志在 seal/current/memory 准备后、persist 前与 cancel_current 共用状态锁形成单一结果决议，提交后拒绝取消但保留任务/退出清理所有权。final capture 阶段中断经既有异常对账撤销 pass、保留 failure/首异常，不扩张为全部通知异常。新增 4 方法、保留旧断言；69/389/152/356 项非跳过项通过及 compileall/diff/cached 通过，修复完成待定向复审。
-- [x] T5 fix round 6：唯一 Important 正式 RED→GREEN；仅在三处已有主异常的补偿 seal/persist 捕获 BaseException，保留裸 raise，正常主流程不吞中断。新增 4 方法覆盖 structured/native/系统中断与双补偿失败、failure/dirty、下一任务取消复位；首次 fixture 中文/英文展示差异已按既有契约修正并记录，生产未放宽。73/393/152/356 项非跳过项及 compileall/diff/cached 通过；修复完成待独立复审，不关闭 T5/I01–I07。
+- [ ] T5.2 实现安全扫描；使用已有 WorkspacePolicy 和安全文件访问规则。一次扫描不等于原子快照：前后复核身份和文件清单；发现变化就失败，不尝试读到“差不多稳定”为止。
+- [ ] T5.3 在 [tools/command.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/src/tricoder/tools/command.py:83) 执行前、清理完成后采集快照。只对认可的检查命令生成 VerificationEvidence。对命令造成的受覆盖文件变化回传本地确认差异；快照完整只覆盖该范围，不能证明无网络等外部副作用。
+- [ ] T5.4 解决 T1 的保守兼容：一般外部命令与 MCP 保持 UNKNOWN；认可检查命令在进程和资源已退出、前后完整一致时，允许就受覆盖文件形成 NONE。命令清理失败或范围不全仍为 UNKNOWN。该判断由本地执行层完成，不能由模型声明命令是只读来触发。
+- [ ] T5.5 在 [agent.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/src/tricoder/agent.py:738) 的 finish 前重新扫描，核对证据仍有效；新写入立即清除证据。UNKNOWN、取消、清理失败是独立阻断条件，不被一次验证通过覆盖。
+- [ ] T5.6 修改 Runtime、SessionContext 传递证据；从数据库恢复时不恢复有效证据。更新 [tools/undo.py](D:/MaHong/AGENT_WORKSPACE_V2/projects/tricoder-cli/src/tricoder/tools/undo.py:49) 及 Runtime 撤销收尾：恢复旧内容也不能仅恢复旧的“通过”字符串，必须重新核验。
+- [ ] T5.7 更新 CLI、TUI 与状态展示，明确区分“命令退出成功”“文件状态验证有效”“业务需求已验收”。保留字符串接口兼容，但核心成功条件只信任本地证据。
 
 ### 验收用例
 
@@ -578,13 +570,13 @@ class VerificationEvidenceTests(unittest.TestCase):
 
 ### 必须连起来验证的用户场景
 
-- [x] I01：补丁第二文件失败、首文件残留 → 同批测试与 finish 跳过 → 下一轮读文件修复 → 重新验证后才完成。
-- [x] I02：补丁失败且身份冲突 → 标 UNKNOWN → 不再调用模型 → 用户能看到已知残留和需检查状态。
-- [x] I03：等待审批时取消／关闭窗口 → 审批线程退出 → 无新命令启动 → 任务锁释放。
-- [x] I04：命令取消并发生清理失败 → 保留取消主原因与清理失败证据 → 不显示成功，不复用占用资源。
-- [x] I05：验证通过后外部修改测试文件 → finish 拒绝 → 重新检查后按新版本判断。
-- [x] I06：同一 Session 跨轮次、切换独立 Session、重启加载、撤销四条路径分别验证，不串用证据。
-- [x] I07：原生多工具调用和 legacy 单动作协议都能恢复或正确停止；调用 ID 无缺失、无重复。
+- [ ] I01：补丁第二文件失败、首文件残留 → 同批测试与 finish 跳过 → 下一轮读文件修复 → 重新验证后才完成。
+- [ ] I02：补丁失败且身份冲突 → 标 UNKNOWN → 不再调用模型 → 用户能看到已知残留和需检查状态。
+- [ ] I03：等待审批时取消／关闭窗口 → 审批线程退出 → 无新命令启动 → 任务锁释放。
+- [ ] I04：命令取消并发生清理失败 → 保留取消主原因与清理失败证据 → 不显示成功，不复用占用资源。
+- [ ] I05：验证通过后外部修改测试文件 → finish 拒绝 → 重新检查后按新版本判断。
+- [ ] I06：同一 Session 跨轮次、切换独立 Session、重启加载、撤销四条路径分别验证，不串用证据。
+- [ ] I07：原生多工具调用和 legacy 单动作协议都能恢复或正确停止；调用 ID 无缺失、无重复。
 
 最终运行：
 
@@ -595,22 +587,16 @@ git diff --check
 
 Windows 是当前主要验证平台。POSIX 目录绑定、进程组和链接语义需要 Linux 环境另验；若没有可用环境，交付必须明确“Windows 已验，Linux 未验”，不能用跳过的测试支撑跨平台保证。
 
-实际集成结果：I01–I07 七项通过；T1–T5 重点门禁通过；第四次完整 Windows
-串行运行 1,072 项全部通过，6 项因平台能力跳过。前三次完整运行暴露并保留了过期
-测试契约、隔离 verifier 依赖闭包和测试模块双身份问题的失败记录；修复后没有通过
-放宽生产清理期限或降低安全断言取得 GREEN。逐项证据见
-`runtime/reliability-top5/integration-report.md`。
-
 ### 回归审查清单
 
-- [x] 所有新增 dataclass 字段追加在末尾，旧位置参数构造仍可用。
-- [x] 同一字段在 Registry、Agent、Runtime、Session 和 UI 中含义一致。
-- [x] 外部工具返回的路径、错误策略、验证证据未被直接提升为可信事实。
-- [x] 在停止／抛异常／取消之前，已发生的副作用得到记录；没有以旧 context 覆盖新状态。
-- [x] 没有隐式自动重试、权限放宽、额外源码持久化或新增凭据输出。
-- [x] 被跳过的工具没有执行计数和审批副作用，但协议结果完整。
-- [x] 失败保持、验证过期、重启降级等新行为在测试和文档中一致。
-- [x] README、project.md 与变更管理／MCP 文档已按最终实现更新；旧面试材料不在本计划工作树范围，交付时另行同步，避免继续宣称旧行为。
+- [ ] 所有新增 dataclass 字段追加在末尾，旧位置参数构造仍可用。
+- [ ] 同一字段在 Registry、Agent、Runtime、Session 和 UI 中含义一致。
+- [ ] 外部工具返回的路径、错误策略、验证证据未被直接提升为可信事实。
+- [ ] 在停止／抛异常／取消之前，已发生的副作用得到记录；没有以旧 context 覆盖新状态。
+- [ ] 没有隐式自动重试、权限放宽、额外源码持久化或新增凭据输出。
+- [ ] 被跳过的工具没有执行计数和审批副作用，但协议结果完整。
+- [ ] 失败保持、验证过期、重启降级等新行为在测试和文档中一致。
+- [ ] README、project.md 与变更管理／MCP 文档已按最终实现更新，旧面试材料另行同步，避免继续宣称旧行为。
 
 ## 10. 回退、交接与执行记录
 
@@ -620,11 +606,10 @@ Windows 是当前主要验证平台。POSIX 目录绑定、进程组和链接语
 
 | 任务 | 当前状态 | 实施后必须填写的交接内容 |
 | --- | --- | --- |
-| T1 | 完成（独立复审通过） | 真实残留已复现；内置处理器身份与规范工作区路径共同建立信任；结果、Runtime、SQLite 与账本一致。复审发现的“同路径旧验证＋写入后取消”缺口已 RED→GREEN 修复并定向复审通过。副作用测试 25/25、计划聚焦 325/325、邻近 81/81 通过；此前全量复跑 881 项通过（5 个 Windows 权限跳过）。冷启动 MCP 超时可在未改基线同样复现，作为时序风险保留。 |
-| T2 | 完成（独立复审通过） | 错误产生点、Registry 信任、native/legacy 协议、UI 与审计已统一。复审的 4 个 Important 均 RED→GREEN 并定向复审通过。计划聚焦 158/158、邻近与 T1 回归 396/398 通过（2 个平台跳过）。 |
-| T3 | 完成（独立复审通过） | B01–B08 已覆盖；复审发现的通知异常截断配对问题已 RED→GREEN 并定向复审通过。协议结果在本地构造成功后先配对、后通知。最终聚焦 125、邻近 242、UI/审计 22，共 389 项通过。 |
-| T4 | 完成（独立复审通过） | C01–C07 已覆盖；三轮定向修复依次关闭活动退出、成功路径清理降级、跨任务 deadline、首取消异常竞争和异步 worker 迟到登记所有权。最终聚焦 166、邻近 400 项通过；额外 worker/MCP 取消边界各 2 项通过。只证明受管资源，永久不合作线程、脱离管理的后代和 POSIX 语义仍是明确限制。 |
-| T5 | 完成（独立复审通过） | `task-5-fix6-review.md` 独立复审确认 V01–V10 通过，Critical／Important／Minor 均为 0；补偿 BaseException 首异常优先级与正常主流程边界已关闭。独立门禁为 T5 73（1 个既有 Windows symlink 权限 skip）、T1/journal/runtime 96、T3/T4 60 项通过；I01–I07 另行集成验收。 |
-| 集成 | 完成（独立整体复审通过） | `test_reliability_integration.py` 的 I01–I07 七条公共流程通过。最终整体复审发现并关闭原生 Task cancel 迟到写、缺失路径错误分流、MCP 冷导入循环与 live-process 取消覆盖缺口；惰性 re-export 保持旧包级导入。Windows 串行全量 1,077 项通过、6 项平台条件跳过；独立整改复审为 0 Critical／Important／Minor。POSIX 与真实 Provider／外部 MCP 仍未验证。完整证据见 `runtime/reliability-top5/integration-report.md` 和 `runtime/reliability-top5/final-remediation-review.md`。 |
+| T1 | 待实施 | 真实残留复现、路径信任规则、账本与结果一致性 |
+| T2 | 待实施 | 分类清单、协议兼容、异常与敏感信息测试 |
+| T3 | 待实施 | 停止策略、调用配对、实际执行计数 |
+| T4 | 待调查与实施 | 各取消窗口结果、清理时限、存活资源证据、平台限制 |
+| T5 | 待实施 | 快照范围、扫描开销、证据失效与恢复行为 |
 
 **本计划的完成条件：**五项都有具体入口、状态契约、实现步骤、验收场景、聚焦测试命令和交接要求。**代码改进的完成条件不同：**上述测试实际执行且证据通过，才可将任务状态改为完成。本次不预先填写实现和测试成绩。

@@ -50,6 +50,7 @@ from tricoder.extensions.models import ToolOrigin
 from tricoder.models import (
     Message,
     MemoryConfig,
+    MemoryRefreshResult,
     ProviderResponse,
     RunResult,
     SessionContext,
@@ -332,6 +333,168 @@ class CodingAgent:
             )
         raise RuntimeError("同步 Agent 入口不能在已运行的事件循环中调用")
 
+    def refresh_review_memory(
+        self,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> MemoryRefreshResult:
+        """同步刷新待保存候选；不进入业务任务、规划或工具循环。"""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.refresh_review_memory_async(
+                    context,
+                    cancellation=cancellation,
+                )
+            )
+        raise RuntimeError("同步记忆刷新入口不能在已运行的事件循环中调用")
+
+    async def refresh_review_memory_async(
+        self,
+        context: SessionContext,
+        *,
+        cancellation: CancellationToken | None = None,
+    ) -> MemoryRefreshResult:
+        """显式重试候选生成；全部批次成功后才返回可提交快照。"""
+
+        cancellation = cancellation or CancellationToken()
+        result = await self._build_review_memory_candidate(context, cancellation)
+        candidate = result.context.review_memory_candidate
+        if not isinstance(candidate, ConversationMemory):
+            raise MemorySummaryError("会话记忆候选未生成", code="commit")
+        if not self._log(
+            {
+                "status": "memory_review_refreshed",
+                "revision": candidate.revision,
+                "covered_through": candidate.covered_through,
+                "memory_calls": result.memory_calls,
+            }
+        ):
+            raise MemorySummaryError("会话记忆刷新审计失败", code="audit")
+        return result
+
+    async def _build_review_memory_candidate(
+        self,
+        context: SessionContext,
+        cancellation: CancellationToken,
+    ) -> MemoryRefreshResult:
+        """从不可变快照生成完整候选；失败时不发布任何部分结果。"""
+
+        if self.memory_config.persistence != "reviewed_summary":
+            raise MemorySummaryError("会话记忆持久化未启用", code="disabled")
+        if context.memory_pending_clear:
+            raise MemorySummaryError("持久化清除尚未完成", code="pending_clear")
+        memory = context.conversation_memory
+        review_candidate = context.review_memory_candidate
+        if not isinstance(memory, ConversationMemory) or (
+            review_candidate is not None
+            and not isinstance(review_candidate, ConversationMemory)
+        ):
+            raise MemorySummaryError("会话记忆状态无效", code="commit")
+        if (
+            isinstance(review_candidate, ConversationMemory)
+            and review_candidate.covered_through < memory.covered_through
+        ):
+            raise MemorySummaryError(
+                "待保存候选落后于已压缩记忆，无法恢复缺失来源",
+                code="coverage",
+            )
+        messages, next_message_seq = assign_message_sequences(
+            context.messages,
+            context.next_message_seq,
+        )
+        previous = review_candidate or memory
+        target = context.latest_completed_task_seq
+        if previous.covered_through > target:
+            raise MemorySummaryError("保存候选覆盖边界无效", code="coverage")
+        if previous.covered_through == target:
+            return MemoryRefreshResult(
+                replace(
+                    context,
+                    messages=messages,
+                    next_message_seq=next_message_seq,
+                )
+            )
+        plan = self.context_manager.plan_save_candidate(
+            messages,
+            covered_through=previous.covered_through,
+        )
+        if not plan.needs_summary or not plan.source_messages:
+            raise MemorySummaryError(
+                "无法从当前历史恢复未覆盖的已完成任务",
+                code="coverage",
+            )
+        if plan.covered_through != target:
+            raise MemorySummaryError(
+                "保存候选覆盖目标与已完成任务水位不一致",
+                code="coverage",
+            )
+        summarizer = self.memory_summarizer
+        if summarizer is None or not callable(getattr(summarizer, "summarize", None)):
+            raise MemorySummaryError("结构化记忆摘要器不可用", code="unavailable")
+        batches = (plan.source_messages,)
+        input_fits = getattr(summarizer, "source_input_fits", None)
+        if callable(input_fits) and not input_fits(previous, plan.source_messages):
+            batches = self.context_manager.split_save_source_batches(plan.source_messages)
+            if len(batches) != 2 or any(
+                not input_fits(previous, batch) for batch in batches
+            ):
+                raise MemorySummaryError(
+                    "两批仍无法容纳完整保存来源",
+                    code="input_limit",
+                )
+        committed = previous
+        usage: TokenUsage | None = None
+        calls = 0
+        for batch in batches:
+            cancellation.raise_if_cancelled()
+            if callable(input_fits) and not input_fits(committed, batch):
+                raise MemorySummaryError(
+                    "两批仍无法容纳完整保存来源",
+                    code="input_limit",
+                )
+            batch_plan = self.context_manager.plan_save_candidate(
+                batch,
+                covered_through=committed.covered_through,
+            )
+            if not batch_plan.needs_summary:
+                raise MemoryValidationError("保存批次没有完整的新任务")
+            calls += 1
+            summary_result = await summarizer.summarize(
+                committed,
+                batch,
+                cancellation,
+            )
+            committed = self.context_manager.merge_save_candidate(
+                committed,
+                messages,
+                batch_plan,
+                summary_result.candidate,
+                summary_max_chars=self.memory_config.summary_max_chars,
+            )
+            if summary_result.usage is not None:
+                usage = (
+                    summary_result.usage
+                    if usage is None
+                    else usage.merge(summary_result.usage)
+                )
+        cancellation.raise_if_cancelled()
+        if committed.covered_through != target:
+            raise MemorySummaryError("刷新未完整覆盖最新任务", code="coverage")
+        return MemoryRefreshResult(
+            replace(
+                context,
+                messages=messages,
+                next_message_seq=next_message_seq,
+                review_memory_candidate=committed,
+            ),
+            memory_usage=usage,
+            memory_calls=calls,
+        )
+
     async def run_with_context_async(
         self,
         task: str,
@@ -415,6 +578,14 @@ class CodingAgent:
             result = RunResult(False, "会话记忆状态无效", 0)
             self._emit(event_sink, RuntimeFailed("memory", result.summary))
             return SessionTurnResult(result, context)
+        review_memory_candidate = context.review_memory_candidate
+        if review_memory_candidate is not None and not isinstance(
+            review_memory_candidate, ConversationMemory
+        ):
+            result = RunResult(False, "会话记忆保存候选状态无效", 0)
+            self._emit(event_sink, RuntimeFailed("memory", result.summary))
+            return SessionTurnResult(result, context)
+        latest_completed_task_seq = context.latest_completed_task_seq
         tool_calls = 0
         modified_files = list(context.modified_files)
         verification = context.verification
@@ -555,7 +726,9 @@ class CodingAgent:
                     verification_failure=failed_snapshot,
                     verification_required=verification_required,
                     conversation_memory=conversation_memory,
+                    review_memory_candidate=review_memory_candidate,
                     next_message_seq=next_message_seq,
+                    latest_completed_task_seq=latest_completed_task_seq,
                     persisted_memory_revision=context.persisted_memory_revision,
                     memory_pending_clear=context.memory_pending_clear,
                 )
@@ -599,9 +772,9 @@ class CodingAgent:
                 )
 
         async def prepare_review_memory() -> None:
-            """正常结束时只整理较早闭合任务，保留最近两项完整对话。"""
+            """正常结束时生成独立保存候选，不删除近期完整对话。"""
 
-            nonlocal conversation_memory, memory_usage, memory_calls, memory_warning
+            nonlocal review_memory_candidate, memory_usage, memory_calls, memory_warning
             if (
                 self.memory_config.persistence != "reviewed_summary"
                 or context.memory_pending_clear
@@ -609,59 +782,57 @@ class CodingAgent:
                 or cancellation.is_cancelled
             ):
                 return
-            normalize_history()
-            plan = self.context_manager.plan_review_compaction(
-                tuple(messages[history_start:]),
-                covered_through=conversation_memory.covered_through,
+            normalized_history = normalize_history()
+            refresh_context = SessionContext(
+                messages=normalized_history,
+                persisted_summary=context.persisted_summary,
+                modified_files=tuple(modified_files),
+                verification=verification,
+                unknown_effects=unknown_effects,
+                verification_evidence=evidence,
+                verification_failure=failed_snapshot,
+                verification_required=verification_required,
+                conversation_memory=conversation_memory,
+                review_memory_candidate=review_memory_candidate,
+                next_message_seq=next_message_seq,
+                latest_completed_task_seq=latest_completed_task_seq,
+                persisted_memory_revision=context.persisted_memory_revision,
+                memory_pending_clear=context.memory_pending_clear,
             )
-            if not plan.needs_compaction:
-                return
-            summarizer = self.memory_summarizer
-            if summarizer is None or not callable(getattr(summarizer, "summarize", None)):
-                memory_warning = "会话记忆候选未生成"
-                return
-            memory_calls += 1
+            source_count = 0
             try:
-                summary_result = await summarizer.summarize(
-                    conversation_memory,
-                    plan.source_messages,
+                previous = review_memory_candidate or conversation_memory
+                audit_plan = self.context_manager.plan_save_candidate(
+                    normalized_history,
+                    covered_through=previous.covered_through,
+                )
+                source_count = len(audit_plan.source_messages)
+                refreshed = await self._build_review_memory_candidate(
+                    refresh_context,
                     cancellation,
-                )
-                transient = SessionContext(
-                    messages=tuple(messages[history_start:]),
-                    persisted_summary=context.persisted_summary,
-                    modified_files=tuple(modified_files),
-                    verification=verification,
-                    unknown_effects=unknown_effects,
-                    verification_evidence=evidence,
-                    verification_failure=failed_snapshot,
-                    verification_required=verification_required,
-                    conversation_memory=conversation_memory,
-                    next_message_seq=next_message_seq,
-                    persisted_memory_revision=context.persisted_memory_revision,
-                    memory_pending_clear=context.memory_pending_clear,
-                )
-                committed = self.context_manager.commit_compaction(
-                    transient,
-                    plan,
-                    summary_result.candidate,
-                    summary_max_chars=self.memory_config.summary_max_chars,
                 )
             except CancellationError:
                 raise
             except MemorySummaryError as exc:
                 reason = memory_summary_failure_code(exc)
+                detail = (
+                    "无法完整保存，当前候选保持不变"
+                    if reason in {"input_limit", "coverage"}
+                    else "执行结果不受影响"
+                )
                 memory_warning = (
                     f"会话记忆候选生成失败（{memory_summary_failure_label(reason)}）；"
-                    "执行结果不受影响"
+                    f"{detail}"
                 )
                 self.observer.on_error(memory_warning)
                 if not self._log(
                     {
                         "status": "memory_review_failed",
                         "failure_code": reason,
-                        "source_count": len(plan.source_messages),
-                        "covered_through": plan.covered_through,
+                        "source_count": source_count,
+                        "covered_through": (
+                            review_memory_candidate or conversation_memory
+                        ).covered_through,
                     }
                 ):
                     raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
@@ -677,37 +848,47 @@ class CodingAgent:
                     {
                         "status": "memory_review_failed",
                         "failure_code": reason,
-                        "source_count": len(plan.source_messages),
-                        "covered_through": plan.covered_through,
+                        "source_count": source_count,
+                        "covered_through": (
+                            review_memory_candidate or conversation_memory
+                        ).covered_through,
                     }
                 ):
                     raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
                 return
+            committed = refreshed.context.review_memory_candidate
+            if not isinstance(committed, ConversationMemory):
+                raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
             if not self._log(
                 {
                     "status": "memory_review_candidate",
-                    "source_count": len(plan.source_messages),
-                    "revision": committed.conversation_memory.revision,
-                    "covered_through": committed.conversation_memory.covered_through,
+                    "source_count": source_count,
+                    "revision": committed.revision,
+                    "covered_through": committed.covered_through,
                 }
             ):
                 raise _MemoryAuditFailure(AUDIT_FAILURE_MESSAGE)
-            conversation_memory = committed.conversation_memory
-            messages[history_start:] = committed.messages
-            if summary_result.usage is not None:
+            review_memory_candidate = committed
+            memory_calls += refreshed.memory_calls
+            if refreshed.memory_usage is not None:
                 memory_usage = (
-                    summary_result.usage
+                    refreshed.memory_usage
                     if memory_usage is None
-                    else memory_usage.merge(summary_result.usage)
+                    else memory_usage.merge(refreshed.memory_usage)
                 )
 
         def execution_context() -> SessionContext:
             return SessionContext(
-                modified_files=tuple(modified_files), verification=verification,
-                unknown_effects=unknown_effects, verification_evidence=evidence,
-                verification_failure=failed_snapshot, verification_required=verification_required,
+                modified_files=tuple(modified_files),
+                verification=verification,
+                unknown_effects=unknown_effects,
+                verification_evidence=evidence,
+                verification_failure=failed_snapshot,
+                verification_required=verification_required,
                 conversation_memory=conversation_memory,
+                review_memory_candidate=review_memory_candidate,
                 next_message_seq=next_message_seq,
+                latest_completed_task_seq=latest_completed_task_seq,
                 persisted_memory_revision=context.persisted_memory_revision,
                 memory_pending_clear=context.memory_pending_clear,
             )
@@ -784,11 +965,13 @@ class CodingAgent:
                     verification_failure=failed_snapshot,
                     verification_required=verification_required,
                     conversation_memory=conversation_memory,
+                    review_memory_candidate=review_memory_candidate,
                     next_message_seq=(
                         rollback_next_message_seq
                         if rollback_task and not current_complete
                         else next_message_seq
                     ),
+                    latest_completed_task_seq=latest_completed_task_seq,
                     persisted_memory_revision=context.persisted_memory_revision,
                     memory_pending_clear=context.memory_pending_clear,
                 ),
@@ -1272,6 +1455,20 @@ class CodingAgent:
                         summary = f"{summary}；文件修改后尚未运行验证命令，或受覆盖文件状态证据已失效"
                     elif result.ok and verification_required and verification == "失败":
                         summary = f"{summary}；文件修改后的验证失败"
+                    if completed:
+                        completed_history = normalize_history()
+                        completed_sequences = [
+                            message.message_seq
+                            for message in completed_history
+                            if message.task_id == current_task_id
+                            and message.message_seq is not None
+                        ]
+                        if not completed_sequences:
+                            return turn_result(RunResult(
+                                False, "无法确定已完成任务的记忆覆盖边界", round_number,
+                                tool_calls, tuple(modified_files), verification,
+                            ))
+                        latest_completed_task_seq = max(completed_sequences)
                     if completed and self.memory_config.persistence == "reviewed_summary":
                         try:
                             await prepare_review_memory()
