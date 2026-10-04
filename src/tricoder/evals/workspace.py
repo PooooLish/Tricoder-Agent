@@ -10,7 +10,10 @@ import shutil
 import stat
 from typing import Mapping
 
-import tricoder.subprocess_control as subprocess_control
+from tricoder.core import cancellation as cancellation_module
+from tricoder.process import control as process_control
+import tricoder.task_cleanup as task_cleanup_module
+from tricoder.workspace.lock import CONTROL_DIRECTORY
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase
@@ -67,6 +70,12 @@ def capture_snapshot(workspace: Path) -> dict[str, FileFingerprint]:
     snapshot: dict[str, FileFingerprint] = {}
     for path in _iter_regular_files(root, root):
         relative_path = path.relative_to(root).as_posix()
+        control_prefix = CONTROL_DIRECTORY.as_posix()
+        if (
+            relative_path == control_prefix
+            or relative_path.startswith(control_prefix + "/")
+        ):
+            continue
         snapshot[relative_path] = _fingerprint(path)
     return snapshot
 
@@ -99,9 +108,6 @@ def install_verifier(case: EvalCase, workspace: Path) -> Path:
 def _install_bounded_process_runtime(verifier: Path, root: Path) -> None:
     """只复制隐藏进程 helper 的最小本地依赖闭包，避免依赖开发环境。"""
 
-    process_source = Path(subprocess_control.__file__)
-    _reject_link_or_reparse_path(process_source)
-    source_root = process_source.resolve(strict=True).parent
     runtime_package = _within_root(verifier / _HIDDEN_RUNTIME_PACKAGE, root)
     runtime_core = _within_root(runtime_package / "core", root)
     runtime_package.mkdir()
@@ -113,9 +119,9 @@ def _install_bounded_process_runtime(verifier: Path, root: Path) -> None:
         destination.write_text("", encoding="utf-8")
 
     sources = (
-        (source_root / "subprocess_control.py", verifier / _HIDDEN_PROCESS_HELPER),
-        (source_root / "task_cleanup.py", runtime_package / "task_cleanup.py"),
-        (source_root / "core" / "cancellation.py", runtime_core / "cancellation.py"),
+        (Path(process_control.__file__), verifier / _HIDDEN_PROCESS_HELPER),
+        (Path(task_cleanup_module.__file__), runtime_package / "task_cleanup.py"),
+        (Path(cancellation_module.__file__), runtime_core / "cancellation.py"),
     )
     for source, destination in sources:
         _copy_framework_file(source, destination, root)

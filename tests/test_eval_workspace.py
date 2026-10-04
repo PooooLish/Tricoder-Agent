@@ -112,8 +112,22 @@ class EvalWorkspaceTests(unittest.TestCase):
         verifier = install_verifier(self.case, workspace)
         probe = verifier / "probe_import.py"
         probe.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
             "from _tricoder_bounded_process import run_bounded_process\n"
-            "assert callable(run_bounded_process)\n",
+            "success = run_bounded_process(\n"
+            "    [sys.executable, '-c', \"print('helper-ok')\"],\n"
+            "    cwd=Path.cwd(), env=dict(os.environ), timeout=2, max_output_bytes=4096,\n"
+            ")\n"
+            "assert success.returncode == 0, success\n"
+            "assert success.stdout.strip() == 'helper-ok', success\n"
+            "timeout = run_bounded_process(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(1)'],\n"
+            "    cwd=Path.cwd(), env=dict(os.environ), timeout=0.05, max_output_bytes=4096,\n"
+            ")\n"
+            "assert timeout.timed_out, timeout\n"
+            "assert not timeout.cleanup_failed, timeout\n",
             encoding="utf-8",
         )
         environ = dict(os.environ)
@@ -126,6 +140,7 @@ class EvalWorkspaceTests(unittest.TestCase):
             env=environ,
             capture_output=True,
             text=True,
+            timeout=10,
             check=False,
         )
 

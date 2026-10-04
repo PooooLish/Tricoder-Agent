@@ -11,8 +11,26 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tricoder.evals.service import run_eval_command
-from tricoder.models import ProviderConfig, ProviderResponse, ToolCall, ToolDefinition
+from tricoder.evals.models import EvalCase, ScenarioStep
+from tricoder.evals.scenarios import RuntimeScenarioObservation
+from tricoder.evals.service import _execute_case, run_eval_command
+from tricoder.core.events import (
+    ProviderCompleted,
+    TextDelta,
+    ToolCallCompleted,
+    UsageReported,
+)
+from tricoder.models import (
+    AppConfig,
+    ProviderConfig,
+    ProviderResponse,
+    RunResult,
+    ToolCall,
+    ToolDefinition,
+)
+from tricoder.models import TokenUsage
+from tricoder.session.runtime import SessionRuntimeError
+from tricoder.workspace.lock import WorkspaceLock
 
 
 class PassingProvider:
@@ -66,6 +84,65 @@ class ExplodingProvider:
         _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
     ) -> ProviderResponse:
         raise RuntimeError("PROVIDER-SECRET-SENTINEL")
+
+
+class MultiTurnMemoryProvider:
+    """同时模拟业务工具调用和生产记忆摘要流。"""
+
+    def __init__(self) -> None:
+        self.business_calls = 0
+        self.summary_calls = 0
+
+    def complete(
+        self,
+        _messages: list[object],
+        _tools: list[ToolDefinition] | tuple[ToolDefinition, ...] = (),
+    ) -> ProviderResponse:
+        self.business_calls += 1
+        calls: tuple[ToolCall, ...]
+        if self.business_calls == 1:
+            calls = (
+                ToolCall(
+                    "edit",
+                    "edit_file",
+                    {
+                        "path": "app.py",
+                        "old_text": "value = 1\n",
+                        "new_text": "value = 2\n",
+                    },
+                ),
+                ToolCall(
+                    "verify",
+                    "run_command",
+                    {"command": "python -m unittest -q"},
+                ),
+                ToolCall("finish-1", "finish", {"summary": "first turn"}),
+            )
+        else:
+            calls = (ToolCall("finish-2", "finish", {"summary": "second turn"}),)
+        return ProviderResponse(
+            tool_calls=calls,
+            finish_reason="tool_calls",
+            usage=TokenUsage(input_tokens=7, output_tokens=2),
+        )
+
+    async def stream(self, _messages, _tools=(), *, cancellation=None):  # type: ignore[no-untyped-def]
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
+        if _tools:
+            response = self.complete(_messages, _tools)
+            for call in response.tool_calls:
+                yield ToolCallCompleted(call)
+            assert response.usage is not None
+            yield UsageReported(response.usage)
+            yield ProviderCompleted(response.finish_reason)
+            return
+        self.summary_calls += 1
+        yield TextDelta(
+            '{"goal":null,"constraints":[],"decisions":[],"open_items":[]}'
+        )
+        yield UsageReported(TokenUsage(input_tokens=3, output_tokens=1))
+        yield ProviderCompleted("stop")
 
 
 class EvalServiceTests(unittest.TestCase):
@@ -128,6 +205,8 @@ class EvalServiceTests(unittest.TestCase):
     def _args(self, **overrides: object) -> argparse.Namespace:
         values: dict[str, object] = {
             "suite": self.suite_dir,
+            "experiment": None,
+            "repeat": 1,
             "provider": "openai",
             "model": None,
             "base_url": None,
@@ -223,6 +302,128 @@ class EvalServiceTests(unittest.TestCase):
         self.assertNotIn("test-key", output.getvalue())
         self.assertNotIn("TASK-SECRET-SENTINEL", output.getvalue())
         self.assertNotIn("PROVIDER-SUMMARY-SENTINEL", output.getvalue())
+
+    def test_repeat_rebuilds_provider_and_writes_each_trial_result(self) -> None:
+        """Repeats must be independent runs rather than retries inside one Agent."""
+        output = io.StringIO()
+        provider_calls: list[ProviderConfig] = []
+
+        def factory(config: ProviderConfig, _timeout: float) -> PassingProvider:
+            provider_calls.append(config)
+            return PassingProvider()
+
+        exit_code = run_eval_command(
+            self._args(case="case-two", model="eval-model", repeat=2),
+            environ=self._environment(),
+            provider_factory=factory,
+            output=output,
+        )
+
+        run_dir = next((self.root / "runtime" / "evals").iterdir())
+        payload = json.loads((run_dir / "result.json").read_text("utf-8"))
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, len(provider_calls))
+        self.assertEqual(2, len(payload["trials"]))
+        self.assertEqual(2, len(list((run_dir / "results").glob("*.json"))))
+        self.assertEqual(2, payload["schema_version"])
+        self.assertEqual("legacy", payload["benchmark_version"])
+        self.assertEqual("default", payload["conditions"][0]["id"])
+        self.assertEqual(
+            {"suite", "verifier", "tasks", "budgets", "approval_policy", "environment", "code"},
+            set(payload["fingerprints"]),
+        )
+
+    def test_experiment_uses_real_multi_turn_and_memory_configuration(self) -> None:
+        """只记录 memory-on 标签、却未触发生产摘要路径时必须失败。"""
+        (self.suite_dir / "suite.toml").write_text(
+            'schema_version = 2\nbenchmark_version = "quality-v1"\n'
+            'id = "smoke"\ntitle = "Smoke"\ncases = ["case-one"]\n',
+            encoding="utf-8",
+        )
+        case_path = self.suite_dir / "cases" / "case-one" / "case.toml"
+        case_path.write_text(
+            'id = "case-one"\ntitle = "case-one"\ntask = "fallback"\n'
+            'allowed_changes = ["app.py"]\nrequired_changes = ["app.py"]\n'
+            'max_rounds = 4\nmax_context_chars = 4000\n'
+            'category = "memory"\nsplit = "dev"\nexecution_kind = "quality"\n'
+            'scorers = ["hidden_verifier"]\nfaults = ["none"]\n'
+            'dimensions = ["artifact_correct", "agent_completed"]\n\n'
+            '[[steps]]\nkind = "user_turn"\ncontent = "先修复文件"\n\n'
+            '[[steps]]\nkind = "user_turn"\ncontent = "确认约束仍然有效"\n\n'
+            '[[verification]]\nname = "hidden"\n'
+            'command = "python -m unittest discover -s .tricoder_eval_verifier -q"\n'
+            'timeout = 5\n',
+            encoding="utf-8",
+        )
+        experiment = self.root / "experiment.toml"
+        experiment.write_text(
+            'schema_version = 1\nexperiment_id = "memory-path"\n'
+            'suite = "suite"\nrepetitions = 1\nsplit = "all"\n'
+            'max_trials = 1\ntime_budget_seconds = 60\nseed = 1\n\n'
+            '[[conditions]]\nid = "memory-on"\nprovider = "openai"\n'
+            'model = "offline"\nexecution_kind = "quality"\n'
+            'memory_compaction = "structured"\n'
+            'memory_persistence = "reviewed_summary"\n'
+            'scorers = ["hidden_verifier"]\nfaults = ["none"]\n',
+            encoding="utf-8",
+        )
+        providers: list[MultiTurnMemoryProvider] = []
+
+        def factory(_config: ProviderConfig, _timeout: float) -> MultiTurnMemoryProvider:
+            provider = MultiTurnMemoryProvider()
+            providers.append(provider)
+            return provider
+
+        exit_code = run_eval_command(
+            self._args(suite=None, experiment=experiment),
+            environ=self._environment(),
+            provider_factory=factory,
+            output=io.StringIO(),
+        )
+
+        run_dir = next((self.root / "runtime" / "evals").iterdir())
+        payload = json.loads((run_dir / "result.json").read_text("utf-8"))
+        trial = payload["trials"][0]
+        self.assertEqual(0, exit_code)
+        self.assertEqual(1, len(providers))
+        self.assertEqual(2, providers[0].business_calls)
+        self.assertEqual(2, providers[0].summary_calls)
+        self.assertTrue(trial["summary_triggered"])
+        self.assertEqual(2, trial["summary_count"])
+        self.assertEqual(6, trial["summary_usage"]["input_tokens"])
+        self.assertEqual(2, trial["summary_usage"]["output_tokens"])
+
+    def test_experiment_records_triggered_fault_and_recovery_path(self) -> None:
+        """声明故障但未包装生产 Provider 时，不得伪造恢复成功。"""
+        experiment = self.root / "fault-experiment.toml"
+        experiment.write_text(
+            'schema_version = 1\nexperiment_id = "fault-path"\n'
+            'suite = "suite"\nrepetitions = 1\nsplit = "all"\n'
+            'max_trials = 2\ntime_budget_seconds = 60\nseed = 1\n\n'
+            '[[conditions]]\nid = "provider-retry"\nprovider = "openai"\n'
+            'model = "offline"\nexecution_kind = "quality"\n'
+            'memory_compaction = "off"\nmemory_persistence = "off"\n'
+            'scorers = ["hidden_verifier"]\nfaults = ["provider_transient"]\n',
+            encoding="utf-8",
+        )
+
+        exit_code = run_eval_command(
+            self._args(suite=None, experiment=experiment),
+            environ=self._environment(),
+            provider_factory=lambda _config, _timeout: PassingProvider(),
+            output=io.StringIO(),
+        )
+
+        run_dir = next((self.root / "runtime" / "evals").iterdir())
+        payload = json.loads((run_dir / "result.json").read_text("utf-8"))
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, len(payload["trials"]))
+        for trial in payload["trials"]:
+            self.assertEqual(["provider_transient"], trial["triggered_faults"])
+            self.assertEqual("provider_transport_retry", trial["recovery_path"])
+            self.assertEqual(1, trial["retries"])
+            self.assertTrue(trial["dimensions"]["fault_triggered"])
+            self.assertTrue(trial["dimensions"]["recovered"])
 
     def test_case_failure_returns_one_and_still_writes_report(self) -> None:
         """Treating a scored case failure as success or omitting its report must fail."""
@@ -381,6 +582,169 @@ class EvalServiceTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertEqual([], provider_calls)
         self.assertFalse((self.root / "runtime").exists())
+
+    def test_control_steps_use_temporary_session_runtime_and_restart(self) -> None:
+        """控制步骤不得落入普通多轮分支或作为文本发送给模型。"""
+        workspace = self.root / "control-workspace"
+        workspace.mkdir()
+        (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+        (workspace / "test_smoke.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n"
+            "    def test_ok(self): self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        case = EvalCase(
+            id="control",
+            title="control",
+            task="fallback",
+            source_dir=self.root,
+            workspace_dir=workspace,
+            verifier_dir=self.root,
+            allowed_changes=("app.py",),
+            required_changes=("app.py",),
+            max_rounds=4,
+            max_context_chars=4000,
+            verifications=(),
+            category="memory",
+            steps=(
+                ScenarioStep("user_turn", content="记住约束"),
+                ScenarioStep("memory_save"),
+                ScenarioStep("restart_session"),
+                ScenarioStep("user_turn", content="现在修改文件"),
+            ),
+        )
+        config = AppConfig(
+            workspace=workspace,
+            provider=ProviderConfig(
+                "openai", "synthetic", "https://example.invalid/v1", "offline"
+            ),
+            audit_dir=self.root / "audit",
+            plan_enabled=False,
+        )
+        builds = 0
+
+        def factory(_config: ProviderConfig, _timeout: float):  # type: ignore[no-untyped-def]
+            nonlocal builds
+            builds += 1
+            return FinishingWithoutChangesProvider() if builds == 1 else PassingProvider()
+
+        result = _execute_case(
+            case,
+            workspace,
+            self.root / "audit" / "control.jsonl",
+            config,
+            factory,
+        )
+
+        self.assertTrue(result.ok, result)
+        self.assertEqual(2, builds)
+        self.assertEqual("value = 2\n", (workspace / "app.py").read_text("utf-8"))
+        self.assertFalse((self.root / "audit" / "control-sessions.db").exists())
+
+    def test_plain_user_turn_eval_uses_workspace_lock_before_provider_creation(self) -> None:
+        """普通 Eval 也必须走 Runtime 门禁，不能只有控制步骤才取得工作区锁。"""
+
+        workspace = self.root / "plain-runtime-workspace"
+        workspace.mkdir()
+        (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+        case = EvalCase(
+            id="plain-runtime",
+            title="plain",
+            task="finish only",
+            source_dir=self.root,
+            workspace_dir=workspace,
+            verifier_dir=self.root,
+            allowed_changes=(),
+            required_changes=(),
+            max_rounds=2,
+            max_context_chars=4000,
+            verifications=(),
+        )
+        config = AppConfig(
+            workspace=workspace,
+            provider=ProviderConfig(
+                "openai", "synthetic", "https://example.invalid/v1", "offline"
+            ),
+            audit_dir=self.root / "plain-audit",
+            plan_enabled=False,
+        )
+        provider_calls = 0
+
+        def factory(_config: ProviderConfig, _timeout: float):  # type: ignore[no-untyped-def]
+            nonlocal provider_calls
+            provider_calls += 1
+            return FinishingWithoutChangesProvider()
+
+        ownership = WorkspaceLock.acquire(workspace)
+        try:
+            with self.assertRaisesRegex(SessionRuntimeError, "工作区正在执行其他任务"):
+                _execute_case(
+                    case,
+                    workspace,
+                    self.root / "plain-audit" / "plain.jsonl",
+                    config,
+                    factory,
+                )
+        finally:
+            ownership.close()
+
+        self.assertEqual(0, provider_calls)
+
+    def test_eval_stops_and_preserves_database_when_runtime_cleanup_is_incomplete(self) -> None:
+        """Runtime 未确认释放锁与资源时，Eval 不能删库后继续验证。"""
+
+        workspace = self.root / "cleanup-workspace"
+        workspace.mkdir()
+        audit_path = self.root / "cleanup-audit" / "cleanup.jsonl"
+        audit_path.parent.mkdir()
+        database = audit_path.parent / "cleanup-sessions.db"
+        database.write_text("synthetic-state", encoding="utf-8")
+        case = EvalCase(
+            id="cleanup",
+            title="cleanup",
+            task="finish only",
+            source_dir=self.root,
+            workspace_dir=workspace,
+            verifier_dir=self.root,
+            allowed_changes=(),
+            required_changes=(),
+            max_rounds=2,
+            max_context_chars=4000,
+            verifications=(),
+        )
+        config = AppConfig(
+            workspace=workspace,
+            provider=ProviderConfig(
+                "openai", "synthetic", "https://example.invalid/v1", "offline"
+            ),
+            audit_dir=audit_path.parent,
+            plan_enabled=False,
+        )
+
+        class IncompleteRuntime:
+            def close(self) -> bool:
+                return False
+
+        scenario = RuntimeScenarioObservation(
+            runtime=IncompleteRuntime(),  # type: ignore[arg-type]
+            results=(RunResult(True, "done", 1),),
+            runtime_instances=1,
+            approval_decisions=(),
+        )
+        with patch(
+            "tricoder.evals.service.run_runtime_scenario",
+            return_value=scenario,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup"):
+                _execute_case(
+                    case,
+                    workspace,
+                    audit_path,
+                    config,
+                    lambda _config, _timeout: FinishingWithoutChangesProvider(),
+                )
+
+        self.assertTrue(database.is_file())
 
 
 if __name__ == "__main__":

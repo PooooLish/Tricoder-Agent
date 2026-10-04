@@ -1,0 +1,1100 @@
+"""基于 Textual 的本地交互 TUI 实现。
+
+完全复用 SessionRuntime / CodingAgent / ToolRegistry / CommandPolicy 的安全
+边界：写操作与命令执行仍需在模态审批中明确确认；read_only 由运行配置决定。
+Agent 循环在后台线程运行，UI 事件通过 Textual 线程安全机制转发。
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from rich.text import Text
+from textual import on
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Collapsible,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+)
+
+from tricoder.agent import AgentObserver
+from tricoder.presentation.commands import (
+    CommandError,
+    is_slash_command,
+    list_commands,
+    parse_command,
+)
+from tricoder.core.events import AgentEvent, TextDelta
+from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
+from tricoder.presentation.approval_wait import ApprovalWait
+from tricoder.core.cancellation import CancellationToken
+from tricoder.session.runtime import SessionInUseError, SessionRuntime, SessionRuntimeError
+
+
+def _format_token_usage(usage: TokenUsage) -> str:
+    def count(value: int | None) -> str:
+        return "-" if value is None else f"{value:,}"
+
+    ratio = usage.cache_hit_ratio
+    ratio_text = "-" if ratio is None else f"{ratio:.1%}"
+    return (
+        f"输入 {count(usage.input_tokens)} · "
+        f"缓存 {count(usage.cached_tokens)} ({ratio_text}) · "
+        f"输出 {count(usage.output_tokens)}"
+    )
+
+
+def _p(value: object) -> Text:
+    """把动态外部文本转为纯文本，绝不解析 Rich markup。"""
+    return Text(str(value))
+
+
+def _distinct_session_prefixes(
+    sessions: Sequence[SessionRecord],
+) -> dict[str, str]:
+    """返回至少八位且在当前列表中可区分的 Session ID 前缀。"""
+
+    ids = [record.id for record in sessions]
+    prefixes: dict[str, str] = {}
+    for session_id in ids:
+        width = min(8, len(session_id))
+        while width < len(session_id) and any(
+            other != session_id and other[:width] == session_id[:width]
+            for other in ids
+        ):
+            width += 1
+        prefixes[session_id] = session_id[:width]
+    return prefixes
+
+
+class ApprovalScreen(ModalScreen[bool]):
+    """展示动作详情，仅接受明确的 y 允许 / n 或 Esc 拒绝。"""
+
+    BINDINGS = [
+        ("y", "approve", "允许"),
+        ("n", "reject", "拒绝"),
+        ("escape", "reject", "取消"),
+    ]
+
+    def __init__(self, action: str, detail: str) -> None:
+        super().__init__()
+        self._action = action
+        self._detail = detail
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            Text.assemble(("待审批动作：", "bold yellow"), _p(self._action))
+        )
+        # detail 含命令/diff/外部文本，必须按纯文本渲染，防止 markup 注入。
+        yield VerticalScroll(
+            Static(Text(self._detail), classes="approval-detail"),
+            classes="approval-scroll",
+        )
+        yield Static("[dim]按 y 允许，n 或 Esc 拒绝[/dim]", classes="approval-hint")
+
+    def action_approve(self) -> None:
+        self.dismiss(True)
+
+    def action_reject(self) -> None:
+        self.dismiss(False)
+
+
+@dataclass(frozen=True, slots=True)
+class OptionChoice:
+    """选择列表的显示文本与稳定返回值。"""
+
+    label: str
+    value: str
+
+
+class OptionListScreen(ModalScreen[str]):
+    """通用方向键选择列表；Enter 确认、Esc 取消，返回选项值或 None。"""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        title: str,
+        options: Sequence[str | OptionChoice],
+        current: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._options = list(options)
+        self._current = current
+
+    @staticmethod
+    def _label(option: str | OptionChoice) -> str:
+        return option.label if isinstance(option, OptionChoice) else option
+
+    @staticmethod
+    def _value(option: str | OptionChoice) -> str:
+        return option.value if isinstance(option, OptionChoice) else option
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"[bold cyan]{self._title}[/bold cyan]")
+        items = [ListItem(Label(self._label(option))) for option in self._options]
+        yield ListView(*items, id="options")
+        yield Static("[dim]↑/↓ 选择 · Enter 确认 · Esc 取消[/dim]", classes="approval-hint")
+
+    def on_mount(self) -> None:
+        list_view = self.query_one("#options", ListView)
+        values = [self._value(option) for option in self._options]
+        if self._current is not None and self._current in values:
+            list_view.index = values.index(self._current)
+        list_view.focus()
+
+    @on(ListView.Selected)
+    def _selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        list_view = self.query_one("#options", ListView)
+        self.dismiss(self._value(self._options[list_view.index]))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TextInputScreen(ModalScreen[str]):
+    """本地单字段输入；文本只交给调用方，不进入 Agent。"""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(self, title: str, placeholder: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text(self._title))
+        yield Input(placeholder=self._placeholder, id="modal-input")
+        yield Static("[dim]Enter 确认 · Esc 取消[/dim]", classes="approval-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#modal-input", Input).focus()
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.dismiss(event.value or "")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TuiObserver(AgentObserver):
+    """把后台线程中的 Agent 事件转发到 UI 线程。"""
+
+    def __init__(self, app: "TricoderApp") -> None:
+        self._app = app
+
+    def __call__(self, event: AgentEvent) -> None:
+        """只把可公开文本增量送入 RichLog；动态内容始终按纯文本处理。"""
+        if isinstance(event, TextDelta):
+            self._app.round_line(Text(event.text))
+
+    def on_round_start(self, round_number: int, max_rounds: int) -> None:
+        self._app.begin_round(round_number, max_rounds)
+
+    def on_action(self, action: ToolAction) -> None:
+        self._app.round_line(
+            Text.assemble(("● ", "bold cyan"), _p(action.tool), "  ", _p(action.reason))
+        )
+
+    def on_tool_result(
+        self,
+        action: ToolAction,
+        result: ToolResult,
+        duration_ms: int,
+    ) -> None:
+        icon = "✓" if result.ok else "✗"
+        color = "green" if result.ok else "red"
+        error_label = (f" · {result.error.code.value} / {result.error.recovery.value}"
+                       if result.error is not None else "")
+        self._app.round_line(
+            f"  [{color}]{icon}[/{color}] {len(result.output):,} 字符 · {duration_ms} ms{error_label}"
+        )
+        self._app.round_summary(f"{action.tool} {icon} · {duration_ms} ms")
+
+    def on_provider_usage(self, round_number: int, usage: TokenUsage) -> None:
+        self._app.round_line(
+            f"[cyan]用量 · {_format_token_usage(usage)}[/cyan]"
+        )
+
+    def on_error(self, message: str) -> None:
+        self._app.round_line(
+            Text.assemble(("✗ ", "bold red"), _p(message))
+        )
+
+
+class TricoderApp(App[None]):
+    """TriCoder 本地交互界面。"""
+
+    TITLE = "TriCoder TUI"
+    SUB_TITLE = "安全审批式 Coding Agent"
+
+    BINDINGS = [
+        ("ctrl+q", "quit", "退出"),
+        ("ctrl+c", "cancel", "取消任务/清空输入"),
+    ]
+
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #main {
+        height: 1fr;
+    }
+    #log {
+        width: 1fr;
+        border: round $primary;
+        padding: 0 1;
+    }
+    #log Collapsible {
+        margin: 0 0 1 0;
+    }
+    .log-line {
+        margin: 0 0 1 0;
+    }
+    #sidebar {
+        width: 30;
+        border: round $primary;
+        padding: 1;
+        background: $panel;
+    }
+    #sidebar-content {
+        color: $text;
+        height: 1fr;
+    }
+    #prompt-bar {
+        dock: bottom;
+        height: auto;
+        align: center middle;
+        padding: 0 0 1 0;
+    }
+    #prompt {
+        width: 100%;
+        max-width: 110;
+        height: 4;
+    }
+    #prompt:focus {
+        border: round $accent;
+    }
+    ApprovalScreen {
+        align: center middle;
+        background: $surface;
+        border: round $warning;
+        padding: 1 2;
+        width: 80%;
+        max-width: 110;
+        height: 80%;
+    }
+    .approval-scroll {
+        margin: 1 0;
+        height: 1fr;
+    }
+    .approval-detail {
+        color: $text;
+    }
+    .approval-hint {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(
+        self,
+        runtime_factory: Callable[[AgentObserver, Callable[[str, str], bool]], SessionRuntime],
+    ) -> None:
+        super().__init__()
+        self._runtime_factory = runtime_factory
+        self.runtime: SessionRuntime | None = None
+        self.last_result: RunResult | None = None
+        self._lines: list[str] = []
+        self._round_widgets: list[Collapsible] = []
+        self._current_round_log: RichLog | None = None
+        self._current_round_summary: list[str] = []
+        self._approval_lock = threading.Lock()
+        self._pending_approvals: set[ApprovalWait] = set()
+        self._approvals_closed = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        yield Horizontal(
+            VerticalScroll(id="log"),
+            Vertical(Static("", id="sidebar-content"), id="sidebar", classes="sidebar"),
+            id="main",
+        )
+        yield Horizontal(
+            Input(id="prompt", placeholder="输入任务，或 /help 查看本地命令"),
+            id="prompt-bar",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        try:
+            self.runtime = self._runtime_factory(TuiObserver(self), self._approver)
+        except SessionInUseError as exc:
+            self.log_line(Text(str(exc), style="bold red"))
+            self.exit(2)
+            return
+        except Exception as exc:
+            self.log_line(
+                Text.assemble(
+                    ("无法安全初始化会话：", "bold red"), _p(type(exc).__name__)
+                )
+            )
+            self.exit(2)
+            return
+        status = self.runtime.status()
+        if status.record is None:
+            self.log_line(
+                Text.assemble(
+                    ("TriCoder", "bold cyan"),
+                    " · 新会话（首次任务时创建） · ",
+                    _p(status.provider),
+                    " · ",
+                    _p(status.model),
+                )
+            )
+        else:
+            record = status.record
+            self.log_line(
+                Text.assemble(
+                    ("TriCoder", "bold cyan"),
+                    " · 会话 ",
+                    _p(record.name),
+                    " · ",
+                    _p(record.id[:8]),
+                    " · ",
+                    _p(status.provider),
+                    " · ",
+                    _p(status.model),
+                )
+            )
+        self.log_line(Text.assemble(("工作区：", "dim"), _p(status.workspace)))
+        self._refresh_sidebar_impl()
+        self.query_one(Input).focus()
+
+    # ---- 线程安全日志 ----
+
+    def log_line_safe(self, text: str | Text) -> None:
+        """后台线程调用；转发到 UI 线程。"""
+        try:
+            self.call_from_thread(self._log_line_impl, text)
+        except Exception:
+            pass
+
+    def log_line(self, text: str | Text) -> None:
+        """UI 线程直接写入。"""
+        self._log_line_impl(text)
+
+    def _log_line_impl(self, text: str | Text) -> None:
+        renderable = text if isinstance(text, Text) else Text.from_markup(text)
+        self._lines.append(renderable.plain)
+        self.query_one("#log", VerticalScroll).mount(
+            Static(renderable, classes="log-line")
+        )
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+
+    def refresh_sidebar(self) -> None:
+        """后台线程调用；刷新侧边状态栏。"""
+        try:
+            self.call_from_thread(self._refresh_sidebar_impl)
+        except Exception:
+            pass
+
+    def _refresh_sidebar_impl(self) -> None:
+        if self.runtime is None:
+            return
+        status = self.runtime.status()
+        record = status.record
+        workspace = str(status.workspace)
+        if len(workspace) > 26:
+            workspace = "…" + workspace[-25:]
+        mode = "只读" if status.read_only else "可编辑"
+        content = Text()
+        content.append("会话", style="bold")
+        content.append("\n")
+        if record is None:
+            content.append("新会话（首次任务时创建）")
+        else:
+            content.append(_p(f"{record.name} · {record.id[:8]}"))
+        content.append("\n\n")
+        content.append("Provider", style="bold")
+        content.append("\n")
+        content.append(_p(status.provider))
+        content.append("\n\n")
+        content.append("模型", style="bold")
+        content.append("\n")
+        content.append(_p(status.model))
+        content.append("\n\n")
+        content.append("工作区", style="bold")
+        content.append("\n")
+        content.append(_p(workspace))
+        content.append("\n\n")
+        content.append("模式", style="bold")
+        content.append("\n")
+        content.append(_p(mode))
+        content.append("\n\n")
+        content.append("权限", style="bold")
+        content.append("\n")
+        content.append(_p(self.runtime.permission_level))
+        content.append("\n\n")
+        content.append("上次文件状态检查（非业务验收）", style="bold")
+        content.append("\n")
+        content.append(_p(status.verification))
+        content.append("\n\n")
+        content.append("修改文件", style="bold")
+        content.append("\n")
+        content.append(_p(status.modified_files))
+        self.query_one("#sidebar-content", Static).update(content)
+
+    def begin_round(self, round_number: int, max_rounds: int) -> None:
+        """后台线程调用；为新一轮创建可折叠块。"""
+        try:
+            self.call_from_thread(self._begin_round_impl, round_number, max_rounds)
+        except Exception:
+            pass
+
+    def _begin_round_impl(self, round_number: int, max_rounds: int) -> None:
+        container = self.query_one("#log", VerticalScroll)
+        for widget in self._round_widgets:
+            if not widget.collapsed:
+                widget.collapsed = True
+        content = RichLog(highlight=True, markup=True, wrap=True)
+        collapsible = Collapsible(
+            content, title=f"第 {round_number}/{max_rounds} 轮", collapsed=True
+        )
+        container.mount(collapsible)
+        container.scroll_end(animate=False)
+        self._round_widgets.append(collapsible)
+        self._current_round_log = content
+        self._current_round_summary = [f"第 {round_number}/{max_rounds} 轮"]
+
+    def round_line(self, text: str | Text) -> None:
+        """后台线程调用；写入当前轮内容。"""
+        try:
+            self.call_from_thread(self._round_line_impl, text)
+        except Exception:
+            pass
+
+    def _round_line_impl(self, text: str | Text) -> None:
+        renderable = text if isinstance(text, Text) else Text.from_markup(text)
+        if self._current_round_log is not None:
+            self._current_round_log.write(renderable)
+        else:
+            # 尚无轮次（规划/审计准备阶段）时回退到总日志，避免错误被吞。
+            self._log_line_impl(renderable)
+
+    def round_summary(self, summary: str) -> None:
+        """后台线程调用；更新当前轮标题摘要。"""
+        try:
+            self.call_from_thread(self._round_summary_impl, summary)
+        except Exception:
+            pass
+
+    def _round_summary_impl(self, summary: str) -> None:
+        self._current_round_summary.append(summary)
+        if not self._round_widgets:
+            return
+        title = " · ".join(self._current_round_summary[-3:])
+        self._round_widgets[-1].title = title
+
+    # ---- 任务与命令 ----
+
+    @on(Input.Submitted)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = (event.value or "").strip()
+        self.query_one(Input).value = ""
+        if not text:
+            return
+        if is_slash_command(text):
+            self._handle_command(text)
+        else:
+            self.log_line(Text.assemble(("任务：", "bold"), _p(text)))
+            self.run_worker(
+                lambda: self._run_task(text), thread=True, exclusive=True,
+                name="agent-task",
+            )
+
+    def _run_task(self, task: str) -> None:
+        if self.runtime is None:
+            return
+        try:
+            result = self.runtime.run_task(task)
+        except SessionRuntimeError as exc:
+            self.log_line_safe(
+                Text.assemble(("任务运行失败：", "bold red"), _p(exc))
+            )
+            self.refresh_sidebar()
+            return
+        except Exception:
+            # Runtime 已完成异常对账；最终界面没有公开内部异常正文或自报类型名的权限。
+            self.log_line_safe(
+                Text("任务异常：内部执行失败，已停止本次任务（execution_failed / stop_task）", style="bold red")
+            )
+            self.refresh_sidebar()
+            return
+        self._log_result(result)
+
+    def _log_result(self, result: RunResult) -> None:
+        self.last_result = result
+        color = "green" if result.ok else "red"
+        state = "完成" if result.ok else "未完成"
+        status_text = Text.assemble(
+            (state, color),
+            f" · 工具调用 {result.tool_calls} · 修改文件 {len(result.modified_files)}",
+        )
+        lines = [
+            status_text,
+            Text.assemble(("", "dim"), _p(result.summary)),
+        ]
+        if result.usage is not None:
+            lines.append(f"[dim]累计用量 · {_format_token_usage(result.usage)}[/dim]")
+        for line in lines:
+            self.log_line_safe(line)
+        self.refresh_sidebar()
+
+    # ---- 审批 ----
+
+    def _approver(self, action: str, detail: str) -> bool:
+        """后台线程调用；通过模态等待用户明确确认。"""
+        pending = ApprovalWait()
+        token = (self.runtime.current_task_cancellation() if self.runtime else None)
+        token = token or CancellationToken()
+        # 注册与退出关闭共享锁；退出后新投递的审批也必须拒绝。
+        with self._approval_lock:
+            if self._approvals_closed:
+                return False
+            self._pending_approvals.add(pending)
+
+        def request() -> None:
+            async def ask() -> None:
+                try:
+                    value = await self.push_screen_wait(ApprovalScreen(action, detail))
+                    pending.resolve(bool(value))
+                except Exception:
+                    # 弹窗错误只拒绝本次审批；不回显可能含审批详情的异常。
+                    pending.close()
+                finally:
+                    pending.close()
+
+            try:
+                self.run_worker(ask, thread=False, name="approval-wait")
+            except Exception:
+                pending.close()
+
+        try:
+            try:
+                self.call_from_thread(request)
+            except Exception:
+                pending.close()
+            return pending.wait(token)
+        finally:
+            pending.close()
+            with self._approval_lock:
+                self._pending_approvals.discard(pending)
+
+    def _close_approvals(self) -> None:
+        # 只转移请求所有权，不在锁内等待 UI、Runtime 或工作线程退出。
+        with self._approval_lock:
+            self._approvals_closed = True
+            pending = tuple(self._pending_approvals)
+            self._pending_approvals.clear()
+        for approval in pending:
+            approval.close()
+
+    def on_unmount(self) -> None:
+        self._close_approvals()
+        if self.runtime is not None:
+            active = self.runtime.request_shutdown()
+            self.runtime.cancel_current()
+            if not active:
+                self.runtime.cleanup_pending_resources()
+            self.runtime.close()
+
+    def _confirm(self, prompt: str) -> bool:
+        return self._approver("确认", prompt)
+
+    # ---- 斜杠命令 ----
+
+    def _handle_command(self, text: str) -> None:
+        try:
+            command = parse_command(text)
+        except CommandError as exc:
+            self.log_line(Text.assemble(("", "red"), _p(exc)))
+            return
+        try:
+            if command.name in {"clear", "diff", "undo", "memory"}:
+                self._require_active_session()
+            if command.name == "session" and command.subcommand == "rename":
+                self._require_active_session()
+            if command.name == "help":
+                self._show_help()
+            elif command.name == "status":
+                self._show_status()
+            elif command.name == "clear":
+                self._clear_current()
+            elif command.name == "diff":
+                self._show_diff()
+            elif command.name == "undo":
+                self._undo()
+            elif command.name == "model":
+                self._choose_model()
+            elif command.name == "session":
+                self._handle_session(command.subcommand, command.argument)
+            elif command.name == "permission":
+                self._permission(command.argument)
+            elif command.name == "memory":
+                self._memory(command.subcommand, command.argument)
+            elif command.name == "exit":
+                self.action_quit()
+        except SessionRuntimeError as exc:
+            self.log_line(
+                Text.assemble(("会话操作失败：", "red"), _p(exc))
+            )
+
+    def _require_active_session(self) -> None:
+        if self.runtime is None or not self.runtime.has_active_session:
+            raise SessionRuntimeError("尚未创建或选择会话")
+
+    def _show_help(self) -> None:
+        for name, spec in list_commands().items():
+            self.log_line(f"[dim]/{name:<12}{spec.description}[/dim]")
+        self.log_line("[dim]/session new <名称>     创建并切换到新会话[/dim]")
+
+    def _memory(self, subcommand: str | None, argument: str | None) -> None:
+        if self.runtime is None:
+            return
+        if subcommand is None:
+            self.log_line(_p(self.runtime.render_memory()))
+            return
+        if subcommand == "save":
+            preview = self.runtime.preview_memory_save()
+            self.log_line(_p(preview.text))
+
+            async def save_after_confirm() -> None:
+                approved = await self.push_screen_wait(
+                    ApprovalScreen("保存会话记忆", "保存以上确切候选？")
+                )
+                if not approved or self.runtime is None:
+                    self.log_line("[dim]已取消保存会话记忆[/dim]")
+                    return
+                try:
+                    self.runtime.save_memory_preview(preview)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("保存失败：", "red"), _p(exc)))
+                    return
+                self.log_line("[yellow]会话记忆已保存[/yellow]")
+
+            self.run_worker(save_after_confirm, thread=False, name="memory-save")
+            return
+
+        if subcommand == "refresh":
+            async def refresh_memory() -> None:
+                if self.runtime is None:
+                    return
+                self.log_line("[dim]正在刷新会话记忆候选…[/dim]")
+                try:
+                    refreshed = await asyncio.to_thread(self.runtime.refresh_memory)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("刷新失败：", "red"), _p(exc)))
+                    return
+                self.log_line(
+                    f"[yellow]会话记忆候选已刷新；本次记忆请求 "
+                    f"{refreshed.memory_calls} 次[/yellow]"
+                )
+                if self.runtime is not None:
+                    self.log_line(_p(self.runtime.render_memory()))
+
+            self.run_worker(refresh_memory, thread=False, name="memory-refresh")
+            return
+        if subcommand == "archive":
+            self.log_line(_p(self.runtime.render_memory_archive()))
+            return
+        if subcommand == "archive-delete":
+            preview = self.runtime.preview_memory_archive_delete(argument or "")
+            self.log_line(_p(preview.text))
+
+            async def delete_archive_after_confirm() -> None:
+                approved = await self.push_screen_wait(
+                    ApprovalScreen("删除归档记忆", "删除以上确切归档条目？")
+                )
+                if not approved or self.runtime is None:
+                    self.log_line("[dim]已取消删除归档记忆[/dim]")
+                    return
+                try:
+                    self.runtime.apply_memory_archive_delete(preview)
+                except SessionRuntimeError as exc:
+                    self.log_line(Text.assemble(("删除失败：", "red"), _p(exc)))
+                    return
+                self.log_line(
+                    "[yellow]归档记忆已从当前候选删除；尚未自动保存[/yellow]"
+                )
+
+            self.run_worker(
+                delete_archive_after_confirm,
+                thread=False,
+                name="memory-archive-delete",
+            )
+            return
+
+        async def edit_memory() -> None:
+            text = await self.push_screen_wait(
+                TextInputScreen("新的记忆文本（留空表示删除）")
+            )
+            if text is None or self.runtime is None:
+                return
+            scope = await self.push_screen_wait(
+                OptionListScreen("选择记忆作用范围", ("session", "task"), "session")
+            )
+            if scope is None or self.runtime is None:
+                return
+            selected_state = await self.push_screen_wait(
+                OptionListScreen(
+                    "选择记忆状态",
+                    ("保持原状态", "active", "pending", "done", "cancelled", "superseded"),
+                    "保持原状态",
+                )
+            )
+            if selected_state is None or self.runtime is None:
+                return
+            state = None if selected_state == "保持原状态" else selected_state
+            try:
+                preview = self.runtime.preview_memory_edit(
+                    argument or "", text, scope, state
+                )
+            except SessionRuntimeError as exc:
+                self.log_line(Text.assemble(("编辑失败：", "red"), _p(exc)))
+                return
+            self.log_line(_p(preview.text))
+            approved = await self.push_screen_wait(
+                ApprovalScreen("编辑会话记忆", "应用以上确切编辑？")
+            )
+            if not approved or self.runtime is None:
+                self.log_line("[dim]已取消编辑会话记忆[/dim]")
+                return
+            try:
+                self.runtime.apply_memory_edit(preview)
+            except SessionRuntimeError as exc:
+                self.log_line(Text.assemble(("编辑失败：", "red"), _p(exc)))
+                return
+            self.log_line("[yellow]会话记忆已更新；尚未自动保存[/yellow]")
+
+        self.run_worker(edit_memory, thread=False, name="memory-edit")
+
+    def _show_status(self) -> None:
+        if self.runtime is None:
+            return
+        status = self.runtime.status()
+        current = self.runtime.current
+        if current is not None and current.memory.unknown_effects:
+            self.log_line("文件影响未确认；请检查实际文件并通过 /clear 明确确认")
+        record = status.record
+        session_label = (
+            "新会话（首次任务时创建）"
+            if record is None
+            else f"{record.name} · {record.id[:8]}"
+        )
+        self.log_line(
+            Text.assemble(
+                ("会话", "cyan"),
+                " ",
+                _p(session_label),
+                " · ",
+                ("Provider", "cyan"),
+                " ",
+                _p(status.provider),
+                " · ",
+                ("模型", "cyan"),
+                " ",
+                _p(status.model),
+            )
+        )
+        mode = "只读" if status.read_only else "可编辑 · 人工审批"
+        self.log_line(
+            Text.assemble(
+                ("工作区", "cyan"),
+                " ",
+                _p(status.workspace),
+                " · ",
+                ("模式", "cyan"),
+                " ",
+                _p(mode),
+                " · ",
+                ("上次文件状态检查（非业务验收）", "cyan"),
+                " ",
+                _p(status.verification),
+            )
+        )
+        self.log_line(
+            Text.assemble(("权限", "cyan"), " ", _p(self.runtime.permission_level))
+        )
+
+    def _clear_current(self) -> None:
+        # 确认必须在线程 worker 中执行：UI 线程内 _confirm 会阻塞事件循环并死锁。
+        self.run_worker(
+            self._clear_confirm_worker, thread=True, exclusive=True, name="session-clear"
+        )
+
+    def _clear_confirm_worker(self) -> None:
+        if not self._confirm("清除当前会话记录（不恢复文件）；若有未确认影响，请先检查实际文件。确认？"):
+            self.log_line_safe("[dim]已取消清除[/dim]")
+            return
+        if self.runtime is not None:
+            self.runtime.clear_current(confirmed=True)
+            self.log_line_safe("[yellow]当前会话记忆已清除[/yellow]")
+
+    def _clear_worker(self) -> None:
+        self._clear_confirm_worker()
+
+    def _show_diff(self) -> None:
+        if self.runtime is None:
+            return
+        latest = self.runtime.diff_latest()
+        if latest is None:
+            self.log_line("[dim]当前 Session 没有最近任务变更。[/dim]")
+            return
+        self.log_line("[bold]最近任务变更：[/bold]")
+        for line in latest.splitlines():
+            self.log_line(_p(line))
+
+    def _undo(self) -> None:
+        if self.runtime is None:
+            return
+        # 扫描、工作区变化确认和最终撤销确认都可能阻塞；必须从第一步起
+        # 放在线程 worker，不能先在 UI 线程同步调用 prepare_undo。
+        self.run_worker(self._undo_worker, thread=True, exclusive=True, name="session-undo")
+
+    def _undo_worker(self) -> None:
+        if self.runtime is None:
+            return
+        try:
+            preview = self.runtime.prepare_undo()
+        except SessionRuntimeError as exc:
+            self.log_line_safe(Text.assemble(("", "red"), _p(exc)))
+            return
+        self.log_line_safe("[bold]撤销预览：[/bold]")
+        for line in preview.diff.splitlines():
+            self.log_line_safe(_p(line))
+        approved = False
+        try:
+            approved = self._confirm("撤销最近一条任务的全部文件修改？")
+        finally:
+            if not approved and self.runtime is not None:
+                self.runtime.cancel_undo()
+        if not approved:
+            self.log_line_safe("[dim]已取消撤销[/dim]")
+            return
+        if self.runtime is None:
+            return
+        try:
+            execution = self.runtime.undo_latest()
+        except SessionRuntimeError as exc:
+            self.log_line_safe(Text.assemble(("", "red"), _p(exc)))
+            return
+        if execution.ok:
+            self.log_line_safe("[yellow]已撤销最近一条任务的全部文件修改。[/yellow]")
+        elif execution.conflicts:
+            self.log_line_safe(
+                Text.assemble(("撤销冲突，未执行：", "red"), _p("、".join(execution.conflicts)))
+            )
+        elif execution.compensation_failed:
+            self.log_line_safe(
+                Text.assemble(
+                    ("撤销未完成且补偿失败：", "red"),
+                    _p("、".join(execution.compensation_failed)),
+                )
+            )
+        else:
+            self.log_line_safe("[red]撤销未完成，文件未被修改。[/red]")
+
+    def _permission(self, argument: str | None) -> None:
+        if argument is None:
+            self._choose_permission()
+            return
+        try:
+            level = self.runtime.set_permission(argument)
+        except SessionRuntimeError as exc:
+            self.log_line(
+                Text.assemble(("权限操作失败：", "red"), _p(exc))
+            )
+            return
+        self.log_line(Text.assemble(("权限级别已切换：", "yellow"), _p(level)))
+        self._refresh_sidebar_impl()
+
+    def _choose_permission(self) -> None:
+        options = ("strict", "relaxed", "fullaccess")
+        current = self.runtime.permission_level
+
+        def respond(value: str | None) -> None:
+            if value is None or value == current:
+                return
+            try:
+                level = self.runtime.set_permission(value)
+            except SessionRuntimeError as exc:
+                self.log_line(
+                    Text.assemble(("权限操作失败：", "red"), _p(exc))
+                )
+                return
+            self.log_line(Text.assemble(("权限级别已切换：", "yellow"), _p(level)))
+            self._refresh_sidebar_impl()
+
+        self.push_screen(
+            OptionListScreen("选择权限级别", options, current), respond
+        )
+
+    def _choose_model(self) -> None:
+        providers = ("openai", "deepseek", "glm")
+        current = self.runtime.status().provider
+
+        def respond(value: str | None) -> None:
+            if value is None or value == current:
+                return
+            self.run_worker(
+                lambda: self._change_model_worker(value),
+                thread=True, exclusive=True, name="model-switch",
+            )
+
+        self.push_screen(
+            OptionListScreen("选择 Provider", providers, current), respond
+        )
+
+    def _change_model_worker(self, provider: str) -> None:
+        if self.runtime is None:
+            return
+        try:
+            self.runtime.change_model(provider)
+        except SessionRuntimeError as exc:
+            self.log_line_safe(
+                Text.assemble(("模型切换失败：", "red"), _p(exc))
+            )
+            return
+        self.log_line_safe(
+            Text.assemble(("已切换到 Provider：", "yellow"), _p(provider))
+        )
+        self.refresh_sidebar()
+
+    def _handle_session(self, subcommand: str | None, argument: str | None) -> None:
+        if self.runtime is None:
+            return
+        if subcommand is None:
+            self._choose_session()
+        elif subcommand == "current":
+            self._show_status()
+        elif subcommand == "new":
+            self.run_worker(
+                lambda: self._session_new_worker(argument or "default"),
+                thread=True, exclusive=True, name="session-new",
+            )
+        elif subcommand == "rename":
+            if not argument:
+                self.log_line("[dim]用法：/session rename <名称>[/dim]")
+                return
+            try:
+                self.runtime.rename_current(argument)
+            except SessionRuntimeError as exc:
+                self.log_line(
+                    Text.assemble(("重命名失败：", "red"), _p(exc))
+                )
+                return
+            self.log_line(
+                Text.assemble(("当前会话已重命名为：", "yellow"), _p(argument))
+            )
+
+    def _session_new_worker(self, name: str) -> None:
+        if self.runtime is None:
+            return
+        self.runtime.create(name)
+        self.log_line_safe(
+            Text.assemble(("已创建并切换到新会话：", "yellow"), _p(name))
+        )
+        self.refresh_sidebar()
+
+    def _choose_session(self) -> None:
+        sessions = self.runtime.store.list_all()
+        if not sessions:
+            self.log_line("[dim]没有可切换的会话。[/dim]")
+            return
+        current = self.runtime.current
+        current_id = current.record.id if current is not None else None
+        prefixes = _distinct_session_prefixes(sessions)
+        options = [
+            OptionChoice(
+                f"{record.name} · {prefixes[record.id]}  "
+                f"({record.provider} · {record.model})",
+                record.id,
+            )
+            for record in sessions
+        ]
+
+        def respond(value: str | None) -> None:
+            if value is None:
+                return
+            records_by_id = {record.id: record for record in sessions}
+            record = records_by_id.get(value)
+            if record is None:
+                self.log_line("[red]会话选择已失效，请重新打开列表。[/red]")
+                return
+            if record.id == current_id:
+                return
+            self.run_worker(
+                lambda: self._switch_worker(record),
+                thread=True, exclusive=True, name="session-switch",
+            )
+
+        self.push_screen(
+            OptionListScreen("选择会话", options, current_id), respond
+        )
+
+    def _switch_worker(self, record: SessionRecord) -> None:
+        try:
+            self.runtime.switch(
+                record.id,
+                confirm=lambda workspace: self._confirm(
+                    f"目标工作区为 {workspace}。确认切换？"
+                ),
+            )
+        except SessionRuntimeError as exc:
+            self.log_line_safe(
+                Text.assemble(("会话切换失败：", "red"), _p(exc))
+            )
+            return
+        self.log_line_safe(
+            Text.assemble(("已切换到会话：", "yellow"), _p(record.name))
+        )
+        self.refresh_sidebar()
+
+    # ---- 退出 ----
+
+    def action_cancel(self) -> None:
+        if self.runtime is not None and self.runtime.cancel_current():
+            self.log_line(Text("正在取消当前任务……", style="yellow"))
+            return
+        self.query_one(Input).value = ""
+
+    def action_quit(self) -> None:
+        self._close_approvals()
+        code = 1
+        if self.runtime is not None:
+            active = self.runtime.request_shutdown()
+            cancelled = self.runtime.cancel_current()
+            if active or cancelled:
+                # 活动任务持有任务互斥锁；先发取消信号并以非零码退出，
+                # 避免退出路径与任务收尾并发持久化同一份 Session 状态。
+                self.exit(1)
+                return
+            cleanup_ok = self.runtime.cleanup_pending_resources()
+            code = 0 if self.runtime.retry_persist() and cleanup_ok else 1
+        self.exit(code)

@@ -11,7 +11,7 @@ from typing import Literal, TypeAlias
 
 from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
-from tricoder.subprocess_control import run_bounded_process
+from tricoder.process.control import run_bounded_process
 
 from .loader import is_reserved_eval_path
 from .models import EvalCase, EvalSuite, VerificationSpec
@@ -105,6 +105,22 @@ def run_suite(
         cases=cases,
         usage=_merge_usage(cases),
     )
+
+
+def run_isolated_case(
+    case: EvalCase,
+    trial_dir: Path,
+    agent_executor: AgentExecutor,
+) -> EvalCaseResult:
+    """Run one case inside a scheduler-owned, initially empty trial directory."""
+
+    if not trial_dir.is_absolute() or not trial_dir.is_dir() or any(trial_dir.iterdir()):
+        raise ValueError("trial directory must be an empty absolute directory")
+    workspaces_root = trial_dir / "workspaces"
+    audit_root = trial_dir / "audit"
+    workspaces_root.mkdir()
+    audit_root.mkdir()
+    return _run_case(case, workspaces_root, audit_root, agent_executor)
 
 
 def _run_case(
@@ -307,7 +323,7 @@ def _score(
     failure_codes: list[str] = []
     if not run_result.ok:
         failure_codes.append("agent_failed")
-    if run_result.verification != "通过":
+    if modified_files and run_result.verification != "通过":
         failure_codes.append("agent_unverified")
     if any(not result.passed and result.error_code is None for result in verifications):
         failure_codes.append("verification_failed")

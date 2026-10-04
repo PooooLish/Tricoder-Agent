@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from contextlib import ExitStack
 import threading
 import time
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tricoder.agent import CodingAgent
-from tricoder.approval_wait import ApprovalWait
+from tricoder.presentation.approval_wait import ApprovalWait
 from tricoder.audit import AuditLogger
 from tricoder.changes import ChangeJournal
 from tricoder.execution_state import EffectState, FileEffects
@@ -26,12 +27,12 @@ from tricoder.models import (
 )
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.protocols import LegacyJsonProtocol
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
-from tricoder.sessions import SessionStore
-from tricoder.shell import InteractiveShell
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
+from tricoder.session.store import SessionStore
+from tricoder.presentation.shell import InteractiveShell
 from tricoder.tools import ToolContext
 from tricoder.tools.handlers import ToolHandler
-from tricoder.tui import TricoderApp
+from tricoder.presentation.tui import TricoderApp
 from tests.test_agent import CallIdRecordingRegistry, ScriptedProvider, StructuredScriptedProvider
 from tests.test_shell import FakeUI
 from tests.test_tools import (
@@ -56,6 +57,10 @@ def _runtime_with_provider(
 ) -> tuple[SessionRuntime, CallIdRecordingRegistry]:
     """用独立 SQLite、审计和真实 Runtime/Agent/Registry 组装一个场景。"""
     store = SessionStore(state_dir / "sessions.db")
+    store.initialize(root)
+    record = store.latest_for_workspace(root)
+    if record is None:
+        record = store.create("reliability", root, "openai", "test")
     registries: list[CallIdRecordingRegistry] = []
 
     def factory(record, memory, _options):  # type: ignore[no-untyped-def]
@@ -95,6 +100,8 @@ def _runtime_with_provider(
         root,
         options=RuntimeOptions(environ={}),
         active_session_factory=factory,
+        initial_session_id=record.id,
+        workspace_confirmer=lambda _preview: True,
     )
     return runtime, registries[-1]
 
@@ -104,7 +111,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
     def test_i01_partial_patch_skips_batch_then_repairs_and_verifies(self) -> None:
         """补丁留下首文件后，旧批次不执行；新轮读取、修复并重新验证。"""
-        with tempfile.TemporaryDirectory() as raw:
+        with tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
             base = Path(raw).resolve()
             root = base / "workspace"
             root.mkdir()
@@ -156,6 +163,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                 provider,
                 registry_type=FirstPatchFailureRegistry,
             )
+            resources.callback(runtime.close)
             result = runtime.run_task("应用补丁，失败后检查实际文件并修复")
 
             self.assertTrue(
@@ -199,7 +207,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
     def test_i02_identity_conflict_is_unknown_persisted_and_visible(self) -> None:
         """补偿遇到外部身份替换后立即停止，并从本地命令展示已知冲突。"""
-        with tempfile.TemporaryDirectory() as raw:
+        with tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
             base = Path(raw).resolve()
             root = base / "workspace"
             root.mkdir()
@@ -239,12 +247,13 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                 provider,
                 registry_type=IdentityConflictRegistry,
             )
+            resources.callback(runtime.close)
 
             result = runtime.run_task("应用补丁并处理身份冲突")
 
             self.assertFalse(result.ok)
             self.assertTrue(result.unknown_effects)
-            self.assertEqual("文件影响未确认；请检查实际文件并通过 /clear 明确确认", result.summary)
+            self.assertIn("文件影响未确认；请检查实际文件并通过 /clear 明确确认", result.summary)
             self.assertEqual(
                 ("app.py",),
                 result.modified_files,
@@ -312,7 +321,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
     def test_i03_cancel_or_window_close_releases_waiting_approval(self) -> None:
         """真实 Runtime 等待审批时，取消与窗口关闭都不得启动命令或占住任务锁。"""
         for scenario in ("cancel", "window-close"):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
                 base = Path(raw).resolve()
                 root = base / "workspace"
                 root.mkdir()
@@ -353,6 +362,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     provider,
                     approver=delegate,
                 )
+                resources.callback(runtime.close)
                 app = TricoderApp(lambda *_: runtime)
                 app.runtime = runtime
                 delegate.app = app
@@ -369,7 +379,10 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         errors.append(exc)
 
                 worker = threading.Thread(target=run_task)
-                with patch("tricoder.tui.ApprovalWait", RecordingApprovalWait), \
+                with patch(
+                    "tricoder.presentation.tui.ApprovalWait",
+                    RecordingApprovalWait,
+                ), \
                         patch.object(app, "call_from_thread", side_effect=lambda callback: callback()), \
                         patch.object(app, "run_worker", side_effect=record_ui_worker), \
                         patch.object(app, "log_line"), \
@@ -404,10 +417,10 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
     def test_i04_cancelled_process_keeps_primary_and_cleanup_owner(self) -> None:
         """真实受管进程取消后，清理失败保持独立证据并阻断资源复用。"""
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.core.cancellation import CancellationError
 
-        with tempfile.TemporaryDirectory() as raw:
+        with tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
             base = Path(raw).resolve()
             root = base / "workspace"
             root.mkdir()
@@ -447,6 +460,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                 provider,
                 registry_type=RecordingCancellationRegistry,
             )
+            resources.callback(runtime.close)
             original_cleanup = control._ProcessResources.cleanup
             allow_cleanup = threading.Event()
             resources: list[control._ProcessResources] = []
@@ -501,7 +515,9 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     # 资源已经可复用；取消过已启动脚本产生的 UNKNOWN 仍需用户明确核对。
                     if runtime.current.memory.unknown_effects:
                         runtime.clear_current(confirmed=True)
-                    self.assertTrue(runtime.run_task("显式清理后可复用").ok)
+                    # 资源已经可复用，但取消任务留下的工作区变化仍需重新验证，
+                    # 仅 finish 不能把资源清理误报为代码任务成功。
+                    self.assertFalse(runtime.run_task("显式清理后可复用").ok)
                 finally:
                     allow_cleanup.set()
                     runtime.cancel_current()
@@ -512,7 +528,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
     def test_i05_external_test_change_requires_new_version_evidence(self) -> None:
         """本地检查通过后外改测试文件，旧证据必须拒绝，重验只签发新版本。"""
-        with tempfile.TemporaryDirectory() as raw:
+        with tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
             base = Path(raw).resolve()
             root = base / "workspace"
             root.mkdir()
@@ -539,6 +555,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                 ]
             )
             runtime, registry = _runtime_with_provider(root, base / "state", provider)
+            resources.callback(runtime.close)
 
             first = runtime.run_task("检查版本一")
             self.assertTrue(first.ok, (first, runtime.current.context, registry.call_ids))
@@ -571,7 +588,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
     def test_i06_session_reuse_isolation_restart_and_undo_boundaries(self) -> None:
         """四条真实 Runtime 路径分别证明证据复用与失效边界。"""
         for scenario in ("same-session", "separate-session", "restart", "undo"):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
                 base = Path(raw).resolve()
                 root = base / "workspace"
                 root.mkdir()
@@ -589,6 +606,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         ]
                     )
                     runtime, registry = _runtime_with_provider(root, state_dir, provider)
+                    resources.callback(runtime.close)
                     self.assertTrue(runtime.run_task("同 Session 建立证据").ok)
                     evidence = runtime.current.context.verification_evidence
                     self.assertTrue(registry.context.verification_scope.owns(evidence))
@@ -607,6 +625,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         ]
                     )
                     runtime, _registry = _runtime_with_provider(root, state_dir, provider)
+                    resources.callback(runtime.close)
                     self.assertTrue(runtime.run_task("第一会话检查").ok)
                     first_id = runtime.current.record.id
                     first_evidence = runtime.current.context.verification_evidence
@@ -630,8 +649,10 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         ]
                     )
                     runtime, _registry = _runtime_with_provider(root, state_dir, provider)
+                    resources.callback(runtime.close)
                     self.assertTrue(runtime.run_task("重启前建立证据").ok)
                     old = runtime.current.context.verification_evidence
+                    runtime.close()
                     restarted, _ = _runtime_with_provider(
                         root,
                         state_dir,
@@ -639,6 +660,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                             [_batch(ToolCall("restart-stale", "finish", {"summary": "不得恢复证据"}))]
                         ),
                     )
+                    resources.callback(restarted.close)
                     self.assertIsNone(restarted.current.context.verification_evidence)
                     self.assertEqual("待验证", restarted.current.context.verification)
                     self.assertFalse(restarted.run_task("重启后不得仅 finish").ok)
@@ -660,8 +682,10 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         ]
                     )
                     runtime, _registry = _runtime_with_provider(root, state_dir, provider)
+                    resources.callback(runtime.close)
                     self.assertTrue(runtime.run_task("修改并检查").ok)
                     old = runtime.current.context.verification_evidence
+                    runtime.prepare_undo()
                     self.assertTrue(runtime.undo_latest().ok)
                     self.assertEqual("x = 1\n", (root / "app.py").read_text(encoding="utf-8"))
                     self.assertIsNone(runtime.current.context.verification_evidence)
@@ -672,7 +696,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
     def test_i07_native_and_legacy_protocols_pair_or_reject_every_call(self) -> None:
         """原生批次和 legacy 单动作都保持完整配对；重复原生 ID 在执行前拒绝。"""
         for scenario in ("native", "legacy", "duplicate-native"):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
                 base = Path(raw).resolve()
                 root = base / "workspace"
                 root.mkdir()
@@ -692,6 +716,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         [_batch(*first_calls), _batch(*recovery_calls)]
                     )
                     runtime, registry = _runtime_with_provider(root, base / "state", provider)
+                    resources.callback(runtime.close)
                     result = runtime.run_task("原生失败后重规划")
                     self.assertTrue(result.ok)
                     self.assertEqual(
@@ -728,6 +753,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         provider,
                         tool_protocol="legacy_json",
                     )
+                    resources.callback(runtime.close)
                     result = runtime.run_task("legacy 失败后重规划")
                     self.assertTrue(result.ok)
                     self.assertEqual(3, len(registry.call_ids))
@@ -763,6 +789,7 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                         provider,
                         max_rounds=1,
                     )
+                    resources.callback(runtime.close)
                     result = runtime.run_task("拒绝重复 call id")
                     self.assertFalse(result.ok)
                     self.assertEqual([], registry.call_ids)

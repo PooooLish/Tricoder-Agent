@@ -245,8 +245,8 @@ class ToolErrorTests(unittest.TestCase):
                              payload["tool_result"].get("error"))
             self.assertNotIn(FAKE, json.dumps(payload))
         from rich.console import Console
-        from tricoder.ui import TerminalUI
-        from tricoder.tui import TuiObserver
+        from tricoder.presentation.console import TerminalUI
+        from tricoder.presentation.tui import TuiObserver
         stream = io.StringIO()
         ui = TerminalUI(console=Console(file=stream, force_terminal=False))
         ui.on_tool_result(action, result, 1)
@@ -296,7 +296,7 @@ class ToolErrorTests(unittest.TestCase):
         self.assertEqual("policy_denied", failed.get("error", {}).get("code"))
 
     def test_command_failure_after_process_started_is_never_replan(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         self.context.approver = lambda *_: True
         (self.root / "probe.py").write_text("import time; time.sleep(2)", encoding="utf-8")
         real_terminate = control._terminate_process_tree
@@ -311,7 +311,7 @@ class ToolErrorTests(unittest.TestCase):
                 self.assertNotIn(FAKE, result.output)
 
     def test_command_start_failure_and_cleanup_evidence_are_distinct(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         self.context.approver = lambda *_: True
         with patch.object(control.subprocess, "Popen", side_effect=OSError(FAKE)):
             result = self.registry.execute("run_command", {"command": "python -m unittest"})

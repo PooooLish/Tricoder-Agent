@@ -1,0 +1,18 @@
+schema_version = 1
+experiment_id = "quality-v1-memory"
+suite = "."
+repetitions = 3
+split = "all"
+max_trials = 60
+time_budget_seconds = 21600
+seed = 23
+
+[[conditions]]
+id = "quality-memory"
+provider = "openai"
+model = "replace-with-explicit-model"
+execution_kind = "quality"
+memory_compaction = "structured"
+memory_persistence = "reviewed_summary"
+scorers = ["hidden_verifier"]
+faults = ["none"]

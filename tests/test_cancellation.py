@@ -22,7 +22,7 @@ class CancellationTokenTests(unittest.TestCase):
             root = Path(raw)
             (root / "task.py").write_text("pass\n", encoding="utf-8")
             registry = ToolRegistry(ToolContext(WorkspacePolicy(root), CommandPolicy(workspace=root), lambda *_: True))
-            with mock.patch("tricoder.subprocess_control._terminate_process_tree", return_value=False):
+            with mock.patch("tricoder.process.control._terminate_process_tree", return_value=False):
                 failed = registry.execute("run_command", {"command": "python task.py"})
             self.assertEqual(ErrorCode.CLEANUP_FAILED, failed.error.code)
             blocked = registry.execute("finish", {"summary": "must not erase cleanup failure"})

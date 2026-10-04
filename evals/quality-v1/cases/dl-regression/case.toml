@@ -1,0 +1,22 @@
+id = "dl-regression"
+title = "dl-regression"
+task = "修复 divide 的除零行为，同时保持正常除法。"
+allowed_changes = ["divide.py"]
+required_changes = ["divide.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "delivery"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 divide 的除零行为，同时保持正常除法。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

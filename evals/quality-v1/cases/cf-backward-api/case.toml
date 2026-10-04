@@ -1,0 +1,22 @@
+id = "cf-backward-api"
+title = "cf-backward-api"
+task = "为 converter 增加旧 slugify API 兼容，同时保留 to_slug。"
+allowed_changes = ["converter.py"]
+required_changes = ["converter.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "cross_file"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "为 converter 增加旧 slugify API 兼容，同时保留 to_slug。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

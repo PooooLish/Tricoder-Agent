@@ -1,0 +1,26 @@
+id = "mm-latest-correction"
+title = "mm-latest-correction"
+task = "采用最新修正：select 必须优先返回 latest。"
+allowed_changes = ["config.py"]
+required_changes = ["config.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_latest_correction_used"]
+
+[[steps]]
+kind = "user_turn"
+content = "初始决定使用 red。"
+
+[[steps]]
+kind = "user_turn"
+content = "修正决定：以 latest 参数为准，并修复 config.py。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

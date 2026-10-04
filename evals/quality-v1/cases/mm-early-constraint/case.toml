@@ -1,0 +1,26 @@
+id = "mm-early-constraint"
+title = "mm-early-constraint"
+task = "多轮任务中保持早期颜色约束，修复 render 以使用调用方颜色。"
+allowed_changes = ["renderer.py"]
+required_changes = ["renderer.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_constraint_preserved"]
+
+[[steps]]
+kind = "user_turn"
+content = "先记住约束：颜色由调用方决定，不得写死。"
+
+[[steps]]
+kind = "user_turn"
+content = "现在修复 renderer.py，并保持之前约束。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

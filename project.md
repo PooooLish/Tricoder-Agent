@@ -1,5 +1,136 @@
 # Project: tricoder-cli
 
+## 2026-10-05 命令兼容与错误恢复方案交接（待实施）
+
+- 执行文档及 coding session 提示词：`docs/superpowers/plans/2026-10-05-command-compatibility-and-recovery.md`。本次仅编写方案，没有修改功能代码。
+- 范围：受信 Python 的 python3 别名、固定版本查询、unittest 简单本地目标归一化、cwd 一致性、审计分类、精确预执行纠错、工具说明与审批标题。
+- 安全约束：保留现有权限、审批和命令边界；版本查询不是验证证据；用户拒绝、越界及未知副作用仍停止，不将所有 POLICY_DENIED 降级为 REPLAN。
+- 下一步：coding session 以当前未提交工作树为基线按 S0—S5 实施，补充失败回归、合成任务真实进程验证和最终完整回归；不沿用历史测试数字宣称通过。
+- 验证范围：本次仅做文档自审及格式检查；实现与行为验收尚未进行。第一张截图没有实际命令参数，不能把版本查询假设记为调用日志。
+
+## 2026-10-05 第二轮模块整理（S0—S5 已完成）
+
+- 执行文档：`docs/superpowers/plans/2026-10-05-module-organization-round2.md`；实施证据位于 `runtime/module-organization-round2/`。本轮以第一轮未提交工作树为事实基线，没有用 HEAD 覆盖既有改动，也未重做第一轮。
+- 14 个唯一实现已分别迁入 `tricoder.process`、`tricoder.workspace`、`tricoder.session`、`tricoder.presentation`；原根模块现在是显式薄转发层。内部生产代码和常规行为测试使用规范新路径，新旧常用类型、函数、异常与状态对象保持对象同一性。
+- Eval 隐藏进程 helper 不再假定依赖文件同目录，而是分别定位 `process.control`、`task_cleanup`、`core.cancellation` 的真实源码。隔离测试清空 `PYTHONPATH`、使用 `-S -B`、放置恶意同名包，并真实执行成功命令和超时清理命令。
+- 导入守卫覆盖 14 个旧入口、绝对/包级/相对/动态导入形式、四个轻量包、不同冷导入顺序、MCP/tools 与 Agent 边界；`session.store` 不会带入 Runtime/Agent/TUI，`presentation` 包不会提前加载 Textual。第一轮记忆异常进度、finally 单次合并和两实例隔离测试保持通过。
+- 聚焦验证：process/Eval/MCP 相关 145 项通过（隐藏 helper 组 1 项按符号链接权限跳过）；workspace 138 项通过（6 项平台/权限跳过）；session 221 项通过；presentation 126 项通过；最终模块/Agent/MCP 导入守卫 36 项通过。各集合有交叠，不能相加为全量总数。
+- 最终 Windows / Python 3.11.6 新鲜回归：`Ran 1355 tests in 289.426s`，OK，11 项既有平台/权限跳过；compileall（缓存仅写 `runtime/module-organization-round2/pycache`）、CLI `--help` 与 `git diff --check` 均退出 0。
+- 分发产物未验证：当前环境没有 `build` 和 `wheel`，且 setuptools 65.5.0 低于 `pyproject.toml` 的构建要求 68；按授权未安装或升级依赖，因此没有声称 wheel 验收通过。Linux/macOS、Python 3.12、手工 TUI 和真实 Provider 也未验证。
+- 新结构说明：`docs/framework/module-layout.md`。本轮没有拆分 `SessionRuntime` 内部状态机、扩展 Provider、改变 SQLite schema/CLI 参数/审批边界，也没有提交或推送。
+
+## 2026-10-05 第一轮补齐再次复审（通过，第二轮可开始）
+
+- 对照补齐前有限源码基线审查 coordinator/loop/agent；F1 的依赖边界、窄字段合并、异常部分提交与 F2 的两实例隔离测试均已落实，未发现阻塞性问题。
+- 本次实际运行 `.venv/Scripts/python.exe -B -m unittest discover -s tests -q`：1337 tests，OK，11 skipped，301.275s，退出码 0。运行中有既有 asyncio/Textual 慢回调诊断；没有为测试通过修改源码或断言。
+- 独立只读复核完成 52 个纯内存基线对照场景，状态、审计事件及异常身份一致，覆盖取消、KeyboardInterrupt/SystemExit 和回调异常；未调用真实 Provider。
+- 复审内容标识与环境限制保存在第二轮计划第 0 节。第二轮文档已更新前置状态、记忆异常进度/隔离回归要求，以及新目录下导入守卫的适配要求。
+- 下一步：将 `docs/superpowers/plans/2026-10-05-module-organization-round2.md` 第 8 节提示词交给 coding session，按 S0—S5 实施。本次未修改功能代码、未启动目录迁移、未安装依赖或提交。
+
+## 2026-10-05 第一轮重构审查补齐（C0—C4 已完成）
+
+- 执行文档：`docs/superpowers/plans/2026-10-05-agent-refactor-round1-review-fixes.md`；实施证据位于 `runtime/agent-refactor-round1-review-fixes/`。本轮以未提交的第一轮工作树为事实基线，没有从 HEAD 覆盖用户改动，也未启动第二轮目录迁移。
+- F1 已补齐：`MemoryCoordinator` 不再导入 engine 或接收 `AgentRunState`。Runner 通过不可变 `MemoryStepInput` 传入 Session 快照、完整固定前缀与工具定义；协调器返回窄 `MemoryStepResult`，异常进度由每次调用独享的 `MemoryStepProgress` 保存，Runner 在统一 `finally` 中单点合并。
+- 异常语义保持：摘要调用前计数、收到 usage 后计量、审计成功后才发布压缩/候选。第一批压缩成功后第二批摘要失败、审计失败或原生取消仍保留第一批；`on_error`/`log` 抛出的首异常保持对象身份；保存候选全批与候选审计通过前不发布中间候选，也不擅自提前合并旧实现未统计的调用/usage。
+- F2 已补齐：新增两个独立 Agent 的 `asyncio.Event` 确定性交错测试，覆盖消息、call ID、候选、业务/记忆用量、工具计数、显式父令牌取消和 `Task.cancel()` 隔离；另固定工具调用事件后断流、缺少完成事件及 event sink 首异常三个 Provider 边界。未实现或声明同一 `CodingAgent` 实例并发支持。
+- 阶段证据：C0 基线 Agent 113、记忆 84、跨边界 122（跳过 1）项通过；C1 表征 6 项、C2 最终聚焦 34 项、C3 新专项 6 项及异步组合 23 项通过。独立复审最初发现导入守卫绕过（Important）与交错测试无界等待（Minor），均已补回归并由同一审查 Agent 复核关闭；当前无 Critical/Important。
+- 最终 Windows / Python 3.11.6 验证：`Ran 1337 tests in 309.134s`，OK，11 项既有平台/权限门禁跳过；本轮新增测试无跳过。compileall 与 `git diff --check` 通过。未调用真实 Provider，未验证 Linux/macOS、Python 3.12 或同一 `CodingAgent` 实例并发；运行中保留了既有 asyncio/Textual 慢回调诊断。第二轮目录整理的前置条件现已满足，但本轮没有启动第二轮。
+
+## 2026-10-05 第二轮目录整理交接（待实施，前置复审通过）
+
+- 执行文档与 coding session 提示词：`docs/superpowers/plans/2026-10-05-module-organization-round2.md`。
+- 范围：将 14 个实现模块分组迁入 `process/`、`workspace/`、`session/`、`presentation/`；旧路径保留薄兼容模块，内部使用新路径。保持业务行为，不拆 SessionRuntime 内部逻辑，不扩展 Provider。
+- 第一轮现已产生 `engine/` 与 `context/coordinator.py` 等边界；第二轮 S0 仍须以当时最新工作树重新核实 R0—R6 证据、旧导入与 Eval 独立依赖闭包，不能仅依赖本条历史记录。
+- 前置补充：`docs/superpowers/plans/2026-10-05-agent-refactor-round1-review-fixes.md` 的 C0—C4 已完成；本轮未启动第二轮。后续开始迁移时仍须重新核对当时工作树和独立依赖闭包。
+- 关键风险：Eval 隐藏 helper 按 `__file__` 复制源码；搬目录必须保持其独立运行依赖闭包。另需覆盖实际 patch 查找位置、类型/ContextVar 唯一性、冷导入、锁与快照门禁、分发包资源。
+- 本次只写第二轮计划和本交接记录，未改功能代码、未运行功能回归。下一步由 coding session 按 S0—S5 执行，保留现有工作树改动；证据放 `runtime/module-organization-round2/`。
+- 文档验证：14 对迁移路径及其源文件、S0—S5 阶段、引用测试文件、代码围栏和空白检查通过；`git diff --check` 通过。这些检查不代表源码重构已实施或功能回归已通过。
+
+## 2026-10-05 Agent 第一轮职责拆分（R0—R6 已实施）
+
+- 执行文档：`docs/superpowers/plans/2026-10-05-agent-refactor-round1.md`。
+- 范围：保留 `agent.CodingAgent` 入口，拆分历史、Provider 消费、观测审计、单任务状态、记忆协调、工具批次与结果收尾；本轮不整体搬目录、不重构 SessionRuntime、不新增 Provider 或断流恢复。
+- 实施结果：`agent.py` 从 1857 行的综合实现缩减为公开门面；单任务编排、状态、Provider 收集、观测审计、工具批次和收尾分别落在 `engine/`，历史与记忆协调分别落在 `context/history.py`、`context/coordinator.py`。
+- `CodingAgent` 的构造参数、同步/异步入口、`context_manager` 与现有公开导入保持兼容；内部执行每次创建独立 `AgentRunState`，没有跨任务共享消息、计数、验证或记忆候选。
+- 保持的关键边界：工具副作用先发布再构造/通知；批次首次停止后剩余调用只补 `skipped`；取消、清理、审计首异常、验证 authority、`unknown_effects`、消息配对、记忆覆盖水位和业务/记忆用量分离均由既有专项回归覆盖。
+- 本轮未重构 `SessionRuntime`、providers.py、数据库/CLI 配置，也未改变 Session/工作区锁和快照门禁；没有调用真实 Provider、读取真实密钥或安装依赖。
+- 实施证据与阶段日志：`runtime/agent-refactor-round1/`。完整结果及剩余限制见其中 `progress.md`；本地验证不能替代 Linux/macOS、Python 3.12 或真实 Provider 验证。
+- 最终 Windows / Python 3.11.6 确认：全量 1318 tests，OK，11 skipped；Agent 113、批次 24、记忆 84、验证/错误/副作用 131、Eval 118、工作区 37、导入/MCP 边界 16 均有独立日志。compileall 与 `git diff --check` 通过；独立复审无 Critical/Important。一次全量曾在 BaseException 压力用例中出现 Windows 锁非稳定失败，目标用例 6 次独立复跑及随后全量均通过，详见实施记录，未据此修改锁语义。
+
+## 2026-10-04 工作区锁与任务前快照确认（W1—W6 已实施）
+
+- 任务文档：`docs/superpowers/plans/2026-10-04-workspace-lock-snapshot-gate.md`。
+- W1：新增跨进程 `WorkspaceLock`。锁只按规范工作区根确定，和 Session ID、
+  会话数据库无关；Windows 真实子进程已验证同根竞争、异根并行、不同数据库同根竞争。
+  内部锁另有稳定用户级守卫；Linux 实现抽象 socket 内核锁以避免两个文件系统锁名同时被
+  替换后形成 split-lock。空闲入口不持锁；活动标记仅在真实执行前建立，崩溃遗留必须人工
+  确认资源已结束后恢复。
+- W2/W3：新增有界双清单内容快照与三分支门禁。无变化直接执行；有变化完整分页展示，
+  明确确认后再次全扫；再次变化重新确认。扫描失败、超限、不稳定、无确认器或取消均在
+  Provider/工具/待执行消息之前阻断，`fullaccess` 与只读任务也不能绕过。
+- W4：每个 Session 的源码基线仅驻当前 Runtime 内存；切换/关闭即清除。恢复会话无基线时
+  明确确认初始化。外部变化撤销与当前代码不匹配的验证证据，并向 Agent 注入不含源码正文的
+  临时安全提示；语义记忆、审批、`unknown_effects` 和原始对话保持原语义。
+- W5：单次 CLI、Shell/TUI 的 `SessionRuntime` 路径、撤销和 Eval 合成副本均接入门禁。
+  撤销预览持有工作区锁，提交前复扫绑定快照；拒绝或旧预览不会写入。任务末仅在结果成功、
+  账本可完整解释且无 taint/未知效果时更新基线，否则保留待确认差异。撤销成功还会用工具
+  返回的真实发布后 inode/内容/权限证据做收尾归因；Eval 的 Runtime 清理返回 `False` 时
+  保留诊断数据库并阻止进入验证。
+- W6 新鲜验证（Windows / Python 3.11.6）：锁专项 `Ran 13`，OK（4 项平台/权限跳过）；
+  CLI/TUI/Eval/门禁组合回归 `Ran 225`，OK（5 项平台/权限跳过）；最终完整回归
+  `Ran 1306 tests in 308.253s`，OK（11 项平台/权限跳过）；`compileall -q src tests` 与
+  `git diff --check` 均通过。
+- 实施证据：`runtime/workspace-consistency-implementation/verification.md`。未读取密钥、
+  `.env.local` 或真实会话库，未调用真实 Provider、安装依赖、恢复 Docker、提交或推送。
+  Linux/POSIX、网络文件系统、Python 3.12、手工 TUI 交互和非协作外部进程仍未实测。
+
+## 2026-09-28 无占用入口与 Session 延迟创建（任务 1—5 已实施）
+
+- 文档：`docs/superpowers/plans/2026-09-28-session-landing-lazy-creation.md`。默认
+  `chat`、裸 CLI 与 TUI 现在进入纯内存入口：不恢复 latest、不生成伪 `default` 行、
+  不取得 Session 锁，也不装配 Provider/Agent。
+- 首次非空普通任务在任务互斥区内创建、自动命名、锁定并发布唯一 UUID Session；
+  任务正文不参与名称生成。首次创建提交前取消/退出不留行，提交后 Provider 失败保留
+  已创建 ID，避免静默重试为另一个会话。
+- `initial_session_id` 是唯一显式恢复入口。真实 Session（包括历史名称 `default`）继续
+  跨进程互斥；被占用的历史会话不会降级到 latest、新建或使交互入口退出。
+- Shell/TUI 使用可空 Runtime 状态投影。入口中的模型和权限是首次任务待用草稿；需要
+  真实 Session 的命令返回稳定提示。TUI 用完整 UUID 作为选项值，名称和遇到碰撞会延长
+  的 ID 前缀只作展示，同名/同模型不会串会话。
+- Eval 重启在关闭前保存完整活动 ID，并显式恢复同一 ID；按名称切换匹配到多条记录会
+  拒绝歧义，完整 UUID 仍精确匹配。
+- 聚焦证据：入口/Runtime/所有权/CLI/Shell/UI/Eval `Ran 182`，OK；迁移后记忆/
+  Effect 专项 `Ran 64`，OK；Session/可靠性/验证证据专项 `Ran 86`，OK（1 项平台跳过）。
+  Windows 两个真实子进程可同时停在入口且不增行，并发首次提交创建不同 UUID。
+- 最终新鲜门禁（Windows / Python 3.11）：`unittest discover -s tests -q` 运行
+  `1255 tests in 313.760s`，OK，6 项为既有平台/权限跳过；`compileall -q src tests`
+  与 `git diff --check` 均退出 0。Textual/asyncio 的慢回调行是诊断输出，不是失败。
+- 未读取 `.env.local`、真实密钥或用户会话数据库，未调用真实 Provider、安装依赖、
+  提交或推送。POSIX、手工 TUI 与 Python 3.12 尚未验证。
+
+## 2026-09-28 Session 跨终端独占与切换交接（已完成）
+
+- 用户选择：切换成功后释放旧 Session；再次切回必须重新读取持久化状态，不复用旧的完整消息、未保存语义候选或撤销账本。模型切换仍保留同一个 Session 的上下文与账本。
+- 实现：`session_lock.py` 用标准库提供本机非阻塞文件锁，Windows 字节区间锁 / POSIX flock；锁按数据库规范路径与 Session ID 散列区分，位于数据库同级 `session-locks/`，不使用 PID、过期抢占或删除锁文件。数据库 schema 不变，无新增依赖。
+- 生命周期：先取得目标所有权再加载记忆、构建工具与清理 spill；成功交接后释放旧锁。占用、候选构建失败、旧记忆保存失败或 pending-clear 未完成均不交出旧会话。遗留任务资源未回收时禁止切换；关闭请求交由任务所有者收尾，正常退出/初始化失败释放，进程终止由 OS 回收。
+- 入口：CLI/TUI 显示固定占用提示；Shell 异常及 TUI unmount 清理 Runtime。Eval 模拟重启显式关闭旧实例，异常和 trial 结束也释放资源。既有测试中模拟重启的实例相应补真实 close，不关闭互斥保护来迁就测试。
+- 自审修复：普通状态变更即将释放任务锁时，并发 close 原可漏接请求；新增受控线程竞争用例先复现，再将关闭标记检查与任务锁释放置于同一个状态锁交接。新增独占专项 18 项通过（含真实独立进程竞争、正常/强制退出、失败交接、CLI/TUI 与退出竞争）。
+- 最终验证（Windows / Python 3.11）：独占专项 18 项通过；最终代码完整回归 `Ran 1233 tests in 313.362s`，OK，6 项既有平台/权限跳过（1227 通过）；证据 `runtime/session-ownership-final-verification.log`。Session 邻接 95 项、记忆 84 项通过；验证证据 75 项中 1 项平台跳过。compileall 与 `git diff --check` 通过。日志中的 asyncio/Textual slow-callback 为诊断，不是失败。
+- 边界：只保护同一数据库路径下遵守协议的 Runtime；不同 Session 指向同一工作区仍无工作区锁。POSIX、网络文件系统、旧版进程和脱离管理的外部子进程不在本次 Windows 验证范围内。未访问真实会话库、未读取密钥、未调用真实 Provider、未安装依赖、未提交或推送；既有 Eval 未提交改动保留。
+- 后续可在 Linux CI 验证 flock 分支，本次无阻塞项。日常使用要保留语义记忆时，在切换前明确预览确认 `/memory save`；退出或切换不会隐式保存未审阅内容。
+
+## 2026-09-23 Agent 效果量化（E1—E6 已实施，真实质量未测）
+
+- 文档：`docs/superpowers/plans/2026-09-23-agent-evaluation-implementation.md`；证据：`runtime/agent-evaluation-implementation/`。
+- E1/E2：新增严格 v2 suite/实验定义、旧 smoke/v1 适配、分维度指标、确定性重复调度、条件轮换、时间/取消预算、独立 trial 状态和逐次原子结果。代码正确、正常 finish 与端到端完成分开；未执行、基础设施错误和缺失 usage 不会被删除或当零。
+- E3：普通多轮走 `CodingAgent.run_with_context`；固定保存/重启/切换/撤销动作走临时 SQLite 与 `SessionRuntime` 公开接口。实验的 structured/reviewed-summary 配置真实传入 Agent，摘要调用及独立 token 写入结果；不同重复不共享上下文。
+- E4：新增白名单故障注入，区分 Provider 透明传输重试、Agent 工具重规划和审批拒绝；只在实际命中时统计恢复。安全观测记录危险请求、实际执行、重复绕过及合法操作放行，不执行真实攻击代码。
+- E5：新增 `evals/quality-v1/` 30 道合成自建题，六类各 5，dev/holdout 为 18/12；正确结果和典型错误结果各运行一次隐藏 verifier，契约分别通过/失败。原 smoke 保留。
+- E6：v2 报告包含条件、不可逆实验指纹、quality/contract 与类别分组、恢复/安全/记忆/效率、失败阶段及全部代码；`eval-compare` 默认拒绝不兼容实验，仅允许显式变量并保留未配对、提升和回退。未提供价格表时费用保持 null。
+- 新鲜离线验证（Windows / Python 3.11）：最后代码改动后的 Eval 专项 `Ran 114 tests in 35.541s`，OK，2 项既有链接权限跳过；全项目 `Ran 1215 tests in 175.311s`，OK，6 项既有平台/权限跳过；30 题正确/错误各一次共 60 个 verifier 结果全部符合预期；compileall、旧 smoke dry-run、Quality V1 dry-run、`git diff --check` 均 exit 0。测试期间的 asyncio/Textual slow-callback 输出是诊断，不是失败。
+- 兼容与边界：默认单次 `tricoder eval evals/smoke` 行为和 v1 报告保留；新能力不新增依赖。Harbor、Inspect AI、Langfuse、Docker 和真实 Provider 调用均未纳入本次；离线 fake/fixture 结果不能表述为 Agent 质量提升。
+- 回退：继续使用旧 smoke 单次入口即可绕过实验层；删除新生成的 `runtime/evals/<run-id>/` 不影响会话数据库或项目源码。禁用记忆条件使用 `memory_compaction="off"`、`memory_persistence="off"`。
+
 ## 2026-09-22 Docker 真实验证未通过并回退
 
 - 实现提交 `eece357` 曾完成 Docker P0—P5 代码、模拟生命周期测试与本地回归，但从未推送到 `origin/main`。
@@ -369,11 +500,11 @@ Hcode capabilities through the approved native-adaptation roadmap.
 
 ## Next Action
 
-- 先完成 verified-stdio remediation Task 3 的控制器独立复审（离线门禁已通过）；
-  本轮证据见 `runtime/sdd/2026-09-07-tricoder-verified-stdio-remediation/task-3-report.md`。
-- Phase 5 最终验收后进入 Phase 6：Skills 与项目指令。先重新读取项目规则、Phase 6 设计/计划和当前
-  Git 状态，确认 YAML 依赖、解析范围与写入边界；不得把本轮 Windows 本地结果
-  当作跨平台、真实 Provider 或真实外部 MCP server 的验证。
+- 第二轮模块整理代码与本地回归已完成，等待用户决定是否提交；本任务没有自动提交或推送。
+- 如需补齐分发验收，应另行授权准备满足 `setuptools>=68` 的现有隔离构建环境及 `build/wheel`，
+  再从解压 wheel 执行冷导入、CLI `--help` 和 Eval 隐藏 helper 冒烟，不能复用开发树。
+- 后续若要拆分 `SessionRuntime`，应另立计划并重新固定锁、取消、记忆异常进度和资源所有权；
+  不要把它夹带进本轮目录迁移。
 
 ## Later Roadmap
 
@@ -389,8 +520,9 @@ Hcode capabilities through the approved native-adaptation roadmap.
 
 ## Blockers
 
-- Phase 5 依赖安装与 manifest/lock 变更已经获批并完成，不再是阻塞项；
-  当前等待 verified-stdio 补救的控制器复核。Phase 6 的新依赖仍须另行批准。
+- 源码迁移和本地测试无阻塞项。
+- 分发产物验收受本机缺少 `build`/`wheel` 且 setuptools 版本低于构建要求阻塞；用户未授权安装
+  或升级依赖，因此本轮正确停在“源码与模拟/本地回归通过，wheel 未验证”。
 
 ## Eval
 

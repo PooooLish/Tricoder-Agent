@@ -16,7 +16,7 @@ from tricoder.context import SpillError, ToolResultSpillStore
 from tricoder.models import ProviderResponse, SessionMemory, ToolCall, ToolResult
 from tricoder.extensions import ToolOrigin
 from tricoder.policy import CommandPolicy, WorkspacePolicy
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 from tricoder.tools import ToolContext, ToolRegistry
 from tricoder.tools.handlers import ToolHandler
 

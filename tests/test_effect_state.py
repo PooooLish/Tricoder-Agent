@@ -23,10 +23,10 @@ from tests.test_session_runtime import RegistryJournalFactory
 from tricoder.models import SessionMemory
 from tricoder.models import RunResult, SessionTurnResult
 from tricoder.core.cancellation import CancellationError
-from tricoder.session_runtime import RuntimeOptions, SessionRuntime, SessionRuntimeError
-from tricoder.sessions import SessionStore, SessionError
-from tricoder.shell import InteractiveShell
-from tricoder.tui import TricoderApp
+from tricoder.session.runtime import RuntimeOptions, SessionRuntime, SessionRuntimeError
+from tricoder.session.store import SessionError, SessionStore
+from tricoder.presentation.shell import InteractiveShell
+from tricoder.presentation.tui import TricoderApp
 from tests.test_shell import FakeUI
 
 
@@ -215,8 +215,21 @@ class RuntimeEffectTests(unittest.TestCase):
         self.runtime = self.restart()
 
     def restart(self):
-        return SessionRuntime(self.store, self.workspace, options=RuntimeOptions(environ={}),
-                              active_session_factory=RegistryJournalFactory())
+        if hasattr(self, "_last_runtime"):
+            self._last_runtime.close()
+        self.store.initialize(self.workspace)
+        record = self.store.latest_for_workspace(self.workspace.resolve())
+        if record is None:
+            record = self.store.create(
+                "effect-state", self.workspace, "openai", "test"
+            )
+        runtime = SessionRuntime(self.store, self.workspace, options=RuntimeOptions(environ={}),
+                              active_session_factory=RegistryJournalFactory(),
+                              initial_session_id=record.id,
+                              workspace_confirmer=lambda _preview: True)
+        self._last_runtime = runtime
+        self.addCleanup(runtime.close)
+        return runtime
 
     def test_real_patch_residual_is_consistent_across_runtime_disk_memory_and_journal(self):
         for name in ("app.py", "other.py"):

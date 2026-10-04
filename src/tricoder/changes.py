@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import difflib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 
 from tricoder.execution_state import EffectState, FileEffects
@@ -66,12 +66,17 @@ class UndoPreview:
 
 @dataclass(frozen=True, slots=True)
 class UndoExecution:
-    """一次全量撤销的结构化结果，不包含任何源码快照。"""
+    """一次全量撤销的结构化结果；恢复证据仅供进程内收尾核验。"""
 
     ok: bool
     paths: tuple[str, ...]
     conflicts: tuple[str, ...] = ()
     compensation_failed: tuple[str, ...] = ()
+    _restored_changes: tuple[FileChange, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
 
 def render_change_set_diff(change_set: TaskChangeSet, *, reverse: bool = False) -> str:

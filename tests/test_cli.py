@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import tricoder.cli as cli_module
 from tricoder.audit import AuditLogger
+from tricoder.changes import FileChange, FileIdentity, FileSnapshot, TaskChangeSet
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.cli import ConsoleApprover, build_parser, main
 from tricoder.core.cancellation import CancellationToken
@@ -32,8 +33,10 @@ from tricoder.models import (
 )
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ProviderError, ProviderProtocolError, create_provider
-from tricoder.sessions import SessionError, SessionStore
+from tricoder.session.store import SessionError, SessionStore
 from tricoder.tools import ToolContext, ToolRegistry
+from tricoder.workspace.lock import WorkspaceLock
+from tricoder.workspace.snapshot import WorkspaceScanError, capture_workspace_baseline
 
 
 def _planning_response(
@@ -466,10 +469,9 @@ class CliTests(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             store_path = root / "state" / "sessions.db"
-            entered: list[tuple[str, Path]] = []
+            entered: list[tuple[bool, Path]] = []
             database_paths: list[Path] = []
             environment = {
-                "OPENAI_API_KEY": "test-key",
                 "LOCALAPPDATA": str(root / "state"),
                 "XDG_STATE_HOME": str(root / "state"),
             }
@@ -479,7 +481,8 @@ class CliTests(unittest.TestCase):
                 return SessionStore(store_path.resolve())
 
             def shell_factory(runtime, _ui, *, input_fn):  # type: ignore[no-untyped-def]
-                entered.append((runtime.current.record.name, runtime.current.record.workspace))
+                entered.append((runtime.has_active_session, runtime._entry_workspace))
+                self.assertIsNone(runtime.current)
                 self.assertIsNotNone(input_fn)
 
                 class RecordingShell:
@@ -506,8 +509,9 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(0, exit_code)
 
-            self.assertEqual([("default", workspace.resolve())] * 2, entered)
+            self.assertEqual([(False, workspace.resolve())] * 2, entered)
             self.assertEqual(2, len(database_paths))
+            self.assertEqual([], SessionStore(store_path.resolve()).list_all())
 
     def test_chat_accepts_every_run_option_without_task(self) -> None:
         """防止 chat 漏掉运行限制、审计或只读选项，或错误要求 task 位置参数。"""
@@ -767,7 +771,158 @@ class CliTests(unittest.TestCase):
             self.assertIn("用户任务：检查项目", provider.messages[1].content)
             logs = list(audit_dir.glob("*.jsonl"))
             self.assertEqual(1, len(logs))
-            self.assertFalse((Path(directory) / "runtime").exists())
+            control = Path(directory) / "runtime" / "tricoder-control"
+            self.assertTrue((control / "workspace.lock").is_file())
+            self.assertFalse((control / "active-task.json").exists())
+
+    def test_run_workspace_lock_blocks_before_provider_creation(self) -> None:
+        """不同入口命中同一工作区时，one-shot 不能先创建 Provider 再发现占用。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            audit_dir = workspace.parent / f"{workspace.name}-audit"
+            ownership = WorkspaceLock.acquire(workspace)
+            calls = 0
+
+            def provider_factory(_config, _timeout):  # type: ignore[no-untyped-def]
+                nonlocal calls
+                calls += 1
+                return FinishingProvider()
+
+            try:
+                exit_code = main(
+                    [
+                        "run",
+                        "must-not-run",
+                        "--provider",
+                        "openai",
+                        "--workspace",
+                        str(workspace),
+                        "--audit-dir",
+                        str(audit_dir),
+                    ],
+                    environ={"OPENAI_API_KEY": "test-key"},
+                    provider_factory=provider_factory,
+                    output=io.StringIO(),
+                )
+            finally:
+                ownership.close()
+
+            self.assertEqual(2, exit_code)
+            self.assertEqual(0, calls)
+
+    def test_busy_one_shot_does_not_prepare_workspace_audit_before_lock(self) -> None:
+        """被占用的入口不能先在目标工作区创建审计文件再报告锁冲突。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            audit_dir = workspace / "audit"
+            ownership = WorkspaceLock.acquire(workspace)
+            try:
+                exit_code = main(
+                    [
+                        "run",
+                        "must-not-run",
+                        "--provider",
+                        "openai",
+                        "--workspace",
+                        str(workspace),
+                        "--audit-dir",
+                        str(audit_dir),
+                    ],
+                    environ={"OPENAI_API_KEY": "test-key"},
+                    provider_factory=lambda *_args: self.fail("不得创建 Provider"),
+                    output=io.StringIO(),
+                )
+            finally:
+                ownership.close()
+
+            self.assertEqual(2, exit_code)
+            self.assertFalse(audit_dir.exists())
+
+    def test_one_shot_rejects_external_overwrite_of_journal_path(self) -> None:
+        """单次 CLI 也必须核对工具 after 版本，不能只信相同路径。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            target = workspace / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            baseline = capture_workspace_baseline(workspace)
+            before_stat = target.stat()
+            before = FileSnapshot(
+                "app.py",
+                target.read_text("utf-8"),
+                before_stat.st_mode & 0o7777,
+                FileIdentity(before_stat.st_dev, before_stat.st_ino),
+            )
+            target.write_bytes(b"value = 2\n")
+            after_stat = target.stat()
+            after = FileSnapshot(
+                "app.py",
+                "value = 2\n",
+                after_stat.st_mode & 0o7777,
+                FileIdentity(after_stat.st_dev, after_stat.st_ino),
+            )
+            change_set = TaskChangeSet(
+                (FileChange("app.py", before, after),),
+                (),
+                "待验证",
+                ("app.py",),
+                "通过",
+            )
+            target.write_bytes(b"value = 3\n")
+            config = AppConfig(
+                workspace=workspace,
+                provider=ProviderConfig(
+                    "openai", "synthetic", "https://example.invalid", "model"
+                ),
+            )
+
+            result = cli_module._finalize_one_shot_workspace(
+                config,
+                baseline,
+                RunResult(True, "synthetic", 1, verification="通过"),
+                change_set,
+                audit_path=workspace.parent / "outside-audit.jsonl",
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("未归属", result.summary)
+
+    def test_run_scan_failure_blocks_before_provider_creation(self) -> None:
+        """初始扫描不完整时，非交互入口也必须 fail closed。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            calls = 0
+
+            def provider_factory(_config, _timeout):  # type: ignore[no-untyped-def]
+                nonlocal calls
+                calls += 1
+                return FinishingProvider()
+
+            with patch(
+                "tricoder.cli.capture_workspace_baseline",
+                side_effect=WorkspaceScanError("limit_exceeded"),
+                create=True,
+            ):
+                exit_code = main(
+                    [
+                        "run",
+                        "must-not-run",
+                        "--provider",
+                        "openai",
+                        "--workspace",
+                        directory,
+                        "--audit-dir",
+                        str(Path(directory).parent / "scan-failure-audit"),
+                    ],
+                    environ={"OPENAI_API_KEY": "test-key"},
+                    provider_factory=provider_factory,
+                    output=io.StringIO(),
+                )
+
+            self.assertEqual(2, exit_code)
+            self.assertEqual(0, calls)
 
     def test_run_preserves_explicit_legacy_tool_protocol(self) -> None:
         """防止 one-shot 装配遗漏配置，并被 CodingAgent 的 native 默认值覆盖。"""
@@ -885,7 +1040,9 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code)
             self.assertEqual(1, len(list(audit_dir.glob("*.jsonl"))))
-            self.assertFalse((workspace / "runtime").exists())
+            control = workspace / "runtime" / "tricoder-control"
+            self.assertTrue((control / "workspace.lock").is_file())
+            self.assertFalse((control / "active-task.json").exists())
 
     def test_read_only_run_rejects_audit_dir_inside_workspace(self) -> None:
         """只读运行拒绝工作区内审计目录，且不创建目录或日志。"""
@@ -946,7 +1103,9 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code)
             self.assertEqual(1, len(list(audit_dir.glob("*.jsonl"))))
-            self.assertFalse((workspace / "runtime").exists())
+            control = workspace / "runtime" / "tricoder-control"
+            self.assertTrue((control / "workspace.lock").is_file())
+            self.assertFalse((control / "active-task.json").exists())
 
     def test_run_returns_one_after_file_modification_without_verification(self) -> None:
         """防止 CLI 忽略 Agent 对未验证文件修改给出的失败结果。"""

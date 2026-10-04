@@ -230,7 +230,7 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
         import weakref
         from concurrent.futures import ThreadPoolExecutor
         from unittest.mock import patch
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.policy import CommandPolicy, WorkspacePolicy
         from tricoder.task_cleanup import current_cleanup
         from tricoder.tools import ToolContext, ToolRegistry
@@ -427,7 +427,7 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
         import threading
         from types import SimpleNamespace
         from unittest.mock import Mock, patch
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.execution_state import ErrorCode
         from tricoder.policy import CommandPolicy, WorkspacePolicy
         from tricoder.task_cleanup import current_cleanup
@@ -486,7 +486,7 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
                     registry.context.timeout = 1
                     # T5 的 UNKNOWN 需显式确认；模拟 /clear 只换文件证据能力，
                     # 仍保留同一个 registry 和 T4 cleanup owner 来验证 deadline 隔离。
-                    from tricoder.verification import VerificationScope
+                    from tricoder.workspace.verification import VerificationScope
                     registry.context.verification_scope = VerificationScope()
                     result = await execute(2)
                     self.assertTrue(result.ok, "已完成旧任务的 deadline 污染了后续合法命令")

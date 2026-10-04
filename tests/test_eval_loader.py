@@ -8,6 +8,7 @@ from pathlib import Path
 from tricoder.evals.loader import (
     EvalDefinitionError,
     is_reserved_eval_path,
+    load_experiment,
     load_suite,
 )
 
@@ -79,6 +80,50 @@ class EvalLoaderTests(unittest.TestCase):
             )
         return suite_dir
 
+    def _write_experiment(
+        self,
+        suite_dir: Path,
+        *,
+        repetitions: int = 3,
+        condition_ids: tuple[str, ...] = ("baseline", "memory-on"),
+        max_trials: int = 1000,
+        scorer: str = "hidden_verifier",
+        fault: str = "none",
+        extra: str = "",
+        suite_value: str | None = None,
+    ) -> Path:
+        experiment_path = self.root / f"experiment-{self.suite_count}.toml"
+        relative_suite = suite_value or suite_dir.relative_to(self.root).as_posix()
+        lines = [
+            "schema_version = 1",
+            'experiment_id = "offline-contract"',
+            f'suite = "{relative_suite}"',
+            f"repetitions = {repetitions}",
+            'split = "all"',
+            f"max_trials = {max_trials}",
+            "time_budget_seconds = 120",
+            "seed = 7",
+        ]
+        if extra:
+            lines.append(extra)
+        for condition_id in condition_ids:
+            lines.extend(
+                (
+                    "",
+                    "[[conditions]]",
+                    f'id = "{condition_id}"',
+                    'provider = "fake"',
+                    'model = "offline"',
+                    'execution_kind = "contract"',
+                    'memory_compaction = "off"',
+                    'memory_persistence = "off"',
+                    f'scorers = ["{scorer}"]',
+                    f'faults = ["{fault}"]',
+                )
+            )
+        experiment_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return experiment_path
+
     def test_load_suite_parses_and_filters_a_valid_case(self) -> None:
         """防止 Loader 忽略 suite 顺序或未按 case_id 收窄执行范围。"""
         suite_dir = self._write_suite(case_ids=("fix-one", "fix-two"))
@@ -89,6 +134,32 @@ class EvalLoaderTests(unittest.TestCase):
         self.assertEqual(("fix-two",), tuple(case.id for case in suite.cases))
         self.assertEqual("unit", suite.cases[0].verifications[0].name)
         self.assertEqual((suite_dir / "cases" / "fix-two").resolve(), suite.cases[0].source_dir)
+
+    def test_legacy_smoke_suite_is_adapted_as_schema_v1(self) -> None:
+        """Adding versioned experiments must not invalidate the tracked v1 suite."""
+        suite_dir = self._write_suite()
+
+        suite = load_suite(suite_dir)
+
+        self.assertEqual(1, suite.schema_version)
+        self.assertEqual("coding", suite.cases[0].category)
+        self.assertEqual("dev", suite.cases[0].split)
+        self.assertEqual("quality", suite.cases[0].execution_kind)
+
+    def test_experiment_rejects_persistent_memory_without_structured_compaction(self) -> None:
+        """无效记忆组合必须在 Provider 初始化前被定义校验拒绝。"""
+        suite_dir = self._write_suite()
+        experiment = self._write_experiment(suite_dir, condition_ids=("invalid",))
+        experiment.write_text(
+            experiment.read_text("utf-8").replace(
+                'memory_persistence = "off"',
+                'memory_persistence = "reviewed_summary"',
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(EvalDefinitionError, "reviewed_summary"):
+            load_experiment(experiment)
 
     def test_load_suite_rejects_duplicate_case_ids(self) -> None:
         """防止同一 case 被定义两次而导致结果归属不确定。"""
@@ -132,6 +203,8 @@ class EvalLoaderTests(unittest.TestCase):
         self.assertEqual(("**", "*", "**/*"), suite.cases[0].allowed_changes)
         self.assertTrue(is_reserved_eval_path(".tricoder_eval_verifier/test_hidden.py"))
         self.assertTrue(is_reserved_eval_path("nested/.tricoder_eval_verifier/data.py"))
+        self.assertTrue(is_reserved_eval_path("runtime/tricoder-control/workspace.lock"))
+        self.assertFalse(is_reserved_eval_path("src/runtime/tricoder-control/user.py"))
         self.assertFalse(is_reserved_eval_path("app.py"))
 
     @unittest.skipUnless(hasattr(Path, "symlink_to"), "当前平台不支持符号链接")
@@ -346,6 +419,48 @@ class EvalLoaderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(EvalDefinitionError, "资源上限"):
             load_suite(too_many_bytes)
+
+    def test_load_experiment_rejects_unknown_fields_and_duplicate_conditions(self) -> None:
+        """A typo or duplicate condition must not create an ambiguous trial matrix."""
+        suite_dir = self._write_suite()
+        unknown = self._write_experiment(suite_dir, extra='api_key = "forbidden"')
+        with self.assertRaisesRegex(EvalDefinitionError, "未知字段"):
+            load_experiment(unknown)
+
+        duplicate = self._write_experiment(
+            suite_dir,
+            condition_ids=("baseline", "baseline"),
+        )
+        with self.assertRaisesRegex(EvalDefinitionError, "重复 condition"):
+            load_experiment(duplicate)
+
+    def test_load_experiment_enforces_repeat_and_full_product_limits(self) -> None:
+        """Condition multiplication must not bypass either configured or hard caps."""
+        suite_dir = self._write_suite(case_ids=tuple(f"case-{index}" for index in range(32)))
+        too_many_repeats = self._write_experiment(suite_dir, repetitions=11)
+        with self.assertRaisesRegex(EvalDefinitionError, "repetitions"):
+            load_experiment(too_many_repeats)
+
+        over_declared_budget = self._write_experiment(
+            suite_dir,
+            repetitions=3,
+            max_trials=100,
+        )
+        with self.assertRaisesRegex(EvalDefinitionError, "trial"):
+            load_experiment(over_declared_budget)
+
+    def test_load_experiment_rejects_unregistered_scorer_fault_and_path_escape(self) -> None:
+        """Definitions may select fixed IDs only and cannot escape to another suite tree."""
+        suite_dir = self._write_suite()
+        for label, kwargs in (
+            ("scorer", {"scorer": "python:run_anything"}),
+            ("fault", {"fault": "../../plugin.py"}),
+            ("suite", {"suite_value": "../outside"}),
+        ):
+            with self.subTest(label=label):
+                manifest = self._write_experiment(suite_dir, **kwargs)
+                with self.assertRaises(EvalDefinitionError):
+                    load_experiment(manifest)
 
 
 if __name__ == "__main__":

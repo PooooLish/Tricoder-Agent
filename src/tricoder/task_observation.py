@@ -9,7 +9,11 @@ from dataclasses import replace
 
 from tricoder.execution_state import EffectState, ExecutionState, FileEffects
 from tricoder.models import SessionContext
-from tricoder.verification import VerificationEvidence, proves_new_file_version, stable_snapshots
+from tricoder.workspace.verification import (
+    VerificationEvidence,
+    proves_new_file_version,
+    stable_snapshots,
+)
 
 
 def apply_tool_transition(state: SessionContext, effects: FileEffects,

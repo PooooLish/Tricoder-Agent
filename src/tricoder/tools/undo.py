@@ -168,7 +168,19 @@ class UndoExecutor:
                     pass
             self._close_bindings(bindings)
 
-        return UndoExecution(True, paths)
+        restored_by_path = {
+            entry.prepared.change.path: entry
+            for entry in committed
+        }
+        restored_changes = tuple(
+            FileChange(
+                change.path,
+                change.after,
+                restored_by_path[change.path].restored,
+            )
+            for change in sorted(change_set.changes, key=lambda item: item.path)
+        )
+        return UndoExecution(True, paths, _restored_changes=restored_changes)
 
     def _open_undo_targets(
         self,

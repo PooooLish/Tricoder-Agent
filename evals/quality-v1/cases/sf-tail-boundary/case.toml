@@ -1,0 +1,22 @@
+id = "sf-tail-boundary"
+title = "sf-tail-boundary"
+task = "修复 tail 的零长度边界；count=0 必须返回空列表。"
+allowed_changes = ["sequence_ops.py"]
+required_changes = ["sequence_ops.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "single_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 tail 的零长度边界；count=0 必须返回空列表。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

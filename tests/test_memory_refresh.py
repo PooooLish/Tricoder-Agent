@@ -4,6 +4,7 @@ import threading
 import unittest
 from dataclasses import replace
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 from tricoder.agent import CodingAgent
@@ -20,13 +21,13 @@ from tricoder.models import (
     ToolDefinition,
     ToolResult,
 )
-from tricoder.session_runtime import (
+from tricoder.session.runtime import (
     ActiveSession,
     RuntimeOptions,
     SessionRuntime,
     SessionRuntimeError,
 )
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 
 
 class _FinishProvider:
@@ -219,14 +220,14 @@ class MemoryRefreshTests(unittest.TestCase):
         second = agent.run_with_context("任务 B", first.context)
         retry = _TaskSummarizer()
         agent.memory_summarizer = retry
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             root = Path(temp)
             workspace = (root / "workspace").resolve()
             workspace.mkdir()
             database = (root / "state" / "sessions.db").resolve()
             seed_store = SessionStore(database, id_factory=lambda: "session-refresh")
             seed_store.initialize(workspace)
-            seed_store.create("refresh", workspace, "openai", "test")
+            record = seed_store.create("refresh", workspace, "openai", "test")
             config = AppConfig(
                 workspace=workspace,
                 provider=ProviderConfig(
@@ -252,7 +253,10 @@ class MemoryRefreshTests(unittest.TestCase):
                     config,
                     agent,
                 ),
+                initial_session_id=record.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
             session_id = runtime.current.record.id
 
             refreshed = runtime.refresh_memory()
@@ -326,14 +330,14 @@ class MemoryRefreshTests(unittest.TestCase):
                 release.wait(2)
                 return MemoryRefreshResult(complete_context, memory_calls=1)
 
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             root = Path(temp)
             workspace = (root / "workspace").resolve()
             workspace.mkdir()
             database = (root / "state" / "sessions.db").resolve()
             store = SessionStore(database, id_factory=lambda: "session-cancel")
             store.initialize(workspace)
-            store.create("cancel", workspace, "openai", "test")
+            record = store.create("cancel", workspace, "openai", "test")
             config = AppConfig(
                 workspace=workspace,
                 provider=ProviderConfig(
@@ -359,7 +363,10 @@ class MemoryRefreshTests(unittest.TestCase):
                     config,
                     LateRefreshAgent(),
                 ),
+                initial_session_id=record.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
             errors: list[BaseException] = []
 
             def run_refresh() -> None:

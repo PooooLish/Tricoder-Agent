@@ -9,7 +9,8 @@ from rich.console import Console
 from tricoder.core.events import TextDelta
 from tricoder.models import AppConfig, ProviderConfig, RunResult, TokenUsage, ToolAction, ToolResult
 from tricoder.models import SessionRecord
-from tricoder.ui import TerminalUI
+from tricoder.presentation.console import TerminalUI
+from tricoder.workspace.gate import WorkspaceGatePreview
 
 
 def recording_ui(*, answers: list[str] | None = None) -> tuple[TerminalUI, Console]:
@@ -30,6 +31,29 @@ def recording_ui(*, answers: list[str] | None = None) -> tuple[TerminalUI, Conso
 
 
 class TerminalUITests(unittest.TestCase):
+
+    def test_workspace_change_confirmation_requires_each_page(self) -> None:
+        """长差异必须逐页展示确认，不能只显示第一页后一次性放行。"""
+
+        ui, console = recording_ui(answers=["y", "n"])
+        preview = WorkspaceGatePreview(
+            preview_id="preview",
+            request_id="request",
+            generation=1,
+            session_id="session",
+            workspace_key="workspace",
+            baseline_id="before",
+            candidate_id="after",
+            kind="changed",
+            changed_paths=("a.py", "b.py"),
+            pages=("--- a.py\n+++ a.py\n", "--- b.py\n+++ b.py\n"),
+            message="检测到工作区变化",
+        )
+
+        self.assertFalse(ui.confirm_workspace_change(preview))
+        rendered = console.export_text()
+        self.assertIn("a.py", rendered)
+        self.assertIn("b.py", rendered)
     def test_file_state_check_is_not_presented_as_business_acceptance(self) -> None:
         ui, console = recording_ui()
         result = RunResult(True, "完成", 1, verification="通过")
@@ -104,12 +128,21 @@ class TerminalUITests(unittest.TestCase):
             "two", "second", Path("D:/two"), "glm", "model-b", "created", "updated"
         )
 
-        ui.show_shell_start(first)
-        ui.show_help()
-        ui.show_status(
-            SimpleNamespace(record=first, unsaved_memory=True, warning="本次记忆未持久化"),
-            SimpleNamespace(config=SimpleNamespace(read_only=True), context=SimpleNamespace(messages=("a",))),
+        active_status = SimpleNamespace(
+            record=first,
+            workspace=first.workspace,
+            provider=first.provider,
+            model=first.model,
+            read_only=True,
+            permission_level="strict",
+            verification="未运行",
+            context_messages=1,
+            unsaved_memory=True,
+            warning="本次记忆未持久化",
         )
+        ui.show_shell_start(active_status)
+        ui.show_help()
+        ui.show_status(active_status, None)
         self.assertIsNone(ui.choose_session([first, second], first.id))
         self.assertEqual("two", ui.choose_session([first, second], first.id))
         self.assertEqual(
@@ -157,6 +190,62 @@ class TerminalUITests(unittest.TestCase):
         text = console.export_text()
         self.assertIn("撤销预览", text)
         self.assertIn("[bold red]not markup[/bold red]", text)
+
+    def test_entry_start_and_status_render_without_fake_session(self) -> None:
+        """入口展示使用 Runtime 状态草稿，不能要求伪造 SessionRecord。"""
+
+        ui, console = recording_ui()
+        status = SimpleNamespace(
+            record=None,
+            workspace=Path("D:/workspace").resolve(),
+            provider="deepseek",
+            model="deepseek-preview",
+            read_only=True,
+            permission_level="strict",
+            verification="未运行",
+            context_messages=0,
+            unsaved_memory=False,
+            warning="",
+        )
+
+        ui.show_shell_start(status)
+        ui.show_status(status, None)
+
+        text = console.export_text()
+        self.assertIn("新会话", text)
+        self.assertIn(str(status.workspace), text)
+        self.assertIn("deepseek-preview", text)
+        self.assertNotIn("default", text)
+
+    def test_session_menu_extends_colliding_id_prefixes(self) -> None:
+        """终端列表的短 ID 只是标签，碰撞时必须延长且仍返回完整 ID。"""
+
+        ui, console = recording_ui(answers=["2"])
+        first = SessionRecord(
+            "abcdef12-1111-4111-8111-111111111111",
+            "同名",
+            Path("D:/workspace"),
+            "openai",
+            "model",
+            "created",
+            "updated",
+        )
+        second = SessionRecord(
+            "abcdef12-2222-4222-8222-222222222222",
+            "同名",
+            Path("D:/workspace"),
+            "openai",
+            "model",
+            "created",
+            "updated",
+        )
+
+        selected = ui.choose_session([first, second], None)
+
+        self.assertEqual(second.id, selected)
+        text = console.export_text()
+        self.assertIn("abcdef12-1", text)
+        self.assertIn("abcdef12-2", text)
 
     def test_undo_failure_path_renders_as_literal_text(self) -> None:
         """撤销失败中的动态路径不能被 Rich 当作样式标记。"""

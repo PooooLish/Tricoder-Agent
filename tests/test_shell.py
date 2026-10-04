@@ -9,8 +9,8 @@ import unittest
 
 from tricoder.models import RunResult, SessionMemory, SessionRecord
 from tricoder.changes import UndoExecution, UndoPreview
-from tricoder.session_runtime import RuntimeStatus, SessionRuntimeError
-from tricoder.shell import InteractiveShell
+from tricoder.session.runtime import RuntimeStatus, SessionRuntimeError
+from tricoder.presentation.shell import InteractiveShell
 
 
 EXPECTED_DIFF = "--- src/app.py\n+++ src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
@@ -101,6 +101,12 @@ class FakeRuntime:
             "deepseek": "deepseek-preview",
             "glm": "glm-preview",
         }
+        self.entry_workspace = self.first.workspace
+        self.entry_provider = "openai"
+        self.entry_model = "gpt-preview"
+        self.entry_permission = "strict"
+        self.busy_session_ids: set[str] = set()
+        self.memory_render_calls = 0
         self.current = self._active(self.first)
         self.store = SimpleNamespace(list_all=lambda: list(self.sessions))
 
@@ -117,6 +123,16 @@ class FakeRuntime:
         self.run_task_calls += 1
         self.tasks.append(task)
         self.events.append("run_task")
+        if self.current is None:
+            record = make_record(
+                "auto-created",
+                "会话-20260928-173005-auto",
+                str(self.entry_workspace),
+                self.entry_provider,
+                self.entry_model,
+            )
+            self.sessions.insert(0, record)
+            self.current = self._active(record)
         self.agent.run()
         return self.run_result
 
@@ -139,15 +155,22 @@ class FakeRuntime:
             raise self.undo_latest_error
         return self.undo_execution
 
+    def cancel_undo(self) -> None:
+        self.events.append("cancel_undo")
+
     def switch(self, session_id: str, *, confirm):  # type: ignore[no-untyped-def]
+        if session_id in self.busy_session_ids:
+            raise SessionRuntimeError("该会话已被其他终端占用")
         target = next(item for item in self.sessions if item.id == session_id)
-        if target.workspace != self.current.record.workspace and not confirm(target.workspace):
+        workspace = self.current.record.workspace if self.current is not None else self.entry_workspace
+        if target.workspace != workspace and not confirm(target.workspace):
             return self.current
         self.current = self._active(target)
         return self.current
 
     def create(self, name: str) -> SimpleNamespace:
-        record = make_record("created", name, str(self.current.record.workspace))
+        workspace = self.current.record.workspace if self.current is not None else self.entry_workspace
+        record = make_record("created", name, str(workspace))
         self.sessions.insert(0, record)
         self.current = self._active(record)
         return self.current
@@ -167,6 +190,10 @@ class FakeRuntime:
     def change_model(self, provider: str) -> SimpleNamespace:
         if self.fail_model:
             raise SessionRuntimeError("缺少模型配置")
+        if self.current is None:
+            self.entry_provider = provider
+            self.entry_model = self.model_previews[provider]
+            return None  # type: ignore[return-value]
         original = self.current.record
         changed = make_record(original.id, original.name, str(original.workspace), provider, f"{provider}-test")
         self.sessions = [changed if item.id == original.id else item for item in self.sessions]
@@ -180,6 +207,7 @@ class FakeRuntime:
         return self.persist_ok
 
     def render_memory(self) -> str:
+        self.memory_render_calls += 1
         return "memory revision 1"
 
     def preview_memory_save(self):  # type: ignore[no-untyped-def]
@@ -210,11 +238,29 @@ class FakeRuntime:
         self.memory_edit_calls += 1
 
     def status(self) -> RuntimeStatus:
+        if self.current is None:
+            return RuntimeStatus(None, False, "")
         return RuntimeStatus(
             self.current.record,
             not self.persist_ok,
             "本次记忆未持久化" if not self.persist_ok else "",
         )
+
+    @property
+    def has_active_session(self) -> bool:
+        return self.current is not None
+
+    @property
+    def permission_level(self) -> str:
+        if self.current is None:
+            return self.entry_permission
+        return self.current.memory.permission_level
+
+    def set_permission(self, level: str | None) -> str:
+        if level is None:
+            return self.permission_level
+        self.entry_permission = level
+        return level
 
 
 class FakeUI:
@@ -230,7 +276,7 @@ class FakeUI:
         self.run_results: list[RunResult] = []
         self.diffs: list[tuple[str, str]] = []
 
-    def show_shell_start(self, _record: SessionRecord) -> None:
+    def show_shell_start(self, _status: RuntimeStatus) -> None:
         self.text.append("start")
 
     def show_help(self) -> None:
@@ -239,7 +285,7 @@ class FakeUI:
     def show_status(self, _status: RuntimeStatus, _active: object) -> None:
         self.text.append("status")
 
-    def choose_session(self, _sessions, _current_id: str) -> str | None:  # type: ignore[no-untyped-def]
+    def choose_session(self, _sessions, _current_id: str | None) -> str | None:  # type: ignore[no-untyped-def]
         return self.session_choice
 
     def choose_model(self, previews: dict[str, str], _provider: str) -> str | None:
@@ -295,6 +341,57 @@ class InteractiveShellTests(unittest.TestCase):
 
         self.assertEqual(["检查模块"], self.runtime.tasks)
         self.assertEqual([self.runtime.run_result], self.ui.run_results)
+
+    def test_entry_local_command_matrix_never_activates_agent_or_session(self) -> None:
+        """入口本地命令只能读写草稿；会话型命令稳定拒绝且不触及 Agent。"""
+
+        self.runtime.current = None
+        shell = self.shell()
+        commands = (
+            "/help",
+            "/status",
+            "/session current",
+            "/session",
+            "/model",
+            "/permission",
+            "/permission relaxed",
+            "/memory",
+            "/memory archive",
+            "/diff",
+            "/undo",
+            "/clear",
+            "/session rename renamed",
+            "/not-a-command",
+        )
+
+        for command in commands:
+            shell.execute(command)
+
+        self.assertIsNone(self.runtime.current)
+        self.assertEqual("relaxed", self.runtime.entry_permission)
+        self.assertEqual([], self.runtime.tasks)
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertEqual(0, self.runtime.memory_render_calls)
+        self.assertEqual(0, self.runtime.diff_latest_calls)
+        self.assertEqual(0, self.runtime.prepare_undo_calls)
+        self.assertEqual(0, self.runtime.clear_calls)
+        self.assertTrue(any("尚未创建或选择会话" in item for item in self.ui.text))
+
+    def test_busy_selection_keeps_entry_usable_for_help(self) -> None:
+        """选择被占用会话失败后，Shell 仍停在入口并可继续执行本地命令。"""
+
+        self.runtime.current = None
+        self.runtime.busy_session_ids.add(self.runtime.first.id)
+        self.ui.session_choice = self.runtime.first.id
+
+        shell = self.shell()
+        shell.execute("/session")
+        shell.execute("/help")
+
+        self.assertIsNone(self.runtime.current)
+        self.assertIn("help", self.ui.text)
+        self.assertTrue(any("占用" in item for item in self.ui.text))
 
     def test_failed_run_result_is_still_displayed(self) -> None:
         """防止 Agent 返回未完成结果时 Shell 静默丢弃摘要与验证状态。"""
@@ -356,7 +453,10 @@ class InteractiveShellTests(unittest.TestCase):
         self.shell().execute("/undo")
 
         self.assertEqual([("撤销预览", EXPECTED_REVERSE_DIFF)], self.ui.diffs)
-        self.assertEqual(["prepare_undo", "show_diff", "confirm"], self.runtime.events)
+        self.assertEqual(
+            ["prepare_undo", "show_diff", "confirm", "cancel_undo"],
+            self.runtime.events,
+        )
         self.assertEqual(1, self.ui.confirm_calls)
         self.assertEqual(0, self.runtime.undo_latest_calls)
         self.assertEqual(0, self.runtime.run_task_calls)

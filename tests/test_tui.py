@@ -13,11 +13,24 @@ from textual.widgets import Collapsible, Input, Static
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.core.events import TextDelta
 from tricoder.core.cancellation import CancellationToken
-from tricoder.models import ProviderConfig, ProviderResponse, ToolCall
+from tricoder.changes import UndoExecution, UndoPreview
+from tricoder.models import (
+    AppConfig,
+    ProviderConfig,
+    ProviderResponse,
+    SessionContext,
+    SessionRecord,
+    ToolCall,
+)
 from tricoder.providers import ProviderError
-from tricoder.session_runtime import RuntimeOptions, SessionRuntime
-from tricoder.sessions import SessionStore
-from tricoder.tui import ApprovalScreen, OptionListScreen, TricoderApp, TuiObserver
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+from tricoder.session.store import SessionStore
+from tricoder.presentation.tui import (
+    ApprovalScreen,
+    OptionListScreen,
+    TricoderApp,
+    TuiObserver,
+)
 
 
 class FakeProvider:
@@ -54,6 +67,40 @@ def _provider_factory(responses: list[ProviderResponse]):
 
 
 class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_undo_prepare_gate_runs_in_background_worker(self) -> None:
+        """撤销扫描/工作区确认不能在 Textual UI 线程同步执行。"""
+
+        app = TricoderApp(lambda *_: None)
+        app.runtime = mock.Mock()
+        app.runtime.prepare_undo.return_value = UndoPreview("diff", ("app.py",))
+        app.runtime.undo_latest.return_value = UndoExecution(True, ("app.py",))
+        scheduled: list[object] = []
+        options: list[dict[str, object]] = []
+        owner_thread = threading.get_ident()
+        prepare_threads: list[int] = []
+        app.runtime.prepare_undo.side_effect = lambda: (
+            prepare_threads.append(threading.get_ident())
+            or UndoPreview("diff", ("app.py",))
+        )
+
+        def schedule(worker, **kwargs):  # type: ignore[no-untyped-def]
+            scheduled.append(worker)
+            options.append(kwargs)
+
+        with mock.patch.object(app, "run_worker", side_effect=schedule), \
+             mock.patch.object(app, "_confirm", return_value=True), \
+             mock.patch.object(app, "log_line_safe"):
+            app._undo()
+            app.runtime.prepare_undo.assert_not_called()
+            thread = threading.Thread(target=scheduled[0])
+            thread.start()
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(True, options[0]["thread"])
+        self.assertNotEqual(owner_thread, prepare_threads[0])
+        app.runtime.undo_latest.assert_called_once()
+
     async def check_approval_shutdown(self, scenario):
         app = TricoderApp(lambda *_: None)
         token = CancellationToken()
@@ -310,6 +357,127 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIsNotNone(app.query_one(Input))
             self.assertIsNotNone(app.query_one("#log", VerticalScroll))
+            self.assertIsNone(app.runtime.current)
+            self.assertEqual([], self.store.list_all())
+            self.assertTrue(any("新会话" in line for line in app._lines))
+            await self._submit(pilot, "/status")
+            for _ in range(5):
+                await pilot.pause()
+            self.assertIsNone(app.runtime.current)
+            self.assertEqual([], self.store.list_all())
+
+    async def test_entry_model_selection_only_updates_pending_configuration(self) -> None:
+        """入口模型菜单不能装配 Provider、创建行或伪造活动会话。"""
+
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "/model")
+            await self._wait_option_list(pilot)
+            await pilot.press("down")
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause()
+                if app.runtime.status().provider == "deepseek":
+                    break
+
+            self.assertEqual("deepseek", app.runtime.status().provider)
+            self.assertIsNone(app.runtime.current)
+            self.assertEqual([], self.store.list_all())
+
+    async def test_duplicate_session_labels_select_by_full_id(self) -> None:
+        """同名且短前缀相同的会话必须通过完整 UUID 选择，不能反查显示文本。"""
+
+        first = SessionRecord(
+            "abcdef12-1111-4111-8111-111111111111",
+            "同名会话",
+            self.workspace,
+            "openai",
+            "same-model",
+            "created-1",
+            "updated-1",
+        )
+        second = SessionRecord(
+            "abcdef12-2222-4222-8222-222222222222",
+            "同名会话",
+            self.workspace,
+            "openai",
+            "same-model",
+            "created-2",
+            "updated-2",
+        )
+        app = TricoderApp(lambda *_: None)
+        app.runtime = mock.Mock()
+        app.runtime.current = None
+        app.runtime.store.list_all.return_value = [first, second]
+        captured: list[object] = []
+
+        def capture(screen, callback):  # type: ignore[no-untyped-def]
+            captured.extend((screen, callback))
+
+        with mock.patch.object(app, "push_screen", side_effect=capture), \
+             mock.patch.object(app, "run_worker", side_effect=lambda fn, **_kw: fn()), \
+             mock.patch.object(app, "_switch_worker") as switch:
+            app._choose_session()
+            screen = captured[0]
+            callback = captured[1]
+            self.assertIsInstance(screen, OptionListScreen)
+            callback(second.id)
+
+        switch.assert_called_once()
+        self.assertEqual(second.id, switch.call_args.args[0].id)
+        labels = [getattr(option, "label", option) for option in screen._options]
+        self.assertEqual(2, len(set(labels)))
+        self.assertTrue(all("同名会话" in label for label in labels))
+
+    async def test_busy_session_selection_keeps_tui_in_entry(self) -> None:
+        """从入口选择被占用会话只报告错误，不能退出或偷偷创建新会话。"""
+
+        self.store.initialize(self.workspace)
+        record = self.store.create(
+            "busy", self.workspace, "openai", "offline"
+        )
+
+        def active_factory(item, memory, _options):  # type: ignore[no-untyped-def]
+            config = AppConfig(
+                workspace=self.workspace,
+                provider=ProviderConfig(
+                    "openai", "synthetic", "https://example.invalid", "offline"
+                ),
+            )
+            return ActiveSession(
+                item,
+                memory,
+                SessionContext(persisted_summary=memory.summary),
+                config,
+                mock.Mock(),
+            )
+
+        owner = SessionRuntime(
+            self.store,
+            self.workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=active_factory,
+            initial_session_id=record.id,
+        )
+        self.addCleanup(owner.close)
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "/session")
+            await self._wait_option_list(pilot)
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause()
+                if any("占用" in line for line in app._lines):
+                    break
+            self.assertIsNone(app.runtime.current)
+            self.assertEqual(1, len(self.store.list_all()))
+            await self._submit(pilot, "/help")
+            for _ in range(5):
+                await pilot.pause()
+            self.assertTrue(any("/status" in line for line in app._lines))
+        owner.close()
 
     async def test_task_rounds_are_collapsible(self) -> None:
         """每轮工具调用被折叠进 Collapsible 块，避免逐行刷屏。"""
@@ -341,9 +509,35 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await self._submit(pilot, "跑一个任务")
             result = await self._wait_result(pilot)
+            record = app.runtime.current.record
+            content = app.query_one("#sidebar-content", Static).content
+            plain = content.plain if hasattr(content, "plain") else str(content)
 
         self.assertTrue(result.ok)
         self.assertIn("ok done", result.summary)
+        self.assertIn(record.name, plain)
+        self.assertIn(record.id[:8], plain)
+
+    async def test_failed_first_task_still_displays_committed_session(self) -> None:
+        """Provider 失败发生在创建提交后时，TUI 必须保留并展示真实 Session。"""
+
+        app = self._make_app([])
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self._submit(pilot, "触发合成 Provider 失败")
+            for _ in range(100):
+                await pilot.pause()
+                if any("任务异常" in line for line in app._lines):
+                    break
+            else:
+                self.fail("未观察到合成 Provider 失败")
+
+            record = app.runtime.current.record
+            content = app.query_one("#sidebar-content", Static).content
+            plain = content.plain if hasattr(content, "plain") else str(content)
+            self.assertIn(record.name, plain)
+            self.assertIn(record.id[:8], plain)
+            self.assertEqual(1, len(self.store.list_all()))
 
     async def test_unknown_tool_exception_reaches_tui_without_leaking_and_keeps_runtime_effects(self) -> None:
         """真实写入后异常须由 Runtime 对账，最终 UI 不能把异常中的源码或凭据当文案。"""
@@ -355,6 +549,7 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         primary = RuntimeError(f"{sentinel}\n{source_marker}")
         async with app.run_test() as pilot:
             await pilot.pause()
+            app.runtime.create("exception-test")
             handler = app.runtime.current.tools._handlers["create_file"]
             real_run = handler.run
 
@@ -429,6 +624,7 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         app = self._make_app([])
         async with app.run_test() as pilot:
             await pilot.pause()
+            app.runtime.create("clear-test")
             await self._submit(pilot, "/clear")
             for _ in range(300):
                 await pilot.pause()
@@ -447,6 +643,7 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         app = self._make_app([])
         async with app.run_test() as pilot:
             await pilot.pause()
+            app.runtime.create("archive-test")
             with mock.patch.object(
                 app.runtime,
                 "render_memory_archive",
@@ -468,6 +665,7 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         preview = mock.Mock(text="ARCHIVE-DELETE-PREVIEW")
         async with app.run_test() as pilot:
             await pilot.pause()
+            app.runtime.create("archive-delete-test")
             with mock.patch.object(
                 app.runtime,
                 "preview_memory_archive_delete",

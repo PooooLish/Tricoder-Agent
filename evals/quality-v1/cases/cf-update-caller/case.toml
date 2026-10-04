@@ -1,0 +1,22 @@
+id = "cf-update-caller"
+title = "cf-update-caller"
+task = "calculator 已改为 multiply；更新调用方 report.py，不改计算模块。"
+allowed_changes = ["report.py"]
+required_changes = ["report.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "cross_file"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "calculator 已改为 multiply；更新调用方 report.py，不改计算模块。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

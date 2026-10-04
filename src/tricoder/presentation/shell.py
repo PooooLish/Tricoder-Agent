@@ -1,0 +1,385 @@
+"""交互式 Shell：本地处理斜杠命令，仅将普通文本交给 SessionRuntime。"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from typing import Protocol
+
+from tricoder.presentation.commands import (
+    CommandError,
+    ParsedCommand,
+    is_slash_command,
+    parse_command,
+)
+from tricoder.changes import UndoExecution, UndoPreview
+from tricoder.models import RunResult
+from tricoder.session.runtime import SessionRuntimeError
+
+
+class ShellUI(Protocol):
+    """Shell 依赖的最小 UI 协议，便于通过注入测试而不依赖真实终端。"""
+
+    def show_shell_start(self, status: object) -> None:
+        """显示入口态或当前会话的交互启动信息。"""
+
+    def show_help(self) -> None:
+        """显示本地命令帮助。"""
+
+    def show_status(self, status: object, active: object | None) -> None:
+        """显示当前 Session 状态。"""
+
+    def choose_session(self, sessions: list[object], current_id: str | None) -> str | None:
+        """返回选择的 Session ID，空输入或无效编号返回 None。"""
+
+    def choose_model(self, previews: Mapping[str, str], provider: str) -> str | None:
+        """返回选择的 Provider，空输入或无效编号返回 None。"""
+
+    def confirm(self, prompt: str) -> bool:
+        """仅在用户明确输入 y 或 yes 时返回 True。"""
+
+    def show_memory_warning(self, warning: str) -> None:
+        """显示记忆未持久化警告。"""
+
+    def show_notice(self, message: str) -> None:
+        """显示无需中断循环的一般提示。"""
+
+    def show_diff(self, diff: str, *, title: str) -> None:
+        """以字面形式显示任务变更或撤销预览。"""
+
+    def show_error(self, title: str, message: str) -> None:
+        """显示可恢复的本地错误。"""
+
+    def show_run_result(self, result: RunResult) -> None:
+        """显示普通交互任务的结构化结果。"""
+
+
+class RuntimeLike(Protocol):
+    """Shell 所需的运行时协议，避免将测试与具体装配耦合。"""
+
+    current: object | None
+    store: object
+
+    @property
+    def has_active_session(self) -> bool:
+        ...
+
+    def run_task(self, task: str) -> RunResult:
+        """运行普通用户任务。"""
+
+    def diff_latest(self) -> str | None:
+        """返回最近任务的正向差异；没有历史时返回 None。"""
+
+    def prepare_undo(self) -> UndoPreview:
+        """校验并生成最近任务的反向差异预览。"""
+
+    def undo_latest(self) -> UndoExecution:
+        """在确认后再次校验并撤销最近任务。"""
+
+    def cancel_undo(self) -> None:
+        """拒绝撤销时释放预览占用的工作区锁。"""
+
+    def switch(self, session_id: str, *, confirm: Callable[[object], bool]) -> object:
+        """切换 Session。"""
+
+    def create(self, name: str) -> object:
+        ...
+
+    def rename_current(self, name: str) -> object:
+        ...
+
+    def clear_current(self, *, confirmed: bool = False) -> None:
+        ...
+
+    def change_model(self, provider: str) -> object:
+        ...
+
+    def preview_models(self) -> Mapping[str, str]:
+        ...
+
+    def retry_persist(self) -> bool:
+        ...
+
+    def render_memory(self) -> str:
+        ...
+
+    def preview_memory_save(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def save_memory_preview(self, preview: object) -> None:
+        ...
+
+    def refresh_memory(self):  # type: ignore[no-untyped-def]
+        ...
+
+    def render_memory_archive(self) -> str:
+        ...
+
+    def preview_memory_archive_delete(self, item_id: str):  # type: ignore[no-untyped-def]
+        ...
+
+    def apply_memory_archive_delete(self, preview: object) -> None:
+        ...
+
+    def preview_memory_edit(self, item_id: str, text: str, scope: str):  # type: ignore[no-untyped-def]
+        ...
+
+    def apply_memory_edit(self, preview: object) -> None:
+        ...
+
+    def status(self) -> object:
+        ...
+
+
+class InteractiveShell:
+    """维护输入循环并在本地分发命令的轻量交互层。"""
+
+    def __init__(
+        self,
+        runtime: RuntimeLike,
+        ui: ShellUI,
+        *,
+        input_fn: Callable[[str], str] = input,
+        prompt: str = "tricoder> ",
+    ) -> None:
+        self.runtime = runtime
+        self.ui = ui
+        self.input_fn = input_fn
+        self.prompt = prompt
+
+    def run(self) -> int:
+        """运行至用户退出；输入阶段的 Ctrl+C 和 EOF 均有稳定语义。"""
+        self.ui.show_shell_start(self.runtime.status())
+        while True:
+            try:
+                text = self.input_fn(self.prompt).strip()
+            except KeyboardInterrupt:
+                self.ui.show_notice("已清空当前输入")
+                continue
+            except EOFError:
+                return self._exit()
+            if not text:
+                continue
+            try:
+                code = self.execute(text)
+            except KeyboardInterrupt:
+                self.ui.show_notice("已取消当前操作")
+                continue
+            except EOFError:
+                return self._exit()
+            if code is not None:
+                return code
+
+    def execute(self, text: str) -> int | None:
+        """执行一次输入，供循环和单元测试复用。"""
+        if not is_slash_command(text):
+            try:
+                result = self.runtime.run_task(text)
+                self.ui.show_run_result(result)
+            except SessionRuntimeError as exc:
+                self.ui.show_error("任务运行失败", str(exc))
+            return None
+
+        try:
+            command = parse_command(text)
+        except CommandError as exc:
+            self.ui.show_error("命令错误", f"{exc} 请使用 /help 查看可用命令。")
+            return None
+
+        try:
+            return self._execute_command(command)
+        except SessionRuntimeError as exc:
+            self.ui.show_error("会话操作失败", str(exc))
+            return None
+        except (OSError, ValueError) as exc:
+            self.ui.show_error("会话操作失败", str(exc))
+            return None
+
+    def _execute_command(self, command: ParsedCommand) -> int | None:
+        if command.name in {"clear", "diff", "undo", "memory"}:
+            self._require_active_session()
+        if command.name == "session" and command.subcommand == "rename":
+            self._require_active_session()
+        if command.name == "help":
+            self.ui.show_help()
+        elif command.name == "status":
+            self._show_status()
+        elif command.name == "model":
+            self._choose_model()
+        elif command.name == "clear":
+            self._clear_current()
+        elif command.name == "diff":
+            self._show_diff()
+        elif command.name == "undo":
+            self._undo_latest()
+        elif command.name == "session":
+            self._handle_session(command)
+        elif command.name == "permission":
+            self._permission(command.argument)
+        elif command.name == "memory":
+            self._memory(command)
+        elif command.name == "exit":
+            return self._exit()
+        return None
+
+    def _memory(self, command: ParsedCommand) -> None:
+        """记忆命令完全在本地执行，预览内容不会进入 Agent 或审计。"""
+
+        if command.subcommand is None:
+            self.ui.show_notice(self.runtime.render_memory())
+            return
+        if command.subcommand == "save":
+            preview = self.runtime.preview_memory_save()
+            self.ui.show_notice(preview.text)
+            if not self.ui.confirm("保存以上确切会话记忆候选？[y/N] "):
+                self.ui.show_notice("已取消保存会话记忆")
+                return
+            self.runtime.save_memory_preview(preview)
+            self.ui.show_notice("会话记忆已保存")
+            return
+        if command.subcommand == "refresh":
+            refreshed = self.runtime.refresh_memory()
+            self.ui.show_notice(
+                f"会话记忆候选已刷新；本次记忆请求 {refreshed.memory_calls} 次"
+            )
+            return
+        if command.subcommand == "archive":
+            self.ui.show_notice(self.runtime.render_memory_archive())
+            return
+        if command.subcommand == "archive-delete":
+            preview = self.runtime.preview_memory_archive_delete(
+                command.argument or ""
+            )
+            self.ui.show_notice(preview.text)
+            if not self.ui.confirm("删除以上归档记忆条目？[y/N] "):
+                self.ui.show_notice("已取消删除归档记忆")
+                return
+            self.runtime.apply_memory_archive_delete(preview)
+            self.ui.show_notice("归档记忆已从当前候选删除；尚未自动保存")
+            return
+
+        item_id = command.argument or ""
+        new_text = self.input_fn("新的记忆文本（留空表示删除）：")
+        scope = self.input_fn("作用范围 task/session [session]：").strip().lower() or "session"
+        state = self.input_fn(
+            "状态 active/pending/done/cancelled/superseded [保持原状态]："
+        ).strip().lower() or None
+        preview = self.runtime.preview_memory_edit(item_id, new_text, scope, state)
+        self.ui.show_notice(preview.text)
+        if not self.ui.confirm("应用以上本地记忆编辑？[y/N] "):
+            self.ui.show_notice("已取消编辑会话记忆")
+            return
+        self.runtime.apply_memory_edit(preview)
+        self.ui.show_notice("会话记忆已更新；尚未自动保存")
+
+    def _permission(self, argument: str | None) -> None:
+        if argument is None:
+            self.ui.show_notice(f"当前权限级别：{self.runtime.permission_level}")
+            return
+        try:
+            level = self.runtime.set_permission(argument)
+        except SessionRuntimeError as exc:
+            self.ui.show_error("权限操作失败", str(exc))
+            return
+        self.ui.show_notice(f"权限级别已切换：{level}")
+
+    def _handle_session(self, command: ParsedCommand) -> None:
+        if command.subcommand is None:
+            self._choose_session()
+        elif command.subcommand == "new":
+            self.runtime.create(command.argument or "")
+            self.ui.show_notice("已创建并切换到新会话")
+        elif command.subcommand == "current":
+            self._show_status()
+        elif command.subcommand == "rename":
+            self.runtime.rename_current(command.argument or "")
+            self.ui.show_notice("当前会话已重命名")
+
+    def _show_status(self) -> None:
+        self.ui.show_status(self.runtime.status(), self.runtime.current)
+        current = self.runtime.current
+        if current is not None and current.memory.unknown_effects:  # type: ignore[attr-defined]
+            self.ui.show_notice("文件影响未确认；请检查实际文件并通过 /clear 明确确认")
+
+    def _choose_session(self) -> None:
+        sessions = self.runtime.store.list_all()  # type: ignore[attr-defined]
+        current = self.runtime.current
+        current_id = current.record.id if current is not None else None  # type: ignore[attr-defined]
+        selected_id = self.ui.choose_session(sessions, current_id)
+        if selected_id is None:
+            return
+        if selected_id not in {record.id for record in sessions}:
+            self.ui.show_error("会话错误", "选择的会话编号无效。")
+            return
+
+        self.runtime.switch(
+            selected_id,
+            confirm=lambda workspace: self.ui.confirm(
+                f"目标工作区为 {workspace}。确认切换？[y/N] "
+            ),
+        )
+
+    def _choose_model(self) -> None:
+        provider = self.ui.choose_model(
+            self.runtime.preview_models(),
+            self.runtime.status().provider,  # type: ignore[attr-defined]
+        )
+        if provider is None:
+            return
+        self.runtime.change_model(provider)
+        self.ui.show_notice("模型已切换")
+
+    def _require_active_session(self) -> None:
+        if not self.runtime.has_active_session:
+            raise SessionRuntimeError("尚未创建或选择会话")
+
+    def _clear_current(self) -> None:
+        if not self.ui.confirm("清除当前会话记录（不恢复文件）；若有未确认影响，请先检查实际文件。确认？[y/N] "):
+            self.ui.show_notice("已取消清除")
+            return
+        self.runtime.clear_current(confirmed=True)
+        self.ui.show_notice("当前会话记忆已清除")
+
+    def _show_diff(self) -> None:
+        """只读取最近一次任务变更，绝不进入 Agent 任务通道。"""
+        diff = self.runtime.diff_latest()
+        if diff is None:
+            self.ui.show_notice("当前 Session 没有最近任务变更。")
+            return
+        self.ui.show_diff(diff, title="最近任务变更")
+
+    def _undo_latest(self) -> None:
+        """先展示完整反向差异，收到明确确认后才请求 Runtime 撤销。"""
+        preview = self.runtime.prepare_undo()
+        try:
+            self.ui.show_diff(preview.diff, title="撤销预览")
+            approved = self.ui.confirm("撤销最近一条任务的全部文件修改？[y/N] ")
+        except BaseException:
+            self.runtime.cancel_undo()
+            raise
+        if not approved:
+            self.runtime.cancel_undo()
+            self.ui.show_notice("已取消撤销。")
+            return
+
+        execution = self.runtime.undo_latest()
+        if execution.ok:
+            self.ui.show_notice("已撤销最近一条任务的全部文件修改。")
+            return
+        if execution.conflicts:
+            paths = "、".join(execution.conflicts)
+            self.ui.show_error("撤销冲突", f"检测到文件冲突，未执行撤销：{paths}")
+            return
+        if execution.compensation_failed:
+            paths = "、".join(execution.compensation_failed)
+            self.ui.show_error("撤销失败", f"撤销未完成且补偿失败：{paths}")
+            return
+        self.ui.show_error("撤销失败", "撤销未完成，文件未被修改。")
+
+    def _exit(self) -> int:
+        """退出前重试持久化；失败时明确告警并返回非零状态。"""
+        if self.runtime.retry_persist():
+            return 0
+        status = self.runtime.status()
+        warning = getattr(status, "warning", "") or "本次记忆未持久化"
+        self.ui.show_memory_warning(warning)
+        return 1

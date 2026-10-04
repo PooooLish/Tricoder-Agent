@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from contextlib import ExitStack
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -13,13 +14,13 @@ from tricoder.context.memory import (
     merge_review_candidate,
 )
 from tricoder.models import AppConfig, MemoryConfig, ProviderConfig, SessionContext
-from tricoder.session_runtime import (
+from tricoder.session.runtime import (
     ActiveSession,
     RuntimeOptions,
     SessionRuntime,
     SessionRuntimeError,
 )
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 from tests.test_memory_refresh import _FinishProvider, _TaskSummarizer, _agent
 
 
@@ -62,14 +63,14 @@ class MemoryReviewRound2EndToEndTests(unittest.TestCase):
         business_calls = provider.calls
         original_messages = second.context.messages
 
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             root = Path(temp)
             workspace = (root / "workspace").resolve()
             workspace.mkdir()
             database = (root / "state" / "sessions.db").resolve()
             seed_store = SessionStore(database, id_factory=lambda: "session-round2")
             seed_store.initialize(workspace)
-            seed_store.create("round2", workspace, "openai", "test")
+            record = seed_store.create("round2", workspace, "openai", "test")
             config = AppConfig(
                 workspace=workspace,
                 provider=ProviderConfig(
@@ -98,7 +99,10 @@ class MemoryReviewRound2EndToEndTests(unittest.TestCase):
                     config,
                     agent,
                 ),
+                initial_session_id=record.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
 
             with self.assertRaisesRegex(SessionRuntimeError, "覆盖|刷新"):
                 runtime.preview_memory_save()
@@ -228,6 +232,7 @@ class MemoryReviewRound2EndToEndTests(unittest.TestCase):
                 first_saved_revision,
             )
 
+            runtime.close()
             restarted = SessionRuntime(
                 SessionStore(database),
                 workspace,
@@ -239,7 +244,10 @@ class MemoryReviewRound2EndToEndTests(unittest.TestCase):
                     config,
                     object(),
                 ),
+                initial_session_id=record.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(restarted.close)
             restored = restarted.current.context.conversation_memory
             self.assertEqual(final_candidate, restored)
             self.assertEqual((replacement,), restored.decisions)

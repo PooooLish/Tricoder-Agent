@@ -26,7 +26,7 @@ from tricoder.changes import (
 from tricoder.models import ToolDefinition, ToolResult, tool_failure
 from tricoder.patches import PatchError, parse_unified_diff
 from tricoder.policy import CommandPolicy, PolicyArgumentError, PolicyError, WorkspacePolicy
-from tricoder.verification import VerificationScope
+from tricoder.workspace.verification import VerificationScope
 from tricoder.task_observation import current_task_observation
 from tricoder.tools.binding import (
     _DirectoryBinding,

@@ -17,8 +17,8 @@ from tricoder.models import (
     ToolCall,
 )
 from tricoder.protocols import NativeToolProtocol
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
-from tricoder.sessions import SessionError, SessionStore
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
+from tricoder.session.store import SessionError, SessionStore
 
 
 def block(start: int, label: str) -> tuple[Message, ...]:
@@ -55,6 +55,7 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.database = (self.root / "state" / "sessions.db").resolve()
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def _runtime(self, store: SessionStore) -> SessionRuntime:
@@ -79,12 +80,18 @@ class MemoryLifecycleTests(unittest.TestCase):
                 object(),
             )
 
-        return SessionRuntime(
+        record = store.latest_for_workspace(self.workspace)
+        self.assertIsNotNone(record)
+        runtime = SessionRuntime(
             store,
             self.workspace,
             options=RuntimeOptions(),
             active_session_factory=factory,
+            initial_session_id=record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(runtime.close)
+        return runtime
 
     def _seed_store(self, store: SessionStore) -> str:
         store.initialize(self.workspace)

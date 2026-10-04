@@ -63,8 +63,11 @@ class WorkspaceCase(unittest.TestCase):
 
     def api(self):
         # 缺少实现以行为契约断言 RED，避免导入错误掩盖下面真实 Agent 的缺口。
-        self.assertIsNotNone(importlib.util.find_spec("tricoder.verification"), "缺少文件状态证据能力")
-        from tricoder import verification
+        self.assertIsNotNone(
+            importlib.util.find_spec("tricoder.workspace.verification"),
+            "缺少文件状态证据能力",
+        )
+        from tricoder.workspace import verification
         return verification
 
     def capture(self, **kwargs):
@@ -135,6 +138,21 @@ class SnapshotTests(WorkspaceCase):
         after = self.capture()
         self.assertTrue(after.complete)
         self.assertEqual(before.digest, after.digest)
+
+    def test_workspace_control_directory_is_excluded_but_other_runtime_is_observed(self):
+        """任务锁活动标记不能污染验证快照，普通 runtime 仍属于覆盖范围。"""
+
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        before = self.capture()
+        control = runtime / "tricoder-control"
+        control.mkdir(parents=True)
+        (control / "workspace.lock").write_text("lock", encoding="utf-8")
+        (control / "active-task.json").write_text("active", encoding="utf-8")
+        self.assertEqual(before.digest, self.capture().digest)
+
+        (runtime / "ordinary.txt").write_text("observed", encoding="utf-8")
+        self.assertNotEqual(before.digest, self.capture().digest)
 
     def test_gitignore_cannot_hide_runtime_tests_or_config(self):
         (self.root / ".gitignore").write_text("runtime/\ntests/\npyproject.toml\n", encoding="utf-8")
@@ -424,7 +442,7 @@ class CommandEvidenceTests(WorkspaceCase):
         self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
 
     def test_cleanup_timeout_and_output_limit_keep_unknown_without_evidence(self):
-        from tricoder.subprocess_control import BoundedProcessResult
+        from tricoder.process.control import BoundedProcessResult
         for flag in ("cleanup_failed", "timed_out", "output_exceeded"):
             with self.subTest(flag=flag), patch("tricoder.tools.command.run_bounded_process",
                     return_value=BoundedProcessResult(0, "", "", **{flag: True})):
@@ -789,7 +807,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
     def test_fix5_persist_barrier_never_accepts_cancel_and_returns_success(self):
         from tricoder.models import RunResult, SessionTurnResult
-        from tricoder.session_runtime import SessionRuntimeError
+        from tricoder.session.runtime import SessionRuntimeError
 
         runtime = self.runtime()
         entered, resume = threading.Event(), threading.Event()
@@ -1160,7 +1178,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
     def test_cancel_during_final_scan_keeps_runtime_owner_until_scan_returns(self):
         from tricoder.models import RunResult, SessionTurnResult
-        from tricoder.session_runtime import SessionRuntimeError
+        from tricoder.session.runtime import SessionRuntimeError
         from tricoder.task_cleanup import current_cleanup
 
         runtime = self.runtime([CHECK, FINISH])
@@ -1752,7 +1770,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertEqual("失败", runtime.current.context.verification)
 
     def test_r3_registered_external_unknown_survives_notification_exception_and_restart(self):
-        from tricoder.session_runtime import SessionRuntimeError
+        from tricoder.session.runtime import SessionRuntimeError
 
         class ExternalWrite(ToolHandler):
             name = "external_write"
@@ -1783,23 +1801,32 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertTrue(runtime.store.load_memory(runtime.current.record.id).unknown_effects)
         self.assertIsNone(runtime.current.context.verification_evidence)
         self.assertFalse(runtime.run_task("未经确认再次完成").ok)
+        runtime.close()
         restarted = self.runtime([FINISH])
         self.assertFalse(restarted.run_task("重启仍阻断").ok)
         with self.assertRaises(SessionRuntimeError):
-            runtime.clear_current()
-        runtime.clear_current(confirmed=True)
-        self.assertFalse(runtime.current.context.unknown_effects)
+            restarted.clear_current()
+        restarted.clear_current(confirmed=True)
+        self.assertFalse(restarted.current.context.unknown_effects)
 
     def runtime(self, actions=()):
+        if hasattr(self, "_previous_runtime"):
+            self._previous_runtime.close()
         from tricoder.changes import ChangeJournal
         from tricoder.models import AppConfig, ProviderConfig
-        from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime
-        from tricoder.sessions import SessionStore
+        from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+        from tricoder.session.store import SessionStore
 
         if not hasattr(self, "state_dir"):
             self.state_dir = tempfile.TemporaryDirectory()
             self.addCleanup(self.state_dir.cleanup)
         store = SessionStore(Path(self.state_dir.name) / "sessions.db")
+        store.initialize(self.root)
+        record = store.latest_for_workspace(self.root)
+        if record is None:
+            record = store.create(
+                "verification", self.root, "openai", "test"
+            )
 
         def factory(record, memory, options):
             journal = ChangeJournal()
@@ -1810,7 +1837,17 @@ class RuntimeEvidenceTests(WorkspaceCase):
                                      verification=memory.verification)
             return ActiveSession(record, memory, context, config, self.agent(actions, tools), tools, journal)
 
-        return SessionRuntime(store, self.root, options=RuntimeOptions(environ={}), active_session_factory=factory)
+        runtime = SessionRuntime(
+            store,
+            self.root,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=factory,
+            initial_session_id=record.id,
+            workspace_confirmer=lambda _preview: True,
+        )
+        self._previous_runtime = runtime
+        self.addCleanup(runtime.close)
+        return runtime
 
     def test_runtime_preserves_new_evidence_and_does_not_persist_it(self):
         runtime = self.runtime([EDIT, CHECK, FINISH, FINISH])
@@ -1825,6 +1862,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
     def test_restart_downgrades_pass_display_and_cannot_reuse_evidence(self):
         runtime = self.runtime([EDIT, CHECK, FINISH])
         self.assertTrue(runtime.run_task("检查").ok)
+        runtime.close()
         restarted = self.runtime([FINISH])
         self.assertEqual("待验证", restarted.current.memory.verification)
         self.assertEqual("待验证", restarted.current.context.verification)
@@ -1838,12 +1876,15 @@ class RuntimeEvidenceTests(WorkspaceCase):
         runtime.create("second")
         runtime.switch(first_id, confirm=lambda _: True)
         self.assertIsNone(runtime.current.context.verification_evidence)
+        # 新装配的假 Provider 原本会重新 CHECK；本用例只测试旧通过不能替代检查。
+        runtime.current = replace(runtime.current, agent=self.agent([FINISH], runtime.current.tools))
         self.assertFalse(runtime.run_task("切回").ok)
 
     def test_undo_new_version_cannot_restore_old_pass_or_evidence(self):
         runtime = self.runtime([CHECK, FINISH, EDIT, CHECK, FINISH, FINISH])
         self.assertTrue(runtime.run_task("原版本检查").ok)
         self.assertTrue(runtime.run_task("修改检查").ok)
+        runtime.prepare_undo()
         self.assertTrue(runtime.undo_latest().ok)
         self.assertEqual("x = 1\n", (self.root / "app.py").read_text(encoding="utf-8"))
         self.assertEqual("待验证", runtime.current.context.verification)

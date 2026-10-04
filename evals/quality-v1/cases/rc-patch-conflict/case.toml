@@ -1,0 +1,22 @@
+id = "rc-patch-conflict"
+title = "rc-patch-conflict"
+task = "修复 replace_tag；首次补丁会模拟上下文冲突，重读后再修改。"
+allowed_changes = ["tags.py"]
+required_changes = ["tags.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "recovery"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["patch_conflict"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "fault_triggered", "recovered"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 replace_tag；首次补丁会模拟上下文冲突，重读后再修改。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

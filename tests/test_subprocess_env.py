@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from tricoder.subprocess_env import filtered_subprocess_env
+from tricoder.process.env import filtered_subprocess_env
 
 
 class SubprocessEnvironmentTests(unittest.TestCase):

@@ -10,10 +10,10 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.task_cleanup import run_in_cleanup_thread
 from tricoder.models import ToolResult, tool_failure
 from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
-from tricoder.verification import stable_snapshots
+from tricoder.workspace.verification import stable_snapshots
 from tricoder.policy import CommandPolicy, PolicyError
-from tricoder.subprocess_env import filtered_subprocess_env
-from tricoder.subprocess_control import ProcessExecutionUncertain, run_bounded_process
+from tricoder.process.control import ProcessExecutionUncertain, run_bounded_process
+from tricoder.process.env import filtered_subprocess_env
 
 from tricoder.tools.handlers import ToolHandler
 

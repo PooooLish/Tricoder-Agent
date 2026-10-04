@@ -1,0 +1,22 @@
+id = "cf-parameter-validation"
+title = "cf-parameter-validation"
+task = "修复数量校验，只允许 1 到 100，并保持 service.py 的接口。"
+allowed_changes = ["validator.py"]
+required_changes = ["validator.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "cross_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复数量校验，只允许 1 到 100，并保持 service.py 的接口。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

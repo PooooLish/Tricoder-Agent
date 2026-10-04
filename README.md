@@ -89,6 +89,27 @@ flowchart LR
 
 斜杠命令只在本地处理，不会发送给 Provider；普通任务才进入 Agent、Provider 与工具运行时组成的循环。
 
+阅读 Agent 执行代码时建议按以下顺序：
+
+1. `tricoder/agent.py`：稳定公开门面、同步/异步入口与兼容导出；
+2. `tricoder/engine/loop.py`：单任务的准备、规划、Provider、工具批次和收尾编排；
+3. `tricoder/engine/state.py`：仅在本次任务内存活的权威可变状态；
+4. `tricoder/engine/tool_batch.py`：串行工具执行、首失败停止和剩余结果配对；
+5. `tricoder/engine/finalization.py`：可信状态发布、失败历史回退和公开结果组装。
+
+其余运行时模块按职责归入四个轻量子包：`tricoder.process` 管理受控子进程与环境，
+`tricoder.workspace` 管理工作区锁、验证证据、内容快照与任务前门禁，
+`tricoder.session` 管理 Session 独占、SQLite 存储和生命周期，
+`tricoder.presentation` 管理斜杠命令、审批等待、终端、Shell 与 TUI。
+包级 `__init__.py` 不聚合导入重量级实现；例如只使用会话存储不会加载 Agent 或 TUI。
+旧的根模块导入仍由显式薄兼容层支持，但项目内部和新代码应使用上述规范路径。
+完整迁移表、依赖方向和兼容边界见
+[`docs/framework/module-layout.md`](docs/framework/module-layout.md)。
+
+Provider 完整响应收集与 round 0 规划位于 `tricoder/engine/provider_request.py`，观察/审计辅助位于 `tricoder/engine/telemetry.py`；消息回合处理位于 `tricoder/context/history.py`，运行时压缩和保存候选共用 `tricoder/context/coordinator.py`。`AgentRunState` 每次调用独立创建，不跨任务或 Agent 实例共享；结构化记忆只注入临时 Provider 请求视图，原始会话历史仍单独保存。Session 锁、工作区锁和任务前快照门禁仍由现有宿主层持有，本轮拆分没有在 Agent 内重复获取或提前释放这些资源。
+
+记忆协调器不接收或修改 `AgentRunState`：Runner 把当前 Session 历史、完整固定前缀和工具定义装配成不可变 `MemoryStepInput`，协调器返回只包含记忆历史、候选、调用/用量增量和警告的 `MemoryStepResult`。每次调用另有独立的异常进度快照；Runner 在统一 `finally` 中恰好合并一次，因此第一批已审计压缩不会因第二批失败或取消而丢失，未通过审计的候选也不会提前发布。文件状态、验证证据、`unknown_effects`、业务用量和工具计数不属于该结果，不能被摘要过程覆盖。仓库测试还会确定性交错两个独立 Agent，检查消息、候选、业务/记忆用量与取消令牌互不污染；这不代表支持同一个 `CodingAgent` 实例并发调用。
+
 ## 配置与密钥安全
 
 将 `.env.example` 复制为仅供本机使用的 `.env.local`，再在自己的编辑器中填写所选服务商的 API Key。不要将真实 Key 写入 `.tricoder.toml`、`.env.example`、日志、SQLite 数据库或 Git；也不要把 `.env.local` 提交到版本库。可以用 `--env-file` 显式指定密钥文件；进程环境变量的优先级更高。
@@ -296,7 +317,7 @@ tricoder
 tricoder chat --provider deepseek --workspace D:\path\to\project
 ```
 
-裸 `tricoder` 使用当前目录作为工作区；`tricoder chat` 支持 `run` 的工作区、Provider、模型、密钥文件、审计目录、上下文预算、轮数、超时、只读与颜色选项，但没有任务位置参数。
+裸 `tricoder` 使用当前目录作为工作区；`tricoder chat` 支持 `run` 的工作区、Provider、模型、密钥文件、审计目录、上下文预算、轮数、超时、只读与颜色选项，但没有任务位置参数。两者默认先进入不占用 Session 锁、也不新增数据库行的“新会话”入口；首次非空普通任务才创建并锁定一个独立 UUID Session，名称由受控时间和 ID 前缀生成，不包含任务正文。`/session new <名称>` 也可显式创建，`/session` 可选择并锁定历史会话。
 
 基于 Textual 的本地 TUI（组件化消息流、模态审批，安全边界与 `chat` 一致）：
 
@@ -313,8 +334,8 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | 命令 | 行为 |
 | --- | --- |
 | `/help` | 显示命令、参数和示例。 |
-| `/status` | 显示当前 Session、工作区、Provider、模型、只读、验证及上下文状态。 |
-| `/model` | 显示 OpenAI、DeepSeek、GLM 的模型并按序号切换。 |
+| `/status` | 显示入口草稿或当前 Session、工作区、Provider、模型、只读、验证及上下文状态；不会为了展示而创建 Session。 |
+| `/model` | 显示 OpenAI、DeepSeek、GLM 的模型并按序号切换；入口中只修改本终端待用设置。 |
 | `/memory` | 查看当前待保存候选（没有候选时显示运行时记忆）、归档、revision 与保存状态。 |
 | `/memory edit <条目ID>` | 输入新文本、作用域与状态后预览本地修改；确认后只更新对应内存候选，不自动保存。 |
 | `/memory refresh` | 候选覆盖不足时重新调用无工具摘要器；不重跑业务工具、不直接保存，完整候选仍需确认。 |
@@ -324,17 +345,17 @@ python -m tricoder tui --provider deepseek --workspace D:\path\to\project
 | `/clear` | 仅在输入 `y` 或 `yes` 后清除当前 Session 的运行时上下文、旧安全摘要和结构化语义记忆。 |
 | `/diff` | 本地展示当前 Session 最近一次非空任务的正向 unified diff，不发送给 Provider。 |
 | `/undo` | 先本地展示当前 Session 最近一次非空任务的完整反向 unified diff；仅在输入 `y` 或 `yes` 后尝试撤销整组变更。任何外部内容、权限模式或文件身份冲突都会拒绝全部写入；`--read-only` 会在预览或确认前拒绝撤销。 |
-| `/session` | 列出全部 Session，并按序号选择。 |
+| `/session` | 列出全部 Session，以“名称＋可区分 ID 前缀”展示并用完整 UUID 选择。 |
 | `/session new <名称>` | 用当前工作区、Provider 和模型创建并切换到新 Session。 |
 | `/session current` | 显示当前 Session 的详细信息。 |
 | `/session rename <名称>` | 重命名当前 Session。 |
-| `/permission` | 查看当前权限级别（strict / relaxed / fullaccess），级别随会话记忆持久化，重启或切换会话自动恢复。 |
+| `/permission` | 查看当前权限级别（strict / relaxed / fullaccess）；入口中修改首次任务的待用权限，真实 Session 中随会话记忆持久化。 |
 | `/permission relaxed` | 切换为 relaxed：仅不返回文件正文的 Git 元数据查询（受限的 `status`、`diff --stat`、`diff --name-only`）自动放行；`show`、`log`、补丁 diff 及一切能执行代码的命令继续要求人工审批；文件写入仍人工审批。 |
 | `/permission fullaccess` | 切换为 fullaccess：放行全部非危险工具（文件写入与命令自动执行）；**这不是进程沙盒**——命令仍受 `CommandPolicy` 白名单、`--read-only`、敏感路径与 git 仓库根边界约束，未来 `delete_file` 等破坏性工具加入危险集合后仍审批。 |
 | `/permission strict` | 恢复严格模式：写操作与命令执行均需人工审批。 |
 | `/exit` | 保存安全记忆并退出。 |
 
-`/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先构建并验证目标配置、策略、工具和 Agent；任何一步失败都会保留原 Session 和原工作区。
+`/session` 切换到其他工作区时会显示目标绝对路径，必须明确输入 `y` 或 `yes` 才会继续。切换会先取得目标 Session 的跨进程独占锁，再构建并验证目标配置、策略、工具和 Agent；目标被占用时入口仍可继续使用，活动会话则保留原 Session 及其锁。构建失败或旧记忆保存失败同样不会发生部分切换。切换成功后释放旧 Session，并丢弃其完整对话、未保存的语义记忆候选与撤销账本；切回时重新读取持久化状态。需要保留语义记忆时，请在切换前预览并确认 `/memory save`。
 
 `/clear` 不删除 Session，不会改动目标工作区中的文件，也保留 Provider、模型、工作区、修改文件元数据、验证/审批安全状态和审计记录；它会清除当前会话的消息历史、可持久化摘要、结构化语义记忆，以及该 Session 的临时大型工具结果。语义记忆清除失败时不会恢复旧内容，本进程会标记“持久化清除待重试”并阻止 `/memory save`、编辑和旧记忆加载。
 
@@ -420,6 +441,56 @@ I01–I07 已用七条独立公共流程串联验证：失败补丁的残留与�
 
 源码快照以及本地生成的正向/反向 diff 不会写入 SQLite、JSONL 审计记录或发送给 Provider。`apply_patch` 的补丁文本由 Provider 生成并作为原生工具调用参数进入当前进程的消息上下文；同一任务继续推理时，它可能随后续轮次的消息历史再次发送给 Provider，但不会写入 SQLite 或 JSONL 审计记录。内存账本总预算为 2,000,000 个字符，进程重启后历史即消失。MVP 不提供 `/redo`、多级撤销、按历史记录选择撤销、持久化撤销历史，也不依赖 Git；`apply_patch` 同样不支持文件删除或重命名补丁。
 
+## 工作区任务锁与代码快照门禁
+
+TriCoder 对同一个规范工作区根实施任务级跨进程互斥。工作区锁与 Session 锁相互独立：
+不同 Session、不同会话数据库、单次 `run`、Shell/TUI、撤销和 Eval 只要指向同一根目录，
+同一时刻只能有一个任务进入扫描、确认、模型执行、验证和资源清理阶段。空闲初始入口和空闲
+Session 不占用工作区锁；父子目录仍被视为不同工作区，因此并发协作时必须选择完全相同的根。
+
+每个 Session 在当前进程内维护独立的完整代码基线。任务开始时取得锁并做有界全量扫描：
+
+- 快照无变化时直接执行。
+- 有变化时显示新增、修改、删除或类型变化的完整分页差异；每一页都必须用 `y` 或 `yes`
+  明确确认。确认后再次完整扫描；如果代码又变化，旧确认立即失效并重新展示。
+- 权限错误、不稳定、特殊文件、取消或任何扫描上限导致的覆盖不完整都会阻止任务；
+  `fullaccess`、自动命令审批、只读任务和无交互入口都不能跳过该门禁。
+
+默认上限是 5000 个条目、单文件 2 MiB、总读取 64 MiB、可缓存文本 16 MiB、10 秒和
+32 层目录深度。二进制仅展示路径、类型和大小等元数据，不缓存正文。敏感路径、`.git`、
+`.venv`、常见缓存和精确控制目录 `runtime/tricoder-control/` 会在读取前排除；普通用户
+`runtime/` 代码仍在快照范围内。基线及用于 diff 的旧文本只驻当前进程内存，不写入
+SQLite、审计日志或 Provider 消息；切换、关闭或重启后不会恢复。恢复旧 Session 时如果
+缺少内存基线，TriCoder 会明确说明无法比较重启期间的历史修改，并要求确认以当前完整扫描
+初始化，不能静默重建基线。
+
+发现外部变化会让不再匹配当前代码版本的旧验证证据失效，并向 Agent 添加仅含安全相对路径
+与变化类型的临时提示；不会自动清空、改写或批准语义记忆、权限、`unknown_effects` 或撤销
+冲突。任务结束后会再次扫描，只有成功结果及内置变更账本能够完整解释的状态才成为该
+Session 的新基线；取消、失败、扫描异常、taint 或未知外部修改会保留为下次任务待确认差异。
+撤销同样先持锁预览并绑定快照，确认提交前再次扫描，陈旧预览会被拒绝。
+
+锁文件位于工作区的 `runtime/tricoder-control/workspace.lock`，并辅以用户目录
+`~/.tricoder/workspace-locks-v1/` 下按规范工作区散列的守卫锁；Linux 还会先取得不依赖
+文件系统路径的抽象 Unix socket 内核锁。所有锁名都不含任务、源码、Session 或凭据，解锁后
+文件会保留，不要通过删除它们来“解锁”。持有期间会复核工作区、控制目录、内部锁以及外部
+守卫的打开对象和命名路径身份。真正执行前还会写入不含任务、Session 或 PID 的
+`active-task.json`；进程
+崩溃后操作系统锁会释放，但该标记会继续阻止任务，因为 TriCoder 不能据此证明遗留子进程
+已结束。只有在人工确认不存在活动 TriCoder/子进程且受管资源已清理后，维护代码才可调用：
+
+```python
+from pathlib import Path
+from tricoder.workspace.lock import WorkspaceLock
+
+WorkspaceLock.recover_stale_activity(Path(r"D:\path\to\workspace"), confirmed=True)
+```
+
+该机制是本机协作与一致性门禁，不是操作系统沙箱；它不阻止编辑器、旧版 TriCoder、恶意
+程序或其他不遵守协议的进程写文件，只会在受控边界发现部分外部变化并阻止/要求重新确认。
+Windows 已做真实本地子进程竞争测试；Linux 抽象 socket 与其他 POSIX 分支尚未在真实对应
+平台验收，macOS 等不支持 Linux 抽象 socket 的平台仍依赖协作文件锁。网络文件系统未验证。
+
 ## Session 数据与恢复
 
 SQLite 数据库位于系统状态目录，不会写入目标工作区：
@@ -427,11 +498,15 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 - Windows：`%LOCALAPPDATA%\TriCoder\sessions.db`；若未设置 `LOCALAPPDATA`，使用 `%USERPROFILE%\AppData\Local\TriCoder\sessions.db`。
 - 其他系统：`$XDG_STATE_HOME/tricoder/sessions.db`；若未设置 `XDG_STATE_HOME`，使用 `~/.local/state/tricoder/sessions.db`。
 
-每个 Session 独立保存名称、工作区绝对路径、Provider、模型、时间戳、修改文件路径、验证状态和受限长度的安全摘要。进程运行期间，每个已打开 Session 有独立的完整消息上下文；默认重启后只恢复旧安全摘要和结构化执行元数据。只有显式启用 `persistence = "reviewed_summary"` 并确认 `/memory save` 后，才会额外恢复经审阅的结构化目标、约束、决策与待办；Agent 如需源码，仍必须重新调用读取工具。
+每个 Session 独立保存名称、工作区绝对路径、Provider、模型、时间戳、修改文件路径、验证状态和受限长度的安全摘要。当前激活的 Session 在进程内保留完整消息上下文；切换离开或重启后，默认只恢复旧安全摘要和结构化执行元数据。只有显式启用 `persistence = "reviewed_summary"` 并确认 `/memory save` 后，才会额外恢复经审阅的结构化目标、约束、决策与待办；Agent 如需源码，仍必须重新调用读取工具。
+
+同一本地数据库中的一个真实 Session 同时只允许一个 Runtime/终端占用，激活后即使空闲等待输入也持锁。默认“新会话”入口没有 Session ID、没有锁，也不自动恢复 latest；多个终端可同时停在入口。首次普通任务会各自创建不同 UUID。显式选择同一个真实 Session 时，后来的终端会提示“该会话已被其他终端占用”并保留入口；不会自动接管、恢复其他记录或给名称恰好为 `default` 的历史 Session 豁免锁。Session 所有权之外，实际任务还必须竞争上节所述的工作区锁，因此不同 Session 或不同数据库不能在同一工作区同时执行。Session 锁文件位于数据库同级的 `session-locks/`，文件名由数据库路径和 Session ID 散列生成，不保存消息、密钥或 PID。Windows 使用非阻塞字节区间锁，POSIX 使用 `flock`；不要删除锁文件来“解锁”。文件存在不代表占用，进程退出由操作系统释放锁，不需要超时抢占。
+
+正常退出先完成任务取消、资源清理及持久化再释放 Session；清理未完成时不会提前交出所有权。程序内使用 `SessionRuntime` 的调用方必须在结束时调用 `close()`，返回 `False` 表示保存失败或仍有任务/资源待收尾。该保护限于本机、使用同一数据库路径且遵守此协议的 TriCoder 实例，不覆盖旧版进程、直接数据库写入、网络文件系统或进程崩溃后脱离管理的外部子进程。Windows 双进程用例已验证，POSIX 分支仍需对应平台验证。
 
 旧会话持久化只保存受控结构化元数据，不保存任何用户任务或模型 `RunResult.summary` 的自由文本原文。无论内容是空白、中英文自然语言、源码、命令、工具输出、Provider 原始响应、动作 JSON、认证信息还是完整消息历史，SQLite 中的 `requirements_summary` 都只保存长度占位；运行结果只保存固定格式的成功/失败、修改文件数量和规范化验证状态。成功编辑或创建的文件路径由工作区策略解析后以规范相对路径保存，不会保存原始绝对路径或 `..` 形式。可选的 `conversation_memory` 表仅保存用户明确预览确认过的结构化语义字段和消息序号，不保存源码正文、原始工具输出、权限、审批、验证证据或 `unknown_effects`。关闭持久化后不会读取该表，但也不会隐式删除已保存候选。
 
-完整消息上下文仅保留在当前进程的 Session 中，CLI 仍会在当前轮显示 `RunResult.summary`；重启后只能恢复上述结构化元数据和长度占位。该边界仍需配合工作区权限和本地存储权限管理。
+完整消息上下文仅保留在当前进程的激活 Session 中，CLI 仍会在当前轮显示 `RunResult.summary`；切换离开或重启后只能恢复上述已持久化内容。撤销历史同样不跨 Session 切换保留。该边界仍需配合工作区权限和本地存储权限管理。
 
 大型工具结果不进入 SQLite。默认暂存目录与数据库位于同一状态根下的 `runtime/tool-results/session_<hash>/`，不位于目标源码工作区；文件名与引用均由系统生成。模型可用 `read_tool_result` 按引用和字符偏移分段回读当前 Session 的结果，不能传入文件路径。单项默认最多 2 MB、单 Session 默认最多 10 MB；启动时会清理上次进程遗留内容，`/clear` 只清理当前 Session。JSONL 审计只记录引用、字节数和 SHA-256，不记录正文或绝对路径。
 
@@ -469,7 +544,7 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 1. 在 `src/tricoder/config.py` 注册默认 Key 环境变量、HTTPS Base URL、模型和允许的官方 Base URL。
 2. 在 `src/tricoder/providers.py` 声明 `ProviderCapabilities` 并注册工厂。若不是 OpenAI-compatible 协议，实现 `ModelProvider.complete(messages, tools)`。
 3. `complete()` 返回归一化的 `ProviderResponse`（其中包含 `ToolCall`）；厂商响应无法解析或不满足协议时抛出 `ProviderProtocolError`。不要把厂商原始响应或认证头传给 Agent、日志或终端。
-4. 在 `src/tricoder/cli.py` 的 `--provider` choices，以及 `src/tricoder/ui.py` 的 Provider label、帮助和选择列表等公开注册点加入名称。
+4. 在 `src/tricoder/cli.py` 的 `--provider` choices，以及 `src/tricoder/presentation/console.py` 的 Provider label、帮助和选择列表等公开注册点加入名称。
 5. 为配置、请求序列化、响应解析、协议错误、UI/CLI 脱敏输出与交互选择补测试。
 
 只有在适配器确实验证了原生工具调用时才声明 `native_tool_calling=True`。`legacy_json` 是显式兼容回滚路径，不应成为新 Provider 绕过结构化响应适配的默认实现。
@@ -484,19 +559,53 @@ verifier，评测本地 Coding Agent 的确定性完成条件。默认会真实�
 python -m tricoder eval evals/smoke --no-color
 python -m tricoder eval evals/smoke --provider deepseek --no-color
 python -m tricoder eval evals/smoke --provider glm --case fix-subtract --no-color
+python -m tricoder eval evals/smoke --repeat 3 --no-color
 ```
 
 先校验评测定义且不读取 Key、不构建 Provider 或创建运行状态时，使用离线 dry-run：
 
 ```powershell
 python -m tricoder eval evals/smoke --dry-run --no-color
+python -m tricoder eval --experiment evals/quality-v1/experiment-quality-baseline.toml --dry-run --no-color
 ```
+
+`evals/quality-v1/` 是版本化的 30 题自建题库，包含单文件、跨文件、恢复、记忆、
+安全和交付六类，每类 5 题；dev/holdout 为 18/12。两个示例实验清单中的 model 是
+占位符：dry-run 可直接使用；真实运行前必须在本地副本中换成明确模型，并确认次数、
+总时间和费用预算。v2 题库按 `execution_kind` 把 quality 与 contract 条件匹配，fake
+工程契约结果不会并入真实模型质量成功率。
+
+实验会在开始时冻结 case/condition/repetition 清单，跨条件轮换执行；每次重复都重建
+工作副本、Provider、Agent 和上下文，只有同一个多轮任务内部保留上下文。预算耗尽、
+取消和未执行条目仍写入分母。每个 trial 完成后原子保存，最终报告分别给出代码正确、
+正常 finish、端到端完成、恢复、安全、记忆、效率、业务 token 与摘要 token；缺失用量
+保持 unknown，未配置本地价格表时费用为 `null`。
+
+多轮 `user_turn` 走 `CodingAgent.run_with_context`；保存、重启、切换和撤销等固定控制
+步骤走临时 SQLite 与 `SessionRuntime` 公开接口。实验条件的记忆开关会真实传入 Agent，
+报告记录摘要是否触发、次数和独立用量。故障注入只允许注册 ID，不加载任意 Python 或
+shell 插件；Provider 传输重试、工具错误后的重规划和审批拒绝分别记录。Eval 重启会在
+关闭旧 Runtime 前保存完整 Session ID，并在新 Runtime 中显式恢复同一 ID；按名称切换
+若匹配到多条记录会报歧义，必须改用完整 UUID，不能静默选择第一条。
+
+比较两个单条件 v2 结果时，必须显式声明允许变化的实验变量：
+
+```powershell
+python -m tricoder eval-compare runtime/evals/<baseline>/result.json runtime/evals/<candidate>/result.json --allow-variable model --no-color
+python -m tricoder eval-compare runtime/evals/<memory-off>/result.json runtime/evals/<memory-on>/result.json --allow-variable memory --no-color
+```
+
+比较器默认要求题库、隐藏 verifier、任务、预算、审批策略、环境和代码指纹一致；代码
+对照只有显式加入 `--allow-variable code` 才允许。报告保留未配对样本、原始分子分母、
+百分点变化、由成功转失败/由失败转成功、耗时与失败分布。首版不做显著性推断，也不
+内置实时价格。
 
 真实运行的隔离工作副本、结构化结果和 Markdown 报告位于
 `runtime/evals/<run-id>/`。Eval 使用的 `fullaccess` 仅代表 TriCoder 自动批准策略
 允许的工具，**不是操作系统沙盒**；命令白名单、工作区边界和敏感环境变量过滤仍然
 生效。内置 smoke suite 的自动测试只验证离线框架与 fixture 合约，不代表已完成三家
-真实 Provider 的质量验证；真实运行会使用本机配置并可能产生费用。
+真实 Provider 的质量验证；30 题的正确/错误 fixture 验证和 fake 故障测试同样不能说明
+Agent 效果已提升。真实运行会使用本机配置并可能产生费用。
 
 ## 测试
 

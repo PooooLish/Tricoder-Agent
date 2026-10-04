@@ -1,0 +1,30 @@
+id = "mm-session-isolation"
+title = "mm-session-isolation"
+task = "两个 Session 的值必须隔离，修复 value_for。"
+allowed_changes = ["sessions.py"]
+required_changes = ["sessions.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "memory"
+split = "holdout"
+execution_kind = "contract"
+scorers = ["behavior_assertions"]
+faults = ["none"]
+dimensions = ["behavior_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_session_isolated"]
+
+[[steps]]
+kind = "user_turn"
+content = "Session main 的值是 A。"
+
+[[steps]]
+kind = "switch_session"
+target = "secondary"
+
+[[steps]]
+kind = "user_turn"
+content = "Session secondary 的值是 B；修复 sessions.py 保持隔离。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

@@ -1,0 +1,22 @@
+id = "rc-read-once"
+title = "rc-read-once"
+task = "读取 parser.py 并修复 parse_number；首次读取会被注入一次可恢复失败。"
+allowed_changes = ["parser.py"]
+required_changes = ["parser.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "recovery"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["tool_transient_read"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "fault_triggered", "recovered"]
+
+[[steps]]
+kind = "user_turn"
+content = "读取 parser.py 并修复 parse_number；首次读取会被注入一次可恢复失败。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

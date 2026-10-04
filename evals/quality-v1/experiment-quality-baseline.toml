@@ -1,0 +1,18 @@
+schema_version = 1
+experiment_id = "quality-v1-baseline"
+suite = "."
+repetitions = 3
+split = "all"
+max_trials = 60
+time_budget_seconds = 21600
+seed = 23
+
+[[conditions]]
+id = "quality-baseline"
+provider = "openai"
+model = "replace-with-explicit-model"
+execution_kind = "quality"
+memory_compaction = "off"
+memory_persistence = "off"
+scorers = ["hidden_verifier"]
+faults = ["none"]

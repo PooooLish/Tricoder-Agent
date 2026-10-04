@@ -1,0 +1,26 @@
+id = "mm-todo-once"
+title = "mm-todo-once"
+task = "完成过的待办不得重复返回，修复 pending_once。"
+allowed_changes = ["tasks.py"]
+required_changes = ["tasks.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_stale_state_avoided"]
+
+[[steps]]
+kind = "user_turn"
+content = "待办 a 已完成，不要重复执行。"
+
+[[steps]]
+kind = "user_turn"
+content = "修复 tasks.py，使完成项和重复项不会再次出现。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

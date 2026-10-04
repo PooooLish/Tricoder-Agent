@@ -9,7 +9,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tricoder.evals.report import report_as_dict, render_markdown, write_reports
+from tricoder.evals.report import (
+    experiment_report_as_dict,
+    normalize_report_payload,
+    report_as_dict,
+    render_markdown,
+    write_reports,
+)
+from tricoder.evals.models import ExperimentRunReport, TrialDimensions, TrialKey, TrialRecord
 from tricoder.evals.runner import EvalCaseResult, EvalRunReport, VerificationResult
 from tricoder.models import TokenUsage
 
@@ -199,6 +206,52 @@ class EvalReportTests(unittest.TestCase):
                 write_reports(self._report_with_unknown_usage_and_failure(), self.run_dir)
 
         self.assertFalse(list(self.run_dir.glob("*.tmp")))
+
+    def test_v1_payload_adapts_missing_dimensions_as_unavailable(self) -> None:
+        """Reading a legacy report must not invent dimensional successes or zero usage."""
+        legacy = report_as_dict(self._report_with_unknown_usage_and_failure())
+
+        normalized = normalize_report_payload(legacy)
+
+        self.assertEqual(2, normalized["schema_version"])
+        self.assertEqual(1, normalized["source_schema_version"])
+        self.assertEqual("unavailable", normalized["trials"][0]["dimensions"])
+        self.assertIsNone(normalized["trials"][0]["usage"]["input_tokens"])
+        self.assertEqual("legacy", normalized["trials"][0]["condition_id"])
+
+    def test_quality_and_contract_metrics_are_never_combined(self) -> None:
+        records = (
+            TrialRecord(
+                TrialKey("quality", "code", 1),
+                "quality",
+                "passed",
+                TrialDimensions(True, True, True, True),
+                category="single_file",
+            ),
+            TrialRecord(
+                TrialKey("contract", "safety", 1),
+                "contract",
+                "passed",
+                TrialDimensions(
+                    agent_completed=True,
+                    scope_compliant=True,
+                    cleanup_confirmed=True,
+                    behavior_correct=True,
+                ),
+                category="safety",
+            ),
+        )
+        report = ExperimentRunReport(
+            "run", "experiment", "suite", "2026-09-23T00:00:00+00:00",
+            10, 2, True, records,
+        )
+
+        payload = experiment_report_as_dict(report)
+
+        self.assertEqual("mixed_not_aggregated", payload["dimensions"])
+        self.assertEqual(1, payload["by_execution_kind"]["quality"]["planned"])
+        self.assertEqual(1, payload["by_execution_kind"]["contract"]["planned"])
+        self.assertEqual(1, payload["by_category"]["safety"]["planned"])
 
 
 if __name__ == "__main__":

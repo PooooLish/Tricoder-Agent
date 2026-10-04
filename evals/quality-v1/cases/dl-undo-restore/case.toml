@@ -1,0 +1,29 @@
+id = "dl-undo-restore"
+title = "dl-undo-restore"
+task = "执行受控修改后撤销，最终 state.py 必须恢复原状态。"
+allowed_changes = ["state.py"]
+required_changes = []
+max_rounds = 8
+max_context_chars = 16000
+category = "delivery"
+split = "holdout"
+execution_kind = "contract"
+scorers = ["behavior_assertions"]
+faults = ["none"]
+dimensions = ["behavior_correct", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "把 VALUE 临时改为 changed。"
+
+[[steps]]
+kind = "undo"
+
+[[steps]]
+kind = "user_turn"
+content = "确认已撤销并正常结束。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

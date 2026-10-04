@@ -21,8 +21,8 @@ from tricoder.models import (
     SessionContext,
     SessionMemory,
 )
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
-from tricoder.sessions import SessionError, SessionStore
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime, SessionRuntimeError
+from tricoder.session.store import SessionError, SessionStore
 
 
 class MemoryPersistenceStoreTests(unittest.TestCase):
@@ -34,6 +34,7 @@ class MemoryPersistenceStoreTests(unittest.TestCase):
         self.database = (self.root / "state" / "sessions.db").resolve()
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def test_initialize_upgrades_synthetic_old_database_without_changing_old_rows(self) -> None:
@@ -265,6 +266,7 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def _runtime(self, persistence: str) -> SessionRuntime:
@@ -288,12 +290,16 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
                 _NoopAgent(),
             )
 
-        return SessionRuntime(
+        runtime = SessionRuntime(
             SessionStore(self.database),
             self.workspace,
             options=RuntimeOptions(),
             active_session_factory=factory,
+            initial_session_id=self.record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(runtime.close)
+        return runtime
 
     def test_reviewed_mode_restores_intent_but_off_mode_does_not_load_it(self) -> None:
         reviewed = self._runtime("reviewed_summary")
@@ -302,6 +308,7 @@ class MemoryPersistenceRuntimeTests(unittest.TestCase):
         self.assertEqual(1, reviewed.current.context.persisted_memory_revision)
         self.assertEqual("未运行", reviewed.current.context.verification)
 
+        reviewed.close()
         off = self._runtime("off")
         self.assertEqual(ConversationMemory(), off.current.context.conversation_memory)
         self.assertEqual(1, off.current.context.next_message_seq)

@@ -1,0 +1,22 @@
+id = "cf-module-interface"
+title = "cf-module-interface"
+task = "修复 formatter 模块接口，使 api.display(first,last) 正常工作。"
+allowed_changes = ["formatter.py"]
+required_changes = ["formatter.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "cross_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 formatter 模块接口，使 api.display(first,last) 正常工作。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

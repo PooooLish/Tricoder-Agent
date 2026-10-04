@@ -46,6 +46,7 @@ import sys
 import tricoder.cli
 import tricoder.config
 import tricoder.session_runtime
+import tricoder.session.runtime
 import tricoder.mcp
 import tricoder.mcp.transport
 from tricoder.mcp import MCPProcessExitEvidence, MCPTransportOutcome, VerifiedStdioTransport
@@ -224,6 +225,7 @@ class MCPColdImportTests(unittest.TestCase):
             "cli": "import tricoder.cli",
             "agent": "from tricoder.agent import CodingAgent",
             "session-runtime": "from tricoder.session_runtime import SessionRuntime",
+            "session-runtime-new": "from tricoder.session.runtime import SessionRuntime",
             "mcp-manager": "from tricoder.mcp.manager import MCPManager",
         }
         for module in (

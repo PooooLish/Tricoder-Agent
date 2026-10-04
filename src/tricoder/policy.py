@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Mapping
 from pathlib import Path
 
-from tricoder.subprocess_env import (
+from tricoder.process.env import (
     filtered_subprocess_env,
     trusted_path_executable,
     trusted_python_executable,
@@ -40,6 +40,7 @@ _SENSITIVE_PATH_PREFIXES = (
     "id_ed25519",
 )
 _SENSITIVE_PATH_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".gpg"})
+_RESERVED_CONTROL_PARTS = ("runtime", "tricoder-control")
 
 
 def is_sensitive_workspace_path(path: str | Path) -> bool:
@@ -62,6 +63,15 @@ def _is_sensitive_path_part(lowered: str) -> bool:
         or lowered.startswith("service-account")
         or lowered.startswith("serviceaccount")
         or Path(lowered).suffix in _SENSITIVE_PATH_SUFFIXES
+    )
+
+
+def _contains_reserved_control_path(parts: tuple[str, ...]) -> bool:
+    lowered = tuple(part.lower() for part in parts)
+    width = len(_RESERVED_CONTROL_PARTS)
+    return any(
+        lowered[index:index + width] == _RESERVED_CONTROL_PARTS
+        for index in range(len(lowered) - width + 1)
     )
 
 
@@ -91,6 +101,8 @@ class WorkspacePolicy:
         candidate = Path(path)
         raw_parts = candidate.parts
         self._check_sensitive_parts(raw_parts)
+        if _contains_reserved_control_path(raw_parts):
+            raise PolicyError("拒绝访问 TriCoder 工作区控制目录")
 
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
@@ -98,7 +110,10 @@ class WorkspacePolicy:
         resolved = candidate.resolve(strict=False)
         if not resolved.is_relative_to(self.workspace):
             raise PolicyError("目标路径超出工作区")
-        self._check_sensitive_parts(resolved.relative_to(self.workspace).parts)
+        relative_parts = resolved.relative_to(self.workspace).parts
+        self._check_sensitive_parts(relative_parts)
+        if _contains_reserved_control_path(relative_parts):
+            raise PolicyError("拒绝访问 TriCoder 工作区控制目录")
         if must_exist and not resolved.exists():
             raise WorkspacePathNotFoundError(f"目标路径不存在：{path}")
         return resolved

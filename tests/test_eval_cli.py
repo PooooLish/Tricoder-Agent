@@ -65,6 +65,25 @@ class EvalCliTests(unittest.TestCase):
         self.assertEqual(Path("evals/smoke"), args.suite)
         self.assertEqual("openai", args.provider)
         self.assertFalse(args.dry_run)
+        self.assertEqual(1, args.repeat)
+        self.assertIsNone(args.experiment)
+
+    def test_eval_compare_parser_requires_explicit_allowed_variables(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "eval-compare",
+                "baseline.json",
+                "candidate.json",
+                "--allow-variable",
+                "model",
+                "--allow-variable",
+                "memory",
+            ]
+        )
+
+        self.assertEqual("eval-compare", args.command)
+        self.assertEqual(Path("baseline.json"), args.baseline)
+        self.assertEqual(["model", "memory"], args.allow_variable)
 
     def test_eval_parser_exposes_only_eval_specific_runtime_options(self) -> None:
         """Adding workspace/read-only/audit controls to eval would break its boundary."""
@@ -131,6 +150,49 @@ class EvalCliTests(unittest.TestCase):
         self.assertFalse((self.root / "runtime").exists())
         self.assertIn("case-one", output.getvalue())
         self.assertNotIn("TASK-SECRET-SENTINEL", output.getvalue())
+
+    def test_experiment_dry_run_freezes_matrix_without_provider_or_runtime(self) -> None:
+        """Experiment planning must remain a credential-free, side-effect-free operation."""
+        manifest = self.root / "experiment.toml"
+        manifest.write_text(
+            "schema_version = 1\n"
+            'experiment_id = "offline"\n'
+            'suite = "suite"\n'
+            "repetitions = 2\n"
+            'split = "all"\n'
+            "max_trials = 10\n"
+            "time_budget_seconds = 60\n"
+            "seed = 1\n\n"
+            "[[conditions]]\n"
+            'id = "contract"\n'
+            'provider = "fake"\n'
+            'model = "offline"\n'
+            'execution_kind = "contract"\n'
+            'memory_compaction = "off"\n'
+            'memory_persistence = "off"\n'
+            'scorers = ["hidden_verifier"]\n'
+            'faults = ["none"]\n',
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        provider_calls: list[str] = []
+        os.chdir(self.root)
+
+        with patch(
+            "tricoder.evals.service.load_config",
+            side_effect=AssertionError("dry-run must not load config"),
+        ):
+            exit_code = main(
+                ["eval", "--experiment", str(manifest), "--dry-run", "--no-color"],
+                environ={},
+                provider_factory=lambda *_args: provider_calls.append("called"),  # type: ignore[arg-type]
+                output=output,
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([], provider_calls)
+        self.assertFalse((self.root / "runtime").exists())
+        self.assertIn("trials=2", output.getvalue())
 
     def test_eval_command_boundary_redacts_unexpected_exception(self) -> None:
         """An unexpected service exception must not escape or expose its text."""

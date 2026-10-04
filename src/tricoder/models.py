@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError
 
 if TYPE_CHECKING:
-    from tricoder.verification import VerificationEvidence, WorkspaceSnapshot
+    from tricoder.workspace.verification import VerificationEvidence, WorkspaceSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +405,9 @@ class SessionContext:
     latest_completed_task_seq: int = 0
     persisted_memory_revision: int | None = None
     memory_pending_clear: bool = False
+    # 仅用于下一次 Provider 请求的本地可信提醒；Agent 返回时必须清空，
+    # 不进入持久化摘要、语义记忆或历史消息。
+    workspace_change_notice: str = ""
 
     def __post_init__(self) -> None:
         if type(self.next_message_seq) is not int or self.next_message_seq <= 0:
@@ -420,6 +423,8 @@ class SessionContext:
             or self.persisted_memory_revision < 0
         ):
             raise ValueError("已持久化记忆 revision 必须是非负整数或 None")
+        if not isinstance(self.workspace_change_notice, str):
+            raise ValueError("工作区变化提醒必须是字符串")
 
 
 def _empty_conversation_memory() -> Any:

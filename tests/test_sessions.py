@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tricoder.models import SessionMemory
-from tricoder.sessions import (
+from tricoder.session.store import (
     SessionError,
     SessionStore,
     default_sessions_db,
@@ -195,7 +195,7 @@ class SessionStoreTests(unittest.TestCase):
 class SessionPathAndSafetyTests(unittest.TestCase):
     def test_default_sessions_db_uses_windows_local_app_data(self) -> None:
         """防止 Windows 将状态数据库误写入当前工作区。"""
-        with patch("tricoder.sessions._is_windows", return_value=True):
+        with patch("tricoder.session.store._is_windows", return_value=True):
             path = default_sessions_db({"LOCALAPPDATA": "D:/state"})
 
         self.assertEqual(Path("D:/state/TriCoder/sessions.db").resolve(), path)
@@ -203,8 +203,8 @@ class SessionPathAndSafetyTests(unittest.TestCase):
     def test_windows_fallback_prefers_supplied_userprofile(self) -> None:
         """防止注入环境缺少 LOCALAPPDATA 时误用当前进程账户的主目录。"""
         with (
-            patch("tricoder.sessions._is_windows", return_value=True),
-            patch("tricoder.sessions.Path.home", return_value=Path("Z:/process-home")),
+            patch("tricoder.session.store._is_windows", return_value=True),
+            patch("tricoder.session.store.Path.home", return_value=Path("Z:/process-home")),
         ):
             path = default_sessions_db({"USERPROFILE": "D:/users/test-user"})
 
@@ -215,7 +215,7 @@ class SessionPathAndSafetyTests(unittest.TestCase):
 
     def test_default_sessions_db_uses_xdg_state_home(self) -> None:
         """防止非 Windows 平台忽略 XDG 状态目录。"""
-        with patch("tricoder.sessions._is_windows", return_value=False):
+        with patch("tricoder.session.store._is_windows", return_value=False):
             path = default_sessions_db({"XDG_STATE_HOME": "/var/state"})
 
         self.assertEqual(Path("/var/state/tricoder/sessions.db").resolve(), path)

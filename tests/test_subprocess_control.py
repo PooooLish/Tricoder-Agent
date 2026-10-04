@@ -13,12 +13,12 @@ from unittest import mock
 from types import SimpleNamespace
 
 from tricoder.core.cancellation import CancellationError, CancellationToken
-from tricoder.subprocess_control import run_bounded_process
+from tricoder.process.control import run_bounded_process
 
 
 class BoundedProcessTests(unittest.TestCase):
     def test_cleanup_exception_does_not_replace_original_business_exception(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         primary = ValueError("primary synthetic")
         process = mock.Mock(returncode=None)
         with mock.patch.object(control.subprocess, "Popen", return_value=process), \
@@ -30,7 +30,7 @@ class BoundedProcessTests(unittest.TestCase):
         self.assertIs(primary, caught.exception)
 
     def test_failed_job_close_keeps_handle_for_owner_retry(self):
-        from tricoder.subprocess_control import _WindowsJob
+        from tricoder.process.control import _WindowsJob
         closed = []
         outcomes = iter((False, True))
         def close(handle):
@@ -45,7 +45,7 @@ class BoundedProcessTests(unittest.TestCase):
     def test_event_driven_cancellation_reaps_parent_and_both_descendant_kinds(self):
         import ctypes
         from ctypes import wintypes
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
 
         ready = threading.Event()
         pids = []
@@ -118,7 +118,7 @@ class BoundedProcessTests(unittest.TestCase):
                         kernel.CloseHandle(handle)
 
     def test_cleanup_uses_one_deadline_for_tree_and_both_readers(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         clock = [0.0]
         budgets = []
         process = mock.Mock(returncode=0)
@@ -142,7 +142,7 @@ class BoundedProcessTests(unittest.TestCase):
         self.assertLessEqual(sum(budgets), 1.0, "树清理耗费后，每个 reader 不能重获完整预算")
 
     def test_cancel_cleanup_failure_keeps_cancellation_primary(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         token = CancellationToken()
         token.cancel()
         process = mock.Mock(returncode=None)

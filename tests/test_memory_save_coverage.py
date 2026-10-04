@@ -19,8 +19,8 @@ from tricoder.models import (
     ToolDefinition,
     ToolResult,
 )
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime
-from tricoder.sessions import SessionStore
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+from tricoder.session.store import SessionStore
 
 
 class _FinishProvider:
@@ -225,7 +225,7 @@ class MemorySavePreviewCoverageTests(unittest.TestCase):
         self.database = (self.root / "state" / "sessions.db").resolve()
         store = SessionStore(self.database, id_factory=lambda: "session-save")
         store.initialize(self.workspace)
-        store.create("save", self.workspace, "openai", "test")
+        self.record = store.create("save", self.workspace, "openai", "test")
         config = AppConfig(
             workspace=self.workspace,
             provider=ProviderConfig(
@@ -249,9 +249,13 @@ class MemorySavePreviewCoverageTests(unittest.TestCase):
             self.workspace,
             options=RuntimeOptions(),
             active_session_factory=factory,
+            initial_session_id=self.record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(self.runtime.close)
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def test_preview_saves_review_candidate_but_keeps_recent_runtime_history(self) -> None:
@@ -296,6 +300,7 @@ class MemorySavePreviewCoverageTests(unittest.TestCase):
                 self.runtime.current.record.id
             ),
         )
+        self.runtime.close()
         restarted = SessionRuntime(
             SessionStore(self.database),
             self.workspace,
@@ -307,7 +312,10 @@ class MemorySavePreviewCoverageTests(unittest.TestCase):
                 self.runtime.current.config,
                 object(),
             ),
+            initial_session_id=self.record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(restarted.close)
         self.assertEqual(
             candidate,
             restarted.current.context.conversation_memory,

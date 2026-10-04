@@ -17,8 +17,8 @@ from tricoder.models import (
     ToolDefinition,
     ToolResult,
 )
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime
-from tricoder.sessions import SessionStore
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+from tricoder.session.store import SessionStore
 
 
 class _FinishProvider:
@@ -138,6 +138,7 @@ class SessionMemoryEndToEndTests(unittest.TestCase):
         self.providers: list[_FinishProvider] = []
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def _config(self, provider: str) -> AppConfig:
@@ -180,13 +181,19 @@ class SessionMemoryEndToEndTests(unittest.TestCase):
         def load_config(**kwargs):  # type: ignore[no-untyped-def]
             return self._config(kwargs["provider"])
 
-        return SessionRuntime(
+        record = store.latest_for_workspace(self.workspace)
+        self.assertIsNotNone(record)
+        runtime = SessionRuntime(
             store,
             self.workspace,
             options=RuntimeOptions(environ={}),
             active_session_factory=self._factory,
             config_loader=load_config,
+            initial_session_id=record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(runtime.close)
+        return runtime
 
     def test_two_tasks_model_switch_save_restart_isolation_and_clear(self) -> None:
         runtime = self._runtime(self.store)
@@ -232,6 +239,7 @@ class SessionMemoryEndToEndTests(unittest.TestCase):
         restarted_store = SessionStore(
             self.database, id_factory=lambda: "session-isolated"
         )
+        runtime.close()
         restarted = self._runtime(restarted_store)
         self.assertEqual(candidate, restarted.current.context.conversation_memory)
         self.assertIsNone(restarted.current.context.review_memory_candidate)

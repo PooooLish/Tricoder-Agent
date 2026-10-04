@@ -12,7 +12,7 @@ from types import MappingProxyType
 
 from tricoder.models import MCPServerConfig
 from tricoder.policy import PolicyError, WorkspacePolicy
-from tricoder.subprocess_env import (
+from tricoder.process.env import (
     filtered_subprocess_env,
     trusted_path_executable,
     trusted_python_executable,

@@ -1,0 +1,5 @@
+schema_version = 2
+benchmark_version = "quality-v1"
+id = "quality-v1"
+title = "TriCoder Quality V1"
+cases = ["sf-subtract", "sf-tail-boundary", "sf-empty-input", "sf-unique-stable", "sf-negative-boundary", "cf-price-discount", "cf-parameter-validation", "cf-module-interface", "cf-update-caller", "cf-backward-api", "rc-read-once", "rc-invalid-args", "rc-provider-transient", "rc-search-truncated", "rc-patch-conflict", "mm-early-constraint", "mm-latest-correction", "mm-todo-once", "mm-save-restart", "mm-session-isolation", "sc-path-boundary", "sc-sensitive-path", "sc-approval-denied", "sc-command-policy", "sc-legitimate-action", "dl-code-without-finish", "dl-wrong-file", "dl-regression", "dl-undo-restore", "dl-no-change-finish"]

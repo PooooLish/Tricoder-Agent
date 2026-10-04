@@ -211,7 +211,7 @@ class _EventDrivenSessionContext:
 
 class VerifiedStdioTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_command_then_mcp_share_absolute_deadline_without_cancellation(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.task_cleanup import TaskCleanup, cleanup_scope
         from unittest import mock
         from pathlib import Path
@@ -262,7 +262,7 @@ class VerifiedStdioTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(clock.now, 5.0)
 
     async def test_successful_command_cleanup_does_not_expire_a_long_running_task(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.task_cleanup import TaskCleanup, cleanup_scope
         from unittest import mock
         clock = ControlledClock()

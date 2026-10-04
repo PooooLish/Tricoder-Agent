@@ -1,6 +1,6 @@
 import unittest
 
-from tricoder.commands import (
+from tricoder.presentation.commands import (
     CommandError,
     ParsedCommand,
     command_spec,

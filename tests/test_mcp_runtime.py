@@ -204,7 +204,7 @@ class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.registry.has_pending_cleanup)
 
     async def test_normal_task_return_cannot_hide_sticky_cleanup_failure(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.models import RunResult, SessionContext, SessionTurnResult
         from tricoder.task_cleanup import current_cleanup
         (self.workspace / "owned.py").write_text("pass\n", encoding="utf-8")
@@ -244,7 +244,7 @@ class MCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(registry.execute("finish", {"summary": "blocked"}).ok)
 
     async def test_standalone_normal_and_exception_exits_keep_exact_command_cleanup_owner(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         from tricoder.execution_state import ErrorCode
         from tricoder.task_cleanup import current_cleanup
         (self.workspace / "owned.py").write_text("pass\n", encoding="utf-8")

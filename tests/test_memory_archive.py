@@ -14,13 +14,13 @@ from tricoder.context.memory import (
     merge_review_candidate,
 )
 from tricoder.models import AppConfig, MemoryConfig, ProviderConfig, SessionContext
-from tricoder.session_runtime import (
+from tricoder.session.runtime import (
     ActiveSession,
     RuntimeOptions,
     SessionRuntime,
     SessionRuntimeError,
 )
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 
 
 def _archived(index: int, *, text_size: int = 8) -> ArchivedMemoryItem:
@@ -45,7 +45,7 @@ class MemoryArchiveRuntimeTests(unittest.TestCase):
         self.database = (self.root / "state" / "sessions.db").resolve()
         store = SessionStore(self.database, id_factory=lambda: "session-archive")
         store.initialize(self.workspace)
-        store.create("archive", self.workspace, "openai", "test")
+        self.record = store.create("archive", self.workspace, "openai", "test")
         self.config = AppConfig(
             workspace=self.workspace,
             provider=ProviderConfig(
@@ -72,9 +72,13 @@ class MemoryArchiveRuntimeTests(unittest.TestCase):
                 self.config,
                 object(),
             ),
+            initial_session_id=self.record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(self.runtime.close)
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def _set_candidate(self, candidate: ConversationMemory) -> None:
@@ -158,6 +162,7 @@ class MemoryArchiveRuntimeTests(unittest.TestCase):
         )
 
         self.runtime.save_memory_preview(self.runtime.preview_memory_save())
+        self.runtime.close()
         restarted = SessionRuntime(
             SessionStore(self.database),
             self.workspace,
@@ -169,7 +174,10 @@ class MemoryArchiveRuntimeTests(unittest.TestCase):
                 self.config,
                 object(),
             ),
+            initial_session_id=self.record.id,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(restarted.close)
         self.assertEqual((), restarted.current.context.conversation_memory.archived)
         self.assertEqual((active,), restarted.current.context.conversation_memory.constraints)
 

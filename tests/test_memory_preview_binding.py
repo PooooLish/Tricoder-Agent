@@ -7,13 +7,13 @@ from pathlib import Path
 
 from tricoder.context.memory import ConversationMemory, MemoryItem
 from tricoder.models import AppConfig, MemoryConfig, ProviderConfig, SessionContext
-from tricoder.session_runtime import (
+from tricoder.session.runtime import (
     ActiveSession,
     RuntimeOptions,
     SessionRuntime,
     SessionRuntimeError,
 )
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 
 
 class _NoopAgent:
@@ -61,10 +61,13 @@ class MemoryPreviewBindingTests(unittest.TestCase):
             self.workspace,
             options=RuntimeOptions(),
             active_session_factory=factory,
+            workspace_confirmer=lambda _preview: True,
         )
+        self.addCleanup(self.runtime.close)
         self.runtime.switch(self.session_a.id, confirm=lambda _workspace: True)
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     @staticmethod

@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import os
 import tempfile
 import threading
 import time
@@ -27,23 +28,26 @@ from tricoder.models import (
     MCPServerConfig,
     Message,
     ProviderConfig,
+    ProviderResponse,
     RunResult,
     SessionContext,
     SessionMemory,
     SessionTurnResult,
     ToolResult,
+    ToolCall,
 )
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import create_provider
-from tricoder.session_runtime import (
+from tricoder.session.runtime import (
     ActiveSession,
     RuntimeOptions,
     SessionRuntime,
     SessionRuntimeError,
 )
-from tricoder.sessions import SessionStore
+from tricoder.session.store import SessionStore
 from tricoder.tools import ToolContext, ToolRegistry
 from tricoder.tools.handlers import ToolHandler
+from tricoder.workspace.lock import WorkspaceLock, WorkspaceLockBusyError
 
 
 class FakeAgent:
@@ -114,7 +118,7 @@ class FakeBuilder:
             workspace=record.workspace,
             provider=ProviderConfig(record.provider, "test-key", "https://example.test", record.model),
         )
-        return ActiveSession(record, memory, SessionContext(persisted_summary=memory.summary), config, FakeAgent(record.provider))
+        return ActiveSession(record, memory, SessionContext(persisted_summary=memory.summary, modified_files=memory.modified_files, verification=memory.verification), config, FakeAgent(record.provider))
 
 
 class FailingMemoryStore:
@@ -461,12 +465,12 @@ class LegacyRegistryJournalFactory(RegistryJournalFactory):
 class SessionRuntimeTests(unittest.TestCase):
     def test_active_tui_exit_retries_resources_registered_later_outside_state_lock(self):
         from tricoder.task_cleanup import current_cleanup
-        from tricoder.tui import TricoderApp
+        from tricoder.presentation.tui import TricoderApp
 
         for exit_method in ("action_quit", "on_unmount"):
             for retry_succeeds in (False, True):
                 with self.subTest(exit_method=exit_method, retry_succeeds=retry_succeeds):
-                    runtime = SessionRuntime(self.store, self.workspace,
+                    runtime = self._new_runtime(self.store, self.workspace,
                         options=RuntimeOptions(environ={}), active_session_factory=self.builder)
                     entered, allow_cleanup = threading.Event(), threading.Event()
                     calls, results, failures, owners = [], [], [], []
@@ -531,9 +535,11 @@ class SessionRuntimeTests(unittest.TestCase):
                     self.assertIsNone(runtime.current_task_cancellation())
                     self.assertTrue(runtime._task_lock.acquire(blocking=False))
                     runtime._task_lock.release()
+                    retry_succeeds = True
+                    runtime.close()
 
     def test_cleanup_failure_is_sticky_owned_and_blocks_reuse_until_reaped(self):
-        from tricoder import subprocess_control as control
+        from tricoder.process import control
         failed = control.BoundedProcessResult(0, "", "", cleanup_failed=True)
 
         class CleanupAgent:
@@ -580,14 +586,34 @@ class SessionRuntimeTests(unittest.TestCase):
         self.first = self.store.create("first", self.workspace, "openai", "model-a")
         self.second = self.store.create("second", self.other_workspace, "glm", "model-b")
         self.builder = FakeBuilder(set())
-        self.runtime = SessionRuntime(
+        self.runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
             active_session_factory=self.builder,
         )
 
+    def _new_runtime(self, *args, **kwargs):
+        # 原测试用重复构造模拟替换/重启；现在必须先结束上一 Runtime 的所有权。
+        for previous in getattr(self, "_owned_runtimes", []):
+            previous.close()
+        # 本文件验证的都是已激活会话行为；默认启动入口另由
+        # test_session_landing 覆盖。旧 fixture 必须显式恢复目标 ID。
+        if "initial_session_id" not in kwargs:
+            store, workspace = args[:2]
+            latest = store.latest_for_workspace(Path(workspace).resolve())
+            if latest is not None:
+                kwargs["initial_session_id"] = latest.id
+        kwargs.setdefault("workspace_confirmer", lambda _preview: True)
+        runtime = SessionRuntime(*args, **kwargs)
+        if not hasattr(self, "_owned_runtimes"):
+            self._owned_runtimes = []
+        self._owned_runtimes.append(runtime)
+        self.addCleanup(runtime.close)
+        return runtime
+
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def _runtime_with_real_registry(
@@ -600,7 +626,7 @@ class SessionRuntimeTests(unittest.TestCase):
             verification="not-run",
         )
         active_store.save_memory(self.first.id, memory)
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             active_store,  # type: ignore[arg-type]
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -655,7 +681,7 @@ class SessionRuntimeTests(unittest.TestCase):
             "TRICODER_EXTENSION_ENV_ALLOWLIST": "DOCS_MCP_TOKEN",
             "DOCS_MCP_TOKEN": "test-token",
         }
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ=source_env),
@@ -699,7 +725,7 @@ class SessionRuntimeTests(unittest.TestCase):
             "tricoder.mcp.sdk.load_mcp_sdk",
             side_effect=AssertionError("disabled path loaded SDK"),
         ), mock.patch(
-            "tricoder.session_runtime.run_mcp_task_sync",
+            "tricoder.session.runtime.run_mcp_task_sync",
             side_effect=AssertionError("disabled path entered MCP scope"),
             create=True,
         ):
@@ -769,7 +795,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 worker_cancelled.set()
             raise CancellationError("controlled command stopped")
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store, self.workspace, options=RuntimeOptions(environ={}),
             active_session_factory=factory.active,
             provider_factory=lambda *_args: object(), agent_factory=Agent,
@@ -790,7 +816,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
     def test_failed_write_is_sealed_once_and_no_write_keeps_latest_diff(self) -> None:
         journals: dict[str, CountingJournal] = {}
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -817,7 +843,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 provider=ProviderConfig(provider, "test-key", "https://example.test", f"{provider}-model"),
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -834,13 +860,15 @@ class SessionRuntimeTests(unittest.TestCase):
         diff_b = runtime.diff_latest()
         runtime.switch(session_a, confirm=lambda _workspace: True)
 
-        self.assertEqual(runtime.diff_latest(), diff_a)
+        self.assertIsNone(runtime.diff_latest())
+        runtime.run_task("new-write-a")
+        diff_a = runtime.diff_latest()
         runtime.clear_current()
         self.assertEqual(runtime.diff_latest(), diff_a)
         runtime.change_model("glm")
         self.assertEqual(runtime.diff_latest(), diff_a)
         runtime.switch(session_b, confirm=lambda _workspace: True)
-        self.assertEqual(runtime.diff_latest(), diff_b)
+        self.assertIsNone(runtime.diff_latest())
 
     def test_three_argument_factory_model_change_rebinds_tools_to_existing_journal(self) -> None:
         source_dir = self.workspace / "src"
@@ -861,7 +889,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 ),
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -874,6 +902,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
         runtime.run_task("v1->v2")
         second_diff = runtime.diff_latest()
+        runtime.prepare_undo()
         execution = runtime.undo_latest()
 
         self.assertIs(original_journal, runtime.current.journal)
@@ -906,7 +935,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 ),
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -919,6 +948,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
         runtime.run_task("v1->v2")
         second_diff = runtime.diff_latest()
+        runtime.prepare_undo()
         execution = runtime.undo_latest()
 
         self.assertIsNotNone(runtime.current.tools)
@@ -934,7 +964,7 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual("v1\n", target.read_text(encoding="utf-8"))
 
     def test_restart_does_not_restore_source_snapshots(self) -> None:
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -943,7 +973,7 @@ class SessionRuntimeTests(unittest.TestCase):
         runtime.run_task("write")
         self.assertIsNotNone(runtime.diff_latest())
 
-        restarted = SessionRuntime(
+        restarted = self._new_runtime(
             SessionStore(self.store.database_path),
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -954,7 +984,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
     def test_agent_exception_after_write_is_sealed_and_reraised_unchanged(self) -> None:
         journals: dict[str, CountingJournal] = {}
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -977,7 +1007,7 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(1, journals[runtime.current.record.id].sealed)
 
     def test_agent_exception_is_not_masked_by_secondary_seal_failure(self) -> None:
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1037,12 +1067,71 @@ class SessionRuntimeTests(unittest.TestCase):
             set(event),
         )
 
+    def test_task_owned_write_updates_baseline_so_next_task_needs_no_external_confirmation(self) -> None:
+        """内置工具已证明并正常收尾的写入，应成为本 Session 下一任务的基线。"""
+
+        app = self.workspace / "app.py"
+        app.write_text("value = 1\n", encoding="utf-8")
+
+        class Provider:
+            calls = 0
+
+            def complete(self, _messages, _tools=()):  # type: ignore[no-untyped-def]
+                self.calls += 1
+                if self.calls == 1:
+                    return ProviderResponse(
+                        tool_calls=(
+                            ToolCall(
+                                "edit",
+                                "edit_file",
+                                {
+                                    "path": "app.py",
+                                    "old_text": "value = 1\n",
+                                    "new_text": "value = 2\n",
+                                },
+                            ),
+                            ToolCall(
+                                "verify",
+                                "run_command",
+                                {"command": "python -m compileall -q app.py"},
+                            ),
+                            ToolCall("finish", "finish", {"summary": "first"}),
+                        )
+                    )
+                return ProviderResponse(
+                    tool_calls=(ToolCall("finish-next", "finish", {"summary": "next"}),)
+                )
+
+        provider = Provider()
+        previews = []
+        runtime = self._new_runtime(
+            SessionStore(self.root / "owned-baseline" / "sessions.db"),
+            self.workspace,
+            options=RuntimeOptions(
+                environ={"OPENAI_API_KEY": "synthetic"},
+                audit_dir=self.root / "owned-baseline-audit",
+                plan_enabled=False,
+            ),
+            provider_factory=lambda _config, _timeout: provider,
+            approver=lambda _action, _detail: True,
+            workspace_confirmer=lambda preview: previews.append(preview) or True,
+            initial_session_id=None,
+        )
+        first = runtime.run_task("write and verify")
+        preview_count = len(previews)
+        second = runtime.run_task("no external change")
+
+        self.assertTrue(first.ok, first)
+        self.assertTrue(second.ok, second)
+        self.assertEqual(preview_count, len(previews))
+
     def test_successful_undo_keeps_files_restored_when_memory_persist_fails_then_retries(self) -> None:
         wrapped = FailingMemoryStore(self.store)
         runtime, _audit_path = self._runtime_with_real_registry(wrapped)
         runtime.run_task("write mixed change")
         wrapped.fail_writes = True
 
+        runtime.prepare_undo()
         execution = runtime.undo_latest()
 
         self.assertTrue(execution.ok)
@@ -1104,17 +1193,87 @@ class SessionRuntimeTests(unittest.TestCase):
         created = self.workspace / "src" / "created.py"
         created.write_text(f"{sentinel}\n", encoding="utf-8")
 
-        execution = runtime.undo_latest()
+        with self.assertRaisesRegex(SessionRuntimeError, "撤销确认后发生变化"):
+            runtime.undo_latest()
 
-        self.assertFalse(execution.ok)
         serialized = audit_path.read_text(encoding="utf-8")
         self.assertNotIn(sentinel, serialized)
-        event = json.loads(serialized.splitlines()[-1])
-        self.assertEqual("undo", event["event"])
-        self.assertEqual("conflicted", event["status"])
-        self.assertEqual(["src/created.py"], event["conflicts"])
-        self.assertEqual(1, event["conflict_count"])
-        self.assertEqual("not-required", event["compensation_status"])
+
+    def test_undo_preview_holds_workspace_lock_and_stale_preview_releases_it(self) -> None:
+        """预览到提交之间必须独占工作区；版本变化后旧确认不得执行。"""
+
+        runtime, _audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        runtime.prepare_undo()
+        with self.assertRaises(WorkspaceLockBusyError):
+            WorkspaceLock.acquire(self.workspace)
+
+        (self.workspace / "unrelated.py").write_text("changed = True\n", encoding="utf-8")
+        with self.assertRaisesRegex(SessionRuntimeError, "撤销确认后发生变化"):
+            runtime.undo_latest()
+
+        ownership = WorkspaceLock.acquire(self.workspace)
+        ownership.close()
+
+    def test_successful_undo_does_not_absorb_unrelated_write_during_execution(self) -> None:
+        """撤销本身成功也不能把执行窗口内的无关外部修改并入可信基线。"""
+
+        runtime, _audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        runtime.prepare_undo()
+        delegate = runtime.current.tools
+        unrelated = self.workspace / "external-during-undo.py"
+
+        class WritingAfterUndo:
+            def undo_change_set(self, change_set):  # type: ignore[no-untyped-def]
+                execution = delegate.undo_change_set(change_set)
+                unrelated.write_text("external = True\n", encoding="utf-8")
+                return execution
+
+        runtime.current = replace(
+            runtime.current,
+            tools=WritingAfterUndo(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(SessionRuntimeError, "收尾扫描或清理失败"):
+            runtime.undo_latest()
+
+        self.assertTrue(unrelated.exists())
+        self.assertIn(
+            runtime.current.record.id,
+            runtime._workspace_baseline_unresolved,
+        )
+
+    def test_successful_undo_rejects_same_content_replacement_after_publication(self) -> None:
+        """撤销工具发布后被同内容新 inode 替换时，不得把外部对象吸收为基线。"""
+
+        runtime, _audit_path = self._runtime_with_real_registry()
+        runtime.run_task("write mixed change")
+        runtime.prepare_undo()
+        delegate = runtime.current.tools
+        target = self.workspace / "src" / "app.py"
+
+        class ReplacingAfterUndo:
+            def undo_change_set(self, change_set):  # type: ignore[no-untyped-def]
+                execution = delegate.undo_change_set(change_set)
+                replacement = target.with_name("app.py.external-replacement")
+                replacement.write_bytes(target.read_bytes())
+                os.chmod(replacement, target.stat().st_mode)
+                os.replace(replacement, target)
+                return execution
+
+        runtime.current = replace(
+            runtime.current,
+            tools=ReplacingAfterUndo(),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(SessionRuntimeError, "收尾扫描或清理失败"):
+            runtime.undo_latest()
+
+        self.assertIn(
+            runtime.current.record.id,
+            runtime._workspace_baseline_unresolved,
+        )
 
     def test_failed_undo_execution_audits_compensation_failure_paths(self) -> None:
         """防止部分撤销补偿失败缺少安全结构化事件。"""
@@ -1129,6 +1288,7 @@ class SessionRuntimeTests(unittest.TestCase):
                     compensation_failed=("src/app.py",),
                 )
 
+        runtime.prepare_undo()
         runtime.current = replace(
             runtime.current,
             tools=CompensationFailingTools(),  # type: ignore[arg-type]
@@ -1155,6 +1315,7 @@ class SessionRuntimeTests(unittest.TestCase):
             def undo_change_set(self, _change_set) -> UndoExecution:  # type: ignore[no-untyped-def]
                 raise OSError(f"{absolute} {sentinel}")
 
+        runtime.prepare_undo()
         runtime.current = replace(
             runtime.current,
             tools=ExplodingTools(),  # type: ignore[arg-type]
@@ -1209,7 +1370,7 @@ class SessionRuntimeTests(unittest.TestCase):
             calls.append((workspace, environ, model))
             return {"openai": "preview-openai", "deepseek": "preview-deepseek", "glm": "preview-glm"}
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1220,33 +1381,37 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual("preview-glm", runtime.preview_models()["glm"])
         self.assertEqual([(self.workspace, {}, None)], calls)
 
-    def test_startup_creates_default_when_workspace_has_no_session(self) -> None:
-        """防止无历史会话的工作区无法获得独立默认会话。"""
+    def test_startup_without_explicit_id_stays_unbound(self) -> None:
+        """无历史工作区默认只进入本地入口，不创建伪 default 会话。"""
         empty_workspace = (self.root / "empty").resolve()
         empty_workspace.mkdir()
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             empty_workspace,
             options=RuntimeOptions(environ={}),
             active_session_factory=FakeBuilder(set()),
         )
-        self.assertEqual("default", runtime.current.record.name)
-        self.assertEqual(empty_workspace, runtime.current.record.workspace)
+        self.assertIsNone(runtime.current)
+        self.assertFalse(runtime.has_active_session)
+        self.assertFalse(
+            any(item.workspace == empty_workspace for item in self.store.list_all())
+        )
 
-    def test_default_startup_failure_does_not_create_orphan_session(self) -> None:
-        """防止首次启动的候选构建失败后在 SQLite 留下 default 孤儿会话。"""
+    def test_unbound_startup_does_not_invoke_failing_builder(self) -> None:
+        """入口不装配 Agent，因此候选工厂故障不会阻止本地命令。"""
         empty_workspace = (self.root / "empty-failed").resolve()
         empty_workspace.mkdir()
         builder = FakeBuilder({"default"})
 
-        with self.assertRaises(SessionRuntimeError):
-            SessionRuntime(
-                self.store,
-                empty_workspace,
-                options=RuntimeOptions(environ={}),
-                active_session_factory=builder,
-            )
+        runtime = self._new_runtime(
+            self.store,
+            empty_workspace,
+            options=RuntimeOptions(environ={}),
+            active_session_factory=builder,
+        )
 
+        self.assertIsNone(runtime.current)
+        self.assertEqual([], builder.built)
         self.assertFalse(
             any(item.workspace == empty_workspace for item in self.store.list_all())
         )
@@ -1261,7 +1426,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 audit_dir=self.root / "audit",
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}, provider="glm"),
@@ -1304,20 +1469,21 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(second_new.record.id, candidate_records[1].id)
         self.assertNotEqual(first_new.record.id, second_new.record.id)
 
-    def test_default_candidate_uses_the_final_persisted_record_id(self) -> None:
-        """防止首次默认会话在候选审计路径中使用固定共享 ID。"""
+    def test_entry_explicit_create_uses_the_final_persisted_record_id(self) -> None:
+        """入口显式新建在候选装配阶段就使用最终 UUID。"""
         empty_workspace = (self.root / "empty-real-id").resolve()
         empty_workspace.mkdir()
         builder = FakeBuilder(set())
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             empty_workspace,
             options=RuntimeOptions(environ={}),
             active_session_factory=builder,
         )
+        created = runtime.create("entry-created")
 
-        self.assertEqual(runtime.current.record.id, builder.records[-1].id)
+        self.assertEqual(created.record.id, builder.records[-1].id)
 
     def test_invalid_session_name_does_not_build_a_candidate(self) -> None:
         """防止无效名称在校验前触发 Agent、审计器或其他候选副作用。"""
@@ -1371,8 +1537,8 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual("glm", self.runtime.current.config.provider.name)
         self.assertEqual(self.other_workspace, self.runtime.current.config.workspace)
 
-    def test_switching_back_restores_each_open_session_complete_context(self) -> None:
-        """防止 A→B→A 时从 SQLite 摘要重建并丢失进程内完整消息。"""
+    def test_switching_back_reloads_persisted_state_without_stale_context(self) -> None:
+        """释放所有权后必须重读 SQLite，不复用旧消息、Agent 或撤销账本。"""
         self.runtime.run_task("first task")
         first_active = self.runtime.current
         first_context = first_active.context
@@ -1385,18 +1551,18 @@ class SessionRuntimeTests(unittest.TestCase):
         restored_first = self.runtime.switch(self.first.id, confirm=lambda _: True)
         restored_second = self.runtime.switch(self.second.id, confirm=lambda _: True)
 
-        self.assertEqual(first_context.messages, restored_first.context.messages)
-        self.assertEqual(second_context.messages, restored_second.context.messages)
+        self.assertEqual((), restored_first.context.messages)
+        self.assertEqual((), restored_second.context.messages)
         self.assertEqual("待验证", restored_first.context.verification)
         self.assertEqual("待验证", restored_second.context.verification)
         self.assertIsNone(restored_first.context.verification_evidence)
         self.assertIsNone(restored_second.context.verification_evidence)
-        self.assertIs(first_active.agent, restored_first.agent)
-        self.assertIs(second_active.agent, restored_second.agent)
+        self.assertIsNot(first_active.agent, restored_first.agent)
+        self.assertIsNot(second_active.agent, restored_second.agent)
         self.assertIsNot(restored_first.agent, restored_second.agent)
-        self.assertEqual(["first task"], [message.content for message in restored_first.context.messages])
-        self.assertEqual(["second task"], [message.content for message in restored_second.context.messages])
-        self.assertEqual([self.first.id, self.second.id], self.builder.built)
+        self.assertEqual(first_active.memory.summary, restored_first.context.persisted_summary)
+        self.assertEqual(second_active.memory.summary, restored_second.context.persisted_summary)
+        self.assertEqual([self.first.id, self.second.id, self.first.id, self.second.id], self.builder.built)
 
     def test_model_change_preserves_complete_context_and_memory(self) -> None:
         """防止 /model 成功重建 Agent 时清空当前消息或替换安全记忆。"""
@@ -1412,7 +1578,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 ),
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1455,7 +1621,7 @@ class SessionRuntimeTests(unittest.TestCase):
             received_protocols.append(kwargs["tool_protocol"])
             return FakeAgent("configured")
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1471,7 +1637,7 @@ class SessionRuntimeTests(unittest.TestCase):
     def test_persist_failure_keeps_memory_and_marks_runtime_unsaved(self) -> None:
         """防止 SQLite 临时失败时丢失内存记忆或伪装为已保存。"""
         wrapped_store = FailingMemoryStore(self.store)
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             wrapped_store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1494,7 +1660,7 @@ class SessionRuntimeTests(unittest.TestCase):
         """防止当前安全摘要未保存时仍切换，导致重启后丢失记忆。"""
         wrapped_store = FailingMemoryStore(self.store)
         builder = FakeBuilder(set())
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             wrapped_store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1512,7 +1678,7 @@ class SessionRuntimeTests(unittest.TestCase):
     def test_create_dirty_session_is_atomic_when_current_persist_fails(self) -> None:
         """防止 /session new 在旧 dirty 记忆保存失败后插入或切换新会话。"""
         wrapped_store = FailingMemoryStore(self.store)
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             wrapped_store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1573,7 +1739,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 audit_dir=audit_dir,
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1598,7 +1764,7 @@ class SessionRuntimeTests(unittest.TestCase):
     def test_failed_clear_keeps_clear_intent_for_retry(self) -> None:
         """防止清空写入失败后重试错误保存清空前摘要或丢失文件元数据。"""
         wrapped_store = FailingMemoryStore(self.store)
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             wrapped_store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1639,7 +1805,7 @@ class SessionRuntimeTests(unittest.TestCase):
                 audit_dir=audit_dir,
             )
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             wrapped_store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1664,7 +1830,7 @@ class SessionRuntimeTests(unittest.TestCase):
         def missing_config(**_kwargs):  # type: ignore[no-untyped-def]
             raise ConfigError("模拟缺失 API Key")
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1772,7 +1938,7 @@ class SessionRuntimeTests(unittest.TestCase):
             approvals.append((action, detail))
             return False
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1807,7 +1973,7 @@ class SessionRuntimeTests(unittest.TestCase):
         """安全权限持久化失败时必须回滚内存中的权限。"""
         failing = FailingMemoryStore(self.store)
         failing.fail_writes = True
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             failing,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1834,7 +2000,7 @@ class SessionRuntimeTests(unittest.TestCase):
                     raise TimeoutError("测试未及时释放会话构建")
             return self.builder(record, memory, options)
 
-        runtime = SessionRuntime(
+        runtime = self._new_runtime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
@@ -1926,7 +2092,7 @@ class SessionRuntimeTests(unittest.TestCase):
             read_started.set()
             tokens.append(getter())
 
-        with mock.patch("tricoder.session_runtime.CancellationToken", PublishingToken):
+        with mock.patch("tricoder.session.runtime.CancellationToken", PublishingToken):
             worker = threading.Thread(target=lambda: self.runtime.run_task("first"))
             worker.start()
             entered.wait(timeout=2)
@@ -1976,7 +2142,7 @@ class SessionRuntimeTests(unittest.TestCase):
         results: list[RunResult] = []
         cancellation_results: list[bool] = []
 
-        with mock.patch("tricoder.session_runtime.CancellationToken", SlowToken):
+        with mock.patch("tricoder.session.runtime.CancellationToken", SlowToken):
             worker = threading.Thread(
                 target=lambda: results.append(self.runtime.run_task("task"))
             )

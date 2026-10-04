@@ -1,0 +1,22 @@
+id = "cf-price-discount"
+title = "cf-price-discount"
+task = "在 pricing.py 中实现折扣计算，保持 checkout.py 调用接口不变。"
+allowed_changes = ["pricing.py"]
+required_changes = ["pricing.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "cross_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "在 pricing.py 中实现折扣计算，保持 checkout.py 调用接口不变。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

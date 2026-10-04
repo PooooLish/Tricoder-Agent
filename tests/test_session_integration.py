@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from contextlib import ExitStack
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,8 +22,8 @@ from tricoder.models import (
     ToolCall,
     ToolDefinition,
 )
-from tricoder.session_runtime import ActiveSession, RuntimeOptions, SessionRuntime
-from tricoder.sessions import SessionStore
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+from tricoder.session.store import SessionStore
 from tricoder.agent import CodingAgent
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.tools import ToolContext, ToolRegistry
@@ -150,11 +151,15 @@ class SessionIntegrationTests(unittest.TestCase):
     def test_default_active_session_shares_one_ephemeral_journal_with_tools(self) -> None:
         """防止默认装配让 Runtime 与写工具记录到不同账本，或把快照写进 SQLite。"""
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as resources:
             root = Path(temporary)
             workspace = root / "workspace"
             workspace.mkdir()
             store = SessionStore((root / "state" / "sessions.db").resolve())
+            store.initialize(workspace)
+            record = store.create(
+                "journal", workspace, "openai", "model-a"
+            )
             registries: list[ToolRegistry] = []
 
             def config_loader(**kwargs):  # type: ignore[no-untyped-def]
@@ -181,7 +186,10 @@ class SessionIntegrationTests(unittest.TestCase):
                 config_loader=config_loader,
                 provider_factory=lambda _config, _timeout: object(),
                 agent_factory=agent_factory,
+                initial_session_id=record.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
 
             self.assertIs(runtime.current.tools, registries[0])
             self.assertIs(
@@ -191,11 +199,11 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(runtime.current.audit)
             self.assertIsNone(runtime.diff_latest())
 
-    def test_structured_messages_survive_model_rebuild_and_session_switches(
+    def test_model_rebuild_keeps_messages_but_session_switch_reloads_persistence(
         self,
     ) -> None:
-        """模型重建保留上下文；会话切换保留消息但撤销旧核验证据。"""
-        with tempfile.TemporaryDirectory() as temporary:
+        """模型重建保留上下文；会话切换交出所有权，返回时只恢复持久化状态。"""
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as resources:
             root = Path(temporary)
             first_workspace = (root / "workspace-one").resolve()
             second_workspace = (root / "workspace-two").resolve()
@@ -230,7 +238,10 @@ class SessionIntegrationTests(unittest.TestCase):
                 options=RuntimeOptions(environ={}),
                 active_session_factory=factory,
                 config_loader=load_config,
+                initial_session_id=first.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
             runtime.run_task("first structured task")
             first_snapshot = runtime.current.context
 
@@ -250,7 +261,7 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertNotEqual(first_snapshot.messages, second_snapshot.messages)
 
             runtime.switch(first.id, confirm=lambda _workspace: True)
-            self.assertEqual(first_snapshot.messages, runtime.current.context.messages)
+            self.assertEqual((), runtime.current.context.messages)
             self.assertEqual("待验证", runtime.current.context.verification)
             self.assertIsNone(runtime.current.context.verification_evidence)
             self.assertTrue(runtime.current.context.verification_required)
@@ -258,14 +269,14 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertEqual((), runtime.current.context.messages)
 
             runtime.switch(second.id, confirm=lambda _workspace: True)
-            self.assertEqual(second_snapshot.messages, runtime.current.context.messages)
+            self.assertEqual((), runtime.current.context.messages)
             self.assertEqual("待验证", runtime.current.context.verification)
             self.assertIsNone(runtime.current.context.verification_evidence)
             self.assertTrue(runtime.current.context.verification_required)
 
     def test_sqlite_persists_only_canonical_relative_paths_after_agent_writes(self) -> None:
         """防止 Agent 写入后将绝对路径或 dotdot 形式保存到 SQLite。"""
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as resources:
             root = Path(temporary)
             workspace = (root / "workspace").resolve()
             workspace.mkdir()
@@ -326,7 +337,9 @@ class SessionIntegrationTests(unittest.TestCase):
                 workspace,
                 options=RuntimeOptions(environ={}),
                 active_session_factory=active_factory,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
 
             result = runtime.run_task(task_marker)
 
@@ -398,7 +411,7 @@ class SessionIntegrationTests(unittest.TestCase):
 
     def test_sessions_are_isolated_restart_restores_safe_summary_and_workspace_stays_clean(self) -> None:
         """跨工作区切换不串状态，重启仅恢复安全摘要，SQLite 不写入工作区或原文。"""
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as resources:
             root = Path(temporary)
             first_workspace = (root / "workspace-one").resolve()
             second_workspace = (root / "workspace-two").resolve()
@@ -428,7 +441,10 @@ class SessionIntegrationTests(unittest.TestCase):
                 first_workspace,
                 options=RuntimeOptions(environ={}),
                 active_session_factory=factory,
+                initial_session_id=first.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(runtime.close)
 
             for task in first_tasks:
                 runtime.run_task(task)
@@ -449,8 +465,14 @@ class SessionIntegrationTests(unittest.TestCase):
             )
             self.assertEqual((), factory.agents[second.id].calls[0][1].messages)
             self.assertEqual(database, store.database_path)
-            self.assertFalse(any(first_workspace.iterdir()))
-            self.assertFalse(any(second_workspace.iterdir()))
+            for workspace in (first_workspace, second_workspace):
+                control = workspace / "runtime" / "tricoder-control"
+                self.assertTrue((control / "workspace.lock").is_file())
+                self.assertFalse((control / "active-task.json").exists())
+                self.assertEqual(
+                    {workspace / "runtime"},
+                    set(workspace.iterdir()),
+                )
 
             restarted_factory = RecordingSessionFactory({}, {})
             restarted = SessionRuntime(
@@ -458,7 +480,10 @@ class SessionIntegrationTests(unittest.TestCase):
                 first_workspace,
                 options=RuntimeOptions(environ={}),
                 active_session_factory=restarted_factory,
+                initial_session_id=first.id,
+                workspace_confirmer=lambda _preview: True,
             )
+            resources.callback(restarted.close)
 
             self.assertEqual(first.id, restarted.current.record.id)
             self.assertEqual("openai", restarted.current.config.provider.name)
