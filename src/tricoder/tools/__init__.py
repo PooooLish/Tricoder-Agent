@@ -412,9 +412,24 @@ class ToolRegistry:
             evidence = result.verification_evidence
             if not self.context.verification_scope.owns(evidence):
                 result = replace(result, verification_evidence=None)
+            # 内置命令处理器只有在固定信息查询成功且清理已确认时，才会在
+            # 没有验证证据的情况下明确返回 NONE。即使作用域此前已有 UNKNOWN，
+            # 也不能把旧状态重新发布为“本次命令的副作用”，否则会覆盖失败证据。
+            information_only = (
+                result.ok
+                and result.verification_passed is None
+                and result.verification_evidence is None
+                and result.file_effects is not None
+                and result.file_effects.state is EffectState.NONE
+            )
             # 只有本地命令路径持有的快照证据可将运行后文件影响收窄为 NONE。
-            effects = (FileEffects(EffectState.UNKNOWN) if self.context.verification_scope.unknown_effects
-                       else result.file_effects or FileEffects(EffectState.NONE))
+            effects = (
+                result.file_effects
+                if information_only
+                else FileEffects(EffectState.UNKNOWN)
+                if self.context.verification_scope.unknown_effects
+                else result.file_effects or FileEffects(EffectState.NONE)
+            )
             return replace(result, file_effects=effects)
         result = replace(result, verification_evidence=None, verification_passed=None)
         effects = operation.active_effects() if operation is not None else None

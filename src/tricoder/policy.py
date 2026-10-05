@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from copy import copy
 from collections.abc import Mapping
+from enum import Enum
 from pathlib import Path
 
 from tricoder.process.env import (
@@ -87,6 +89,39 @@ class WorkspacePathNotFoundError(PolicyArgumentError):
     """工作区内目标不存在；调用方可修改参数后重试。"""
 
 
+class CommandFormReason(str, Enum):
+    """经过完整安全校验后，允许调用方重新规划的有限命令形式。"""
+
+    DIRECT_TOOL_ENTRYPOINT = "direct_tool_entrypoint"
+    LOCAL_TEST_TARGET_REQUIRED = "local_test_target_required"
+
+
+class CommandFormError(PolicyArgumentError):
+    """只携带本地枚举理由，不保存用户命令、路径或异常原文。"""
+
+    def __init__(self, reason: CommandFormReason) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+_COMMAND_FORM_FEEDBACK = {
+    CommandFormReason.DIRECT_TOOL_ENTRYPOINT: (
+        "测试工具入口形式不受支持；请通过会话解释器运行，例如 "
+        "`python -m pytest -q`。ruff 和 mypy 同样使用 `python -m`。"
+    ),
+    CommandFormReason.LOCAL_TEST_TARGET_REQUIRED: (
+        "unittest 目标必须绑定到工作区内已有的相对 `.py` 文件；"
+        "也可改用 `python -m unittest discover -v`。"
+    ),
+}
+
+
+def command_form_feedback(reason: CommandFormReason) -> str:
+    """取得不含原始输入的固定命令形式反馈。"""
+
+    return _COMMAND_FORM_FEEDBACK[reason]
+
+
 class WorkspacePolicy:
     """确保模型只能访问明确指定的工作区。"""
 
@@ -137,6 +172,10 @@ class CommandPolicy:
 
     _META_PATTERN = re.compile(r"[|&;><`\r\n]")
     _PYTHON_MODULES = {"unittest", "pytest", "compileall", "ruff", "mypy"}
+    _PYTHON_REQUEST_NAMES = {
+        "python", "python.exe", "py", "py.exe", "python3", "python3.exe",
+    }
+    _SIMPLE_UNITTEST_TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
     @classmethod
     def is_verification_command(cls, args: list[str]) -> bool:
@@ -144,6 +183,16 @@ class CommandPolicy:
         return (len(args) >= 3
                 and cls._is_python_executable(args[0])
                 and args[1] == "-m" and args[2] in cls._PYTHON_MODULES)
+
+    @classmethod
+    def is_information_command(cls, args: list[str]) -> bool:
+        """只识别本地归一化后的固定 Python 版本查询。"""
+
+        return (
+            len(args) == 3
+            and cls._is_python_executable(args[0])
+            and args[1:] == ["-I", "--version"]
+        )
 
     # 这些工具必须通过 `python -m` 运行：直接调用会被 Windows 从 cwd 或 PATH
     # 命中同名程序，无法保证执行来源可信。
@@ -246,7 +295,7 @@ class CommandPolicy:
             excluded_paths=tuple(excluded_paths),
         )
 
-    def validate(self, command: str) -> list[str]:
+    def validate(self, command: str, *, cwd: Path | None = None) -> list[str]:
         """返回可交给 `subprocess` 的参数数组，否则抛出策略错误。
 
         ``args[0]`` 解析为可信可执行程序的绝对路径，审批与执行均使用该值。
@@ -271,25 +320,58 @@ class CommandPolicy:
         if not args:
             raise PolicyArgumentError("命令不能为空")
 
+        effective_cwd = self._effective_cwd(cwd)
         raw_executable = args[0]
         executable = Path(raw_executable).name.lower()
         if self._is_qualified_path(raw_executable):
             raise PolicyError(f"可执行程序必须是 PATH 中的纯名称：{raw_executable}")
-        if executable in {"python", "python.exe", "py", "py.exe"}:
-            validated = self._validate_python(args)
+        if executable in self._PYTHON_REQUEST_NAMES:
+            validated = self._validate_python(args, effective_cwd)
             return [self._resolve_executable("python"), *validated[1:]]
         if executable in self._DISALLOWED_DIRECT_TOOLS:
-            raise PolicyError(f"请通过 python -m 运行 {executable}，禁止直接调用")
+            module = executable.removesuffix(".exe")
+            # 先把直接入口等价为受支持的 python -m 形式，并复用完整参数/
+            # 路径校验。只有等价形式本身安全时，才允许返回可纠正错误。
+            self._validate_python(
+                ["python", "-m", module, *args[1:]],
+                effective_cwd,
+            )
+            raise CommandFormError(CommandFormReason.DIRECT_TOOL_ENTRYPOINT)
         if executable in {"git", "git.exe"}:
             validated = self._validate_git(args)
             return [self._resolve_executable("git"), *validated[1:]]
         raise PolicyError(f"可执行程序不在允许列表中：{raw_executable}")
 
-    def audit_metadata(self, command: str) -> dict[str, object]:
+    def scoped_to(self, workspace_policy: WorkspacePolicy) -> CommandPolicy:
+        """返回绑定到指定工作区的本次执行视图，不修改共享策略实例。
+
+        旧调用方可能分别构造 ``WorkspacePolicy`` 与 ``CommandPolicy``。执行工具
+        在校验路径参数前用此方法补齐工作区证明；若原策略已经绑定到另一工作区，
+        则拒绝混用，避免把一个会话的策略带入另一个工作区。
+        """
+
+        if self._workspace_policy is not None:
+            if self._workspace_policy.workspace != workspace_policy.workspace:
+                raise PolicyError("命令策略与工具工作区不一致")
+            return self
+        scoped = copy(self)
+        scoped._workspace_policy = workspace_policy
+        scoped._subprocess_env = filtered_subprocess_env(
+            self._subprocess_env,
+            excluded_paths=(workspace_policy.workspace,),
+        )
+        return scoped
+
+    def audit_metadata(
+        self,
+        command: str,
+        *,
+        cwd: Path | None = None,
+    ) -> dict[str, object]:
         """将已允许命令转换为不含自由参数文本的审计元数据。"""
 
         try:
-            args = self.validate(command)
+            args = self.validate(command, cwd=cwd)
         except PolicyError:
             return {
                 "command_valid": False,
@@ -302,12 +384,15 @@ class CommandPolicy:
             "argument_count": len(args) - 1,
         }
         if executable in {"python", "py"}:
-            if len(args) >= 3 and args[1] == "-m":
+            if self.is_information_command(args):
+                metadata["execution_kind"] = "information"
+                metadata["information_kind"] = "python_version"
+            elif len(args) >= 3 and args[1] == "-m":
                 metadata["execution_kind"] = "module"
                 metadata["python_module"] = args[2].lower()
             else:
                 metadata["execution_kind"] = "script"
-                metadata["script"] = self._safe_relative_script(args[1])
+                metadata["script"] = self._safe_relative_script(args[1], cwd)
         elif executable == "git":
             metadata["git_subcommand"] = args[1].lower()
         return metadata
@@ -327,15 +412,53 @@ class CommandPolicy:
         """识别 Windows ``python.exe`` 与 POSIX ``python3.11`` 等名称。"""
         return cls._canonical_executable(raw) in {"python", "py"}
 
-    def _safe_relative_script(self, script: str) -> str:
+    def _safe_relative_script(self, script: str, cwd: Path | None) -> str:
         """把脚本路径规范化为工作区内相对路径；不可解析时返回受限提示。"""
         if self._workspace_policy is not None:
             try:
-                resolved = self._workspace_policy.resolve_path(script, must_exist=True)
+                effective_cwd = self._effective_cwd(cwd)
+                resolved = self._resolve_workspace_path(
+                    script,
+                    effective_cwd,
+                    must_exist=True,
+                )
                 return resolved.relative_to(self._workspace_policy.workspace).as_posix()
             except PolicyError:
                 pass
         return "<工作区内脚本>"
+
+    def _effective_cwd(self, cwd: Path | None) -> Path | None:
+        """得到本次调用的局部执行目录，不修改共享策略对象。"""
+
+        if self._workspace_policy is None:
+            if cwd is not None:
+                raise PolicyError("缺少工作区证明，不能指定命令执行目录")
+            return None
+        if cwd is None:
+            return self._workspace_policy.workspace
+        try:
+            resolved = self._workspace_policy.resolve_path(cwd, must_exist=True)
+        except PolicyError:
+            raise PolicyError("命令工作目录不在工作区内") from None
+        if not resolved.is_dir():
+            raise PolicyArgumentError("命令工作目录必须是目录")
+        return resolved
+
+    def _resolve_workspace_path(
+        self,
+        raw: str,
+        cwd: Path | None,
+        *,
+        must_exist: bool,
+    ) -> Path:
+        """按本次有效 cwd 解析相对路径，并继续受根工作区策略约束。"""
+
+        if self._workspace_policy is None or cwd is None:
+            raise PolicyError("缺少工作区证明，不能解析本地路径")
+        return self._workspace_policy.resolve_path(
+            cwd / Path(raw),
+            must_exist=must_exist,
+        )
 
     def _resolve_executable(self, name: str) -> str:
         """把纯名称解析为可信绝对路径；失败即安全拒绝。"""
@@ -362,26 +485,42 @@ class CommandPolicy:
             return True
         return raw in {".", ".."}
 
-    def _validate_python(self, args: list[str]) -> list[str]:
+    def _validate_python(
+        self,
+        args: list[str],
+        cwd: Path | None,
+    ) -> list[str]:
+        if len(args) == 2 and args[1] in {"--version", "-V"}:
+            return [args[0], "-I", "--version"]
         if len(args) < 3 or args[1] != "-m":
             # 脚本执行：python <工作区内相对 .py 脚本> [参数...]
-            return self._validate_python_script(args)
+            return self._validate_python_script(args, cwd)
         module = args[2].lower()
         if module not in self._PYTHON_MODULES:
             raise PolicyError(f"Python 模块不在允许列表中：{args[2]}")
         if module == "unittest":
-            self._validate_unittest_args(args[3:])
+            return [*args[:3], *self._validate_unittest_args(args[3:], cwd)]
         elif module == "compileall":
-            self._validate_tool_params(args[3:], self._COMPILEALL_ALLOWED_OPTIONS, "compileall")
+            self._validate_tool_params(
+                args[3:], self._COMPILEALL_ALLOWED_OPTIONS, "compileall", cwd
+            )
         elif module == "pytest":
-            self._validate_tool_params(args[3:], self._PYTEST_ALLOWED_OPTIONS, "pytest")
+            self._validate_tool_params(
+                args[3:], self._PYTEST_ALLOWED_OPTIONS, "pytest", cwd
+            )
         elif module == "ruff":
-            self._validate_ruff_args(args[3:])
+            self._validate_ruff_args(args[3:], cwd)
         elif module == "mypy":
-            self._validate_tool_params(args[3:], self._MYPY_ALLOWED_OPTIONS, "mypy")
+            self._validate_tool_params(
+                args[3:], self._MYPY_ALLOWED_OPTIONS, "mypy", cwd
+            )
         return args
 
-    def _validate_python_script(self, args: list[str]) -> list[str]:
+    def _validate_python_script(
+        self,
+        args: list[str],
+        cwd: Path | None,
+    ) -> list[str]:
         """允许运行工作区内相对路径的 .py 脚本。
 
         脚本必须是工作区内存在的普通 .py 文件（真实解析，含符号链接与
@@ -393,28 +532,39 @@ class CommandPolicy:
             raise PolicyError("Python 仅允许运行 .py 脚本")
         if self._workspace_policy is not None:
             try:
-                resolved = self._workspace_policy.resolve_path(args[1], must_exist=True)
+                resolved = self._resolve_workspace_path(
+                    args[1],
+                    cwd,
+                    must_exist=True,
+                )
             except PolicyError:
                 raise PolicyError(f"Python 脚本不在工作区内：{args[1]}")
             if not resolved.is_file():
                 raise PolicyError(f"Python 脚本不是普通文件：{args[1]}")
-            self._require_relative_paths(args[1:], "python")
+            self._require_relative_paths(args[1:], "python", cwd)
         else:
             segments = tuple(re.split(r"[\\/]+", args[1]))
             if any(segment.lower() in {"", ".", ".."} for segment in segments):
                 raise PolicyError(f"Python 脚本路径包含敏感段：{args[1]}")
             if is_sensitive_workspace_path(args[1]):
                 raise PolicyError(f"Python 脚本路径包含敏感段：{args[1]}")
-            self._require_relative_paths(args[1:], "python")
+            self._require_relative_paths(args[1:], "python", cwd)
         return args
 
-    def _validate_ruff_args(self, params: list[str]) -> None:
+    def _validate_ruff_args(self, params: list[str], cwd: Path | None) -> None:
         if not params or params[0].lower() != "check":
             raise PolicyError("ruff 仅允许 check 子命令")
-        self._validate_tool_params(params[1:], self._RUFF_ALLOWED_OPTIONS, "ruff")
+        self._validate_tool_params(
+            params[1:], self._RUFF_ALLOWED_OPTIONS, "ruff", cwd
+        )
 
-    def _validate_unittest_args(self, params: list[str]) -> None:
+    def _validate_unittest_args(
+        self,
+        params: list[str],
+        cwd: Path | None,
+    ) -> list[str]:
         """只允许 discover 或工作区内测试文件，禁止通过 dotted name 导入模块。"""
+        normalized = list(params)
         discover = bool(params and params[0].lower() == "discover")
         index = 1 if discover else 0
         while index < len(params):
@@ -432,40 +582,71 @@ class CommandPolicy:
                     if not value:
                         raise PolicyError(f"unittest 参数缺少值：{name}")
                     if name in self._UNITTEST_PATH_OPTIONS:
-                        self._validate_unittest_discovery_path(value)
+                        self._validate_unittest_discovery_path(value, cwd)
                 elif separator:
                     raise PolicyError(f"unittest 参数不接受值：{name}")
             else:
                 if discover:
                     raise PolicyError(f"unittest discover 不接受位置参数：{token}")
-                self._validate_unittest_file_target(token)
+                normalized[index] = self._validate_unittest_file_target(token, cwd)
             index += 1
+        return normalized
 
-    def _validate_unittest_discovery_path(self, raw: str) -> None:
+    def _validate_unittest_discovery_path(
+        self,
+        raw: str,
+        cwd: Path | None,
+    ) -> None:
         """discover 的起始目录和顶层目录必须真实位于工作区内。"""
         if self._workspace_policy is None:
-            self._require_relative_paths([raw], "unittest")
+            self._require_relative_paths([raw], "unittest", cwd)
             return
         try:
-            resolved = self._workspace_policy.resolve_path(raw, must_exist=True)
+            resolved = self._resolve_workspace_path(raw, cwd, must_exist=True)
         except PolicyError:
             raise PolicyError(f"unittest 路径不在工作区内：{raw}") from None
         if not resolved.is_dir():
             raise PolicyError(f"unittest discover 路径不是目录：{raw}")
 
-    def _validate_unittest_file_target(self, raw: str) -> None:
+    def _validate_unittest_file_target(
+        self,
+        raw: str,
+        cwd: Path | None,
+    ) -> str:
         """点名运行只接受相对 `.py` 文件，不接受可触发导入的模块名称。"""
+        normalized = raw
         if not raw.lower().endswith(".py"):
-            raise PolicyError(f"unittest 点名目标必须是工作区内 .py 文件：{raw}")
-        self._require_relative_paths([raw], "unittest")
+            if not self._SIMPLE_UNITTEST_TARGET.fullmatch(raw):
+                # 先以普通路径规则排除越界、绝对和敏感输入；安全但当前不支持
+                # 的 dotted/class/method 形式才属于可重新规划的命令形式。
+                self._require_relative_paths([raw], "unittest", cwd)
+                raise CommandFormError(
+                    CommandFormReason.LOCAL_TEST_TARGET_REQUIRED
+                )
+            if self._workspace_policy is None:
+                raise CommandFormError(
+                    CommandFormReason.LOCAL_TEST_TARGET_REQUIRED
+                )
+            normalized = f"{raw}.py"
+        self._require_relative_paths([normalized], "unittest", cwd)
         if self._workspace_policy is None:
-            return
+            return normalized
         try:
-            resolved = self._workspace_policy.resolve_path(raw, must_exist=True)
+            resolved = self._resolve_workspace_path(
+                normalized,
+                cwd,
+                must_exist=True,
+            )
+        except WorkspacePathNotFoundError:
+            raise CommandFormError(
+                CommandFormReason.LOCAL_TEST_TARGET_REQUIRED
+            ) from None
         except PolicyError:
-            raise PolicyError(f"unittest 测试文件不在工作区内：{raw}") from None
+            # 链接逃逸、敏感路径和边界错误仍是硬拒绝，不能降级成 REPLAN。
+            raise
         if not resolved.is_file():
-            raise PolicyError(f"unittest 测试目标不是普通文件：{raw}")
+            raise CommandFormError(CommandFormReason.LOCAL_TEST_TARGET_REQUIRED)
+        return normalized
 
     @classmethod
     def is_relaxed_git_metadata_command(cls, args: list[str]) -> bool:
@@ -507,6 +688,7 @@ class CommandPolicy:
         params: list[str],
         allowed: set[str],
         label: str,
+        cwd: Path | None,
     ) -> None:
         """选项必须在允许集合内；`--opt=value` 的值不能是外部路径。"""
         for token in params:
@@ -517,7 +699,7 @@ class CommandPolicy:
                 raise PolicyError(f"{label} 参数不在允许列表：{name}")
             if separator:
                 self._reject_path_like_value(value, label)
-        self._require_relative_paths(params, label)
+        self._require_relative_paths(params, label, cwd)
 
     def _validate_git(self, args: list[str]) -> list[str]:
         index = 1
@@ -544,7 +726,12 @@ class CommandPolicy:
                     self._reject_path_like_value(value, "git")
         return args
 
-    def _require_relative_paths(self, params: list[str], label: str) -> None:
+    def _require_relative_paths(
+        self,
+        params: list[str],
+        label: str,
+        cwd: Path | None,
+    ) -> None:
         """路径位置参数必须是在工作区内的相对路径，防止越界读取。"""
         for token in params:
             if token.startswith("-"):
@@ -559,7 +746,7 @@ class CommandPolicy:
                 raise PolicyError(f"{label} 不接受绝对或越界路径参数：{token}")
             if self._workspace_policy is not None:
                 try:
-                    self._workspace_policy.resolve_path(token, must_exist=False)
+                    self._resolve_workspace_path(token, cwd, must_exist=False)
                 except PolicyError:
                     raise PolicyError(f"{label} 路径不在工作区内：{token}")
                 continue
@@ -571,5 +758,6 @@ class CommandPolicy:
             or value.startswith(("/", "\\"))
             or ".." in value.split("/")
             or ".." in value.split("\\")
+            or is_sensitive_workspace_path(value)
         ):
             raise PolicyError(f"{label} 参数值不能是外部路径：{value}")

@@ -1911,6 +1911,11 @@ class SessionRuntimeTests(unittest.TestCase):
         )
         self.assertFalse(
             self.runtime._auto_approve_git_command(
+                ["C:\\python.exe", "-I", "--version"]
+            )
+        )
+        self.assertFalse(
+            self.runtime._auto_approve_git_command(
                 ["C:\\python.exe", "test/script.py"]
             )
         )

@@ -180,22 +180,36 @@ def audit_arguments(tools: object, action: ToolAction, result: ToolResult) -> di
     if action.tool == "run_command":
         context = getattr(tools, "context")
         command = arguments.get("command", "")
-        metadata = context.command_policy.audit_metadata(
-            command if isinstance(command, str) else "",
-        )
         cwd = arguments.get("cwd", ".")
         if isinstance(cwd, str):
             try:
                 resolved_cwd = context.workspace_policy.resolve_path(cwd)
+                if not resolved_cwd.is_dir():
+                    raise PolicyError("命令工作目录必须是目录")
                 relative_cwd = resolved_cwd.relative_to(context.workspace_policy.workspace)
+                command_policy = context.command_policy.scoped_to(
+                    context.workspace_policy
+                )
+                metadata = command_policy.audit_metadata(
+                    command if isinstance(command, str) else "",
+                    cwd=resolved_cwd,
+                )
                 metadata["cwd"] = {
                     "is_workspace": not relative_cwd.parts,
                     "depth": len(relative_cwd.parts),
                 }
             except (PolicyError, ValueError):
-                metadata["cwd"] = {"valid": False, "chars": len(cwd)}
+                metadata = {
+                    "command_valid": False,
+                    "command_chars": len(command) if isinstance(command, str) else 0,
+                    "cwd": {"valid": False, "chars": len(cwd)},
+                }
         else:
-            metadata["cwd"] = {"valid": False, "chars": 0}
+            metadata = {
+                "command_valid": False,
+                "command_chars": len(command) if isinstance(command, str) else 0,
+                "cwd": {"valid": False, "chars": 0},
+            }
         return metadata
     if action.tool == "finish":
         summary = arguments.get("summary", "")

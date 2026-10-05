@@ -1743,14 +1743,17 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
         client = MCPClient(
             "local_test",
             request,
-            initialize_timeout=2.0,
+            # Windows 冷启动时仅导入 MCP SDK 就可能接近 2 秒；这里验证的
+            # 是真实 stdio 生命周期，而不是依赖导入性能，因此为握手和
+            # 已确认的资源回收留出独立余量。
+            initialize_timeout=5.0,
             operation_timeout=2.0,
-            cleanup_timeout=2.0,
+            cleanup_timeout=5.0,
         )
 
         owner_task = None
         try:
-            await asyncio.wait_for(client.start(CancellationToken()), timeout=3.0)
+            await asyncio.wait_for(client.start(CancellationToken()), timeout=7.0)
             owner_task = client._lifecycle_task
             self.assertIsNotNone(owner_task)
             result = await asyncio.wait_for(
@@ -1759,7 +1762,7 @@ class MCPClientTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual("echo:client", result.text)
         finally:
-            await asyncio.wait_for(client.stop(), timeout=3.0)
+            await asyncio.wait_for(client.stop(), timeout=7.0)
 
         assert owner_task is not None
         self.assertEqual(MCPServerState.STOPPED, client.state)

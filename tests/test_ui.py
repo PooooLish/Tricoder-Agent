@@ -371,6 +371,27 @@ class TerminalUITests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertIn("命令执行", console.export_text())
 
+    def test_non_command_approval_titles_are_action_specific_or_generic(self) -> None:
+        """补丁、扩展、MCP 与工作区门禁不能都误标成命令执行。"""
+
+        cases = (
+            ("apply_patch", "补丁应用"),
+            ("dangerous_extension_tool", "危险扩展工具"),
+            ("dangerous_mcp_server_start", "MCP 服务启动"),
+            ("初始化工作区基线", "工作区基线初始化"),
+            ("确认任务前工作区差异", "工作区差异确认"),
+            ("unknown_action", "操作需要审批"),
+        )
+        for action, expected in cases:
+            with self.subTest(action=action):
+                ui, console = recording_ui(answers=[""])
+                self.assertFalse(ui.approve(action, "[bold]字面详情[/bold]"))
+                rendered = console.export_text()
+                self.assertIn(expected, rendered)
+                self.assertIn("[bold]字面详情[/bold]", rendered)
+                if action != "run_command":
+                    self.assertNotIn("命令执行", rendered)
+
     def test_doctor_error_and_completion_have_distinct_states(self) -> None:
         """防止检查、错误和完成信息混成难以扫描的普通文本。"""
         ui, console = recording_ui()

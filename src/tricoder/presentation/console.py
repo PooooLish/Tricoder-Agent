@@ -25,6 +25,17 @@ _PROVIDER_LABELS = {
     "glm": "GLM",
 }
 
+_APPROVAL_TITLES = {
+    "edit_file": "文件修改 · 需要审批",
+    "create_file": "文件创建 · 需要审批",
+    "apply_patch": "补丁应用 · 需要审批",
+    "run_command": "命令执行 · 需要审批",
+    "dangerous_extension_tool": "危险扩展工具 · 需要审批",
+    "dangerous_mcp_server_start": "MCP 服务启动 · 需要审批",
+    "初始化工作区基线": "工作区基线初始化 · 需要审批",
+    "确认任务前工作区差异": "工作区差异确认 · 需要审批",
+}
+
 
 def _distinct_session_prefixes(
     sessions: Sequence[SessionRecord],
@@ -415,7 +426,7 @@ class TerminalUI:
 
     def approve(self, action: str, detail: str) -> bool:
         self._stop_status()
-        if action in {"edit_file", "create_file"}:
+        if action in {"edit_file", "create_file", "apply_patch"}:
             renderable = Syntax(
                 detail,
                 "diff",
@@ -423,14 +434,9 @@ class TerminalUI:
                 word_wrap=True,
                 background_color="default",
             )
-            title = (
-                "文件修改 · 需要审批"
-                if action == "edit_file"
-                else "文件创建 · 需要审批"
-            )
         else:
             renderable = Text(detail)
-            title = "命令执行 · 需要审批"
+        title = _APPROVAL_TITLES.get(action, "操作需要审批")
         self.console.print(
             Panel(
                 renderable,

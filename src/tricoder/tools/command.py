@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,12 @@ from tricoder.task_cleanup import run_in_cleanup_thread
 from tricoder.models import ToolResult, tool_failure
 from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
 from tricoder.workspace.verification import stable_snapshots
-from tricoder.policy import CommandPolicy, PolicyError
+from tricoder.policy import (
+    CommandFormError,
+    CommandPolicy,
+    PolicyError,
+    command_form_feedback,
+)
 from tricoder.process.control import ProcessExecutionUncertain, run_bounded_process
 from tricoder.process.env import filtered_subprocess_env
 
@@ -57,7 +63,10 @@ def _git_command_escapes_workspace(
 
 class RunCommandTool(ToolHandler):
     name = "run_command"
-    description = "经审批后在工作区内运行受策略允许的命令。"
+    description = (
+        "经审批后在工作区内运行白名单命令；Python 别名统一使用会话解释器，"
+        "标准测试形式为 `python -m unittest discover -v`，版本查询仅用于诊断。"
+    )
     parameters = ToolHandler._schema(
         {"command": {"type": "string"}, "cwd": {"type": "string"}},
         ["command"],
@@ -92,25 +101,43 @@ class RunCommandTool(ToolHandler):
         if self.context.read_only:
             return tool_failure(ErrorCode.POLICY_DENIED, "只读模式禁止执行命令")
         command = self._required_str(arguments, "command")
-        args = self.context.command_policy.validate(command)
-        subprocess_env = self.context.command_policy.subprocess_environment()
         cwd = self.context.workspace_policy.resolve_path(str(arguments.get("cwd", ".")))
         if not cwd.is_dir():
             return tool_failure(ErrorCode.INVALID_ARGUMENT, "命令工作目录必须是目录")
+        command_policy = self.context.command_policy.scoped_to(
+            self.context.workspace_policy
+        )
+        try:
+            args = command_policy.validate(command, cwd=cwd)
+        except CommandFormError as exc:
+            return tool_failure(
+                ErrorCode.INVALID_ARGUMENT,
+                command_form_feedback(exc.reason),
+                recovery=RecoveryAction.REPLAN,
+            )
+        subprocess_env = command_policy.subprocess_environment()
+        information_command = CommandPolicy.is_information_command(args)
         executable = Path(args[0]).name.lower().removesuffix(".exe")
         if executable == "git" and _git_command_escapes_workspace(
             cwd,
-            self.context.command_policy,
+            command_policy,
         ):
             return tool_failure(
                 ErrorCode.POLICY_DENIED,
                 "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
             )
+        normalized_argv = json.dumps(args, ensure_ascii=False)
+        interpreter_note = (
+            "\n说明：Python 请求已归一化到当前会话解释器。"
+            if CommandPolicy._is_python_executable(args[0])
+            else ""
+        )
         detail = (
-            f"目录：{cwd}\n"
-            f"命令：{command}\n"
-            f"执行：{args[0]}\n"
+            f"原始请求：{command}\n"
+            f"归一化 argv：{normalized_argv}\n"
+            f"有效目录：{cwd}\n"
             f"超时：{self.context.timeout:g} 秒"
+            f"{interpreter_note}"
         )
         auto_approved = (
             self.context.auto_approve_git is not None
@@ -162,7 +189,9 @@ class RunCommandTool(ToolHandler):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
         stable = before is not None and after is not None and stable_snapshots(before, after)
-        if stable:
+        succeeded = completed.returncode == 0
+        information_stable = information_command and succeeded
+        if stable or information_stable:
             scope.unknown_effects = previous_unknown
         evidence = (scope.issue(before, after, completed.returncode == 0)
                     if before is not None and after is not None else None)
@@ -171,7 +200,6 @@ class RunCommandTool(ToolHandler):
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
-        succeeded = completed.returncode == 0
         return ToolResult(
             succeeded,
             self._bounded(output),
@@ -179,7 +207,11 @@ class RunCommandTool(ToolHandler):
                 succeeded if _is_verification_command(args) else None
             ),
             error=None if succeeded else ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN),
-            file_effects=FileEffects(EffectState.NONE if stable else EffectState.UNKNOWN),
+            file_effects=FileEffects(
+                EffectState.NONE
+                if stable or information_stable
+                else EffectState.UNKNOWN
+            ),
             verification_evidence=evidence,
         )
 

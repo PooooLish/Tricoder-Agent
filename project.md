@@ -1,12 +1,22 @@
 # Project: tricoder-cli
 
-## 2026-10-05 命令兼容与错误恢复方案交接（待实施）
+## 2026-10-05 Windows CI 修复（本地完成，等待远端验证）
 
-- 执行文档及 coding session 提示词：`docs/superpowers/plans/2026-10-05-command-compatibility-and-recovery.md`。本次仅编写方案，没有修改功能代码。
-- 范围：受信 Python 的 python3 别名、固定版本查询、unittest 简单本地目标归一化、cwd 一致性、审计分类、精确预执行纠错、工具说明与审批标题。
-- 安全约束：保留现有权限、审批和命令边界；版本查询不是验证证据；用户拒绝、越界及未知副作用仍停止，不将所有 POLICY_DENIED 降级为 REPLAN。
-- 下一步：coding session 以当前未提交工作树为基线按 S0—S5 实施，补充失败回归、合成任务真实进程验证和最终完整回归；不沿用历史测试数字宣称通过。
-- 验证范围：本次仅做文档自审及格式检查；实现与行为验收尚未进行。第一张截图没有实际命令参数，不能把版本查询假设记为调用日志。
+- 按用户要求取消 Linux CI，保留 Windows Python 3.11/3.12。新增 `test` 可选依赖 `setuptools>=68`，CI 安装 `.[test]`，解决包发现测试缺少构建工具的问题；未在本机安装依赖。
+- 敏感路径扫描测试的 guard 改用规范化根路径，避免 Windows 临时目录别名等路径写法差异导致 relative_to 抛 ValueError 并被包装成 io_error。用包含 `..` 的等价目录稳定复现旧失败；关闭路径排除的反向验证仍触发敏感文件断言，没有放宽安全检查或修改生产扫描逻辑。
+- 在 `runtime/ci-windows-fix` 独立 worktree（`codex/fix-windows-ci`，基线 `47d08af`）验证后，将 CI、pyproject、测试和 README 的最小补丁回填当前工作区；命令兼容任务的既有改动保留。本次未修改 src、未提交或推送。
+- 隔离完整回归：Windows / Python 3.11.6，1355 tests，OK，11 skipped，212.969s。隔离与回填后聚焦回归均为 22 tests、OK、1 skipped；185 个 Python 文件内存语法检查、CLI --help、git diff --check 通过。完整回归不包含主工作区另行进行的命令兼容修改。
+- 证据：`runtime/ci-windows-verification.md`。本机没有 Python 3.12，未执行新环境依赖安装；本次提交包含该修复，推送后仍须检查两组 Windows CI。Linux inode 重用相关测试问题未修复，恢复 Linux CI 前需要处理。
+
+## 2026-10-05 命令兼容与错误恢复（S0—S5 已实施）
+
+- 执行文档：`docs/superpowers/plans/2026-10-05-command-compatibility-and-recovery.md`；阶段证据位于 `runtime/command-compatibility/`。实现基线为已经提交并推送的 `47d08afb02f421f6130ea963ffcf33a4f1b9efad`，本轮改动由本次提交收口。
+- 六个 Python 请求别名统一到当前会话可信解释器；固定版本查询归一化为隔离参数且不产生 UNKNOWN 或验证证据。脚本、unittest 目标、discover 路径与审计均按同一个单次有效 cwd 解析，不修改共享策略。
+- unittest 单段简写只映射到 cwd 内已存在的 `.py` 普通文件。两个枚举化命令形式错误可返回固定脱敏的 `INVALID_ARGUMENT / REPLAN`；直接测试工具先经过等价 `python -m` 的完整安全校验。越界、敏感路径、禁止选项、未知程序、拒绝、取消与未知副作用继续停止，没有全局降级 `POLICY_DENIED`。
+- native/legacy_json 共用命令说明。审批显示原请求、归一化 argv、有效 cwd 与超时；Console 标题区分补丁、命令、扩展、MCP 和工作区门禁。strict/relaxed/fullaccess、read_only 与危险 MCP 边界保持既有语义。
+- 合成计算器使用 fake Provider 和当前虚拟环境的真实 Python 进程验证：native/legacy 成功路径获得真实 unittest 输出和有效工作区证据；错误实现测试失败、修改后仅查版本均不能被 finish 文案提升为成功；同步与异步工具入口一致。未调用真实 Provider、未读取真实密钥或用户会话数据库。
+- 最终 Windows / Python 3.11.6 新鲜回归：`Ran 1384 tests in 263.940s`，OK，12 项条件跳过；186 个 Python 文件内存语法检查、CLI `--help` 与 `git diff --check` 均退出 0。独立审查最初发现兼容构造的 CommandPolicy scoped view 未重新过滤目标工作区 PATH，新回归先证明会命中工作区 fake `git.exe`，修复后复核关闭；当前命令实现无剩余 Critical/Important。未验证 Linux/macOS、Python 3.12 和真实 Provider 端到端质量。并行出现的 Windows CI/pyproject/快照测试修改由上方独立任务记录，不归入本轮命令改造。
+- 提交前合并工作树复验首次发现两个真实 MCP stdio 用例在当前 Windows 机器上超时：fixture 仅导入 SDK 后立即退出已需 1.83—1.90 秒，而测试初始化预算为 2 秒。只将这两个测试的初始化/清理预算放宽到 5 秒、外层看门狗放宽到 7 秒，未修改生产超时或错误分类；聚焦 `2/2` 通过，随后完整回归 `Ran 1384 tests in 416.355s`，OK，12 项条件跳过。
 
 ## 2026-10-05 第二轮模块整理（S0—S5 已完成）
 

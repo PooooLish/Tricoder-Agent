@@ -75,6 +75,9 @@ class WorkspaceSnapshotTests(unittest.TestCase):
     def test_sensitive_and_control_paths_are_excluded_before_content_read(self) -> None:
         """若排除发生在打开后，扫描仍可能把真实凭据读入进程内存。"""
 
+        # 模拟 Windows 临时目录别名：调用方路径与 resolve 后路径指向
+        # 同一目录，但字符串不同。无需依赖机器是否启用 8.3 短文件名。
+        self.workspace = self.workspace / ".." / self.workspace.name
         (self.workspace / ".env.local").write_text("SECRET=must-not-read", encoding="utf-8")
         control = self.workspace / "runtime" / "tricoder-control"
         control.mkdir(parents=True)
@@ -84,9 +87,10 @@ class WorkspaceSnapshotTests(unittest.TestCase):
         from tricoder.workspace import snapshot as workspace_snapshot
 
         original = workspace_snapshot._read_entry
+        canonical_workspace = self.workspace.resolve(strict=True)
 
         def guarded(path, *args, **kwargs):  # type: ignore[no-untyped-def]
-            relative = path.relative_to(self.workspace).as_posix()
+            relative = path.relative_to(canonical_workspace).as_posix()
             if relative in {".env.local", "runtime/tricoder-control/workspace.lock"}:
                 self.fail(f"排除路径被打开：{relative}")
             return original(path, *args, **kwargs)

@@ -503,16 +503,18 @@ class MCPStdioIntegrationTests(unittest.IsolatedAsyncioTestCase):
         client = MCPClient(
             "local_test",
             self._launch_request("--exit-immediately"),
-            initialize_timeout=2.0,
+            # fixture 需要先导入真实 MCP SDK；Windows 冷启动可能接近 2 秒，
+            # 不能让依赖导入速度掩盖这里要检查的固定协议错误分类。
+            initialize_timeout=5.0,
             operation_timeout=2.0,
-            cleanup_timeout=2.0,
+            cleanup_timeout=5.0,
         )
 
         try:
             with self.assertRaisesRegex(MCPProtocolError, r"^mcp_protocol_error$"):
-                await asyncio.wait_for(client.start(CancellationToken()), timeout=3.0)
+                await asyncio.wait_for(client.start(CancellationToken()), timeout=7.0)
         finally:
-            await asyncio.wait_for(client.stop(), timeout=3.0)
+            await asyncio.wait_for(client.stop(), timeout=7.0)
 
         self.assertEqual(MCPServerState.FAILED, client.state)
         self.assertIsNone(client._lifecycle_task)

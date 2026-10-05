@@ -525,6 +525,16 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
   （`python <脚本>`；脚本必须解析为工作区内存在的普通 `.py` 文件，无 `..`、无绝对路径、
   无符号链接逃逸；**relaxed 不自动放行任何代码执行命令**，自动执行与否由权限级别控制，
   `fullaccess` 放行，`strict`/`relaxed` 仍需人工审批）。审批不是操作系统或容器沙箱的替代品。
+- `python`、`python.exe`、`py`、`py.exe`、`python3`、`python3.exe` 都使用当前
+  TriCoder 会话的可信解释器，不会分别从工作区或 PATH 选择另一套 Python。支持固定的
+  `python --version` / `python -V` 诊断；它不会产生测试通过证据，也不能替代修改后的验证。
+  推荐测试形式为 `python -m unittest discover -v`；单段 unittest 简写只在有效执行目录中
+  存在同名 `.py` 普通文件时转换为文件目标。命令路径始终按审批时显示的有效 cwd 校验和执行。
+- 安全但可改写的直接 `pytest`/`ruff`/`mypy` 入口或无法绑定本地文件的 unittest 目标会返回
+  `INVALID_ARGUMENT / REPLAN`，本次不审批、不启动进程，Agent 可在下一轮改为受支持形式。
+  越界/敏感路径、禁止选项、`python -c`、任意程序、Shell 管道、用户拒绝、取消及未知副作用
+  仍是停止边界；不会因为命令看起来像测试而降级。审批详情会显示原始请求、归一化 argv、
+  有效 cwd 和超时，但这些自由文本不会新增到审计或 Session 数据库。
 - 子进程环境会剔除名称匹配 `api_key`/`token`/`password`/`secret`/`credential` 等敏感模式的变量，
   防止 Provider API Key 与其它凭据泄漏给被执行的测试、脚本或子进程。
 - 发送任务会将相关代码片段交给所选 Provider；只应在获准发送的项目中使用。
@@ -611,7 +621,13 @@ Agent 效果已提升。真实运行会使用本机配置并可能产生费用�
 
 ### 无密钥自动化测试
 
-以下检查不联网，也不需要真实 API Key；GitHub Actions 会在 Windows/Linux 和 Python 3.11/3.12 上执行同样的验证：
+GitHub Actions 当前在 Windows 的 Python 3.11/3.12 上运行，暂不运行 Linux 环境检查；这不代表已经保证其他平台兼容。CI 会先安装项目和测试依赖。需要在新环境中运行测试时，先执行（安装步骤需要网络）：
+
+```powershell
+python -m pip install -e ".[test]"
+```
+
+`test` 可选依赖包含包发现测试使用的 setuptools；构建隔离环境中的 setuptools 不代表测试解释器也已安装它。依赖就绪后，以下检查不联网，也不需要真实 API Key：
 
 ```powershell
 python -m unittest discover -s tests -v

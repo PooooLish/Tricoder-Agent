@@ -7,6 +7,8 @@ from pathlib import Path
 
 import tricoder.policy as policy_module
 from tricoder.policy import (
+    CommandFormError,
+    CommandFormReason,
     CommandPolicy,
     PolicyArgumentError,
     PolicyError,
@@ -238,8 +240,12 @@ class CommandPolicyTests(unittest.TestCase):
         )
         for command in commands:
             with self.subTest(command=command):
-                with self.assertRaisesRegex(PolicyError, "python -m"):
+                with self.assertRaises(CommandFormError) as raised:
                     self.policy.validate(command)
+                self.assertEqual(
+                    CommandFormReason.DIRECT_TOOL_ENTRYPOINT,
+                    raised.exception.reason,
+                )
 
     def test_rejects_option_values_that_escape_workspace(self) -> None:
         """`--option=value` 的值可能是外部路径或越界片段，必须拒绝。"""
@@ -272,7 +278,6 @@ class CommandPolicyTests(unittest.TestCase):
             "python C:\\outside\\script.py",
             "python ..\\outside.py",
             "python script",
-            "python --version",
             "python .env/evil.py",
             "python .git/hooks/pre-commit.py",
             "python secrets/leak.py",
