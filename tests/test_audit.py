@@ -8,6 +8,23 @@ from tricoder.audit import AuditLogger, redact
 
 
 class AuditTests(unittest.TestCase):
+    def test_redact_preserves_only_known_reason_codes(self) -> None:
+        """固定原因码可检索，自由文本 reason 仍不得进入审计。"""
+
+        safe = redact({"reason": "native_missing_tool_call"})
+        private = redact({"reason": "PRIVATE-REASON-SENTINEL"})
+        structured = redact(
+            {"reason": {"message": "PRIVATE-NESTED-SENTINEL", "code": 7}}
+        )
+
+        self.assertEqual("native_missing_tool_call", safe["reason"])
+        self.assertNotIn("reason", private)
+        self.assertEqual(len("PRIVATE-REASON-SENTINEL"), private["reason_chars"])
+        self.assertEqual(
+            {"message_chars": len("PRIVATE-NESTED-SENTINEL"), "code": 7},
+            structured["reason"],
+        )
+
     def test_redacts_nested_secret_fields_without_losing_other_context(self) -> None:
         """防止嵌套凭据进入轨迹，同时保留可审计的非敏感字段。"""
         event = {

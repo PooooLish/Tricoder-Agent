@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-from tricoder.changes import FileSnapshot, TaskChangeSet
+from tricoder.changes import DirectorySnapshot, FileSnapshot, TaskChangeSet
 from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.policy import is_sensitive_workspace_path
 from tricoder.workspace.lock import CONTROL_DIRECTORY
@@ -540,6 +540,31 @@ def _entry_matches_journal_snapshot(
     )
 
 
+def _entry_matches_directory_snapshot(
+    entry: FileSnapshotEntry | None,
+    expected: DirectorySnapshot | None,
+    *,
+    identity_required: bool,
+) -> bool:
+    """按目录种类、权限和本地对象身份核对目录账本。"""
+
+    if expected is None:
+        return entry is None
+    if entry is None or entry.kind != "directory":
+        return False
+    return (
+        entry.mode == expected.mode
+        and (
+            not identity_required
+            or (
+                len(entry.identity) >= 3
+                and entry.identity[1] == expected.identity.device
+                and entry.identity[2] == expected.identity.inode
+            )
+        )
+    )
+
+
 def task_changes_match_baselines(
     before: WorkspaceBaseline,
     after: WorkspaceBaseline,
@@ -550,13 +575,20 @@ def task_changes_match_baselines(
 ) -> bool:
     """证明任务末状态只由账本的精确 before/after 与框架文件构成。"""
 
-    if change_set is not None and change_set.tainted_paths:
+    if change_set is not None and (
+        change_set.tainted_paths or change_set.tainted_directory_paths
+    ):
         return False
     comparison = compare_baselines(before, after)
     old = {entry.path: entry for entry in before.entries}
     new = {entry.path: entry for entry in after.entries}
     expected = (
         {change.path: change for change in change_set.changes}
+        if change_set is not None
+        else {}
+    )
+    expected_directories = (
+        {change.path: change for change in change_set.directory_changes}
         if change_set is not None
         else {}
     )
@@ -578,9 +610,28 @@ def task_changes_match_baselines(
         ):
             return False
 
+    for path, change in expected_directories.items():
+        if not _entry_matches_directory_snapshot(
+            old.get(path),
+            change.before,
+            identity_required=True,
+        ):
+            return False
+        if not _entry_matches_directory_snapshot(
+            new.get(path),
+            change.after,
+            identity_required=after_identity_required,
+        ):
+            return False
+
     expected_paths = set(expected)
+    expected_directory_paths = set(expected_directories)
     for change in comparison.changes:
-        if change.path in owned or change.path in expected_paths:
+        if (
+            change.path in owned
+            or change.path in expected_paths
+            or change.path in expected_directory_paths
+        ):
             continue
         is_directory = (
             (change.before is not None and change.before.kind == "directory")

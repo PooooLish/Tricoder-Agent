@@ -4,7 +4,11 @@ import unittest
 
 from tricoder.agent import _is_complete_tool_round
 from tricoder.models import Message, ProviderResponse, ToolCall
-from tricoder.protocols import LegacyJsonProtocol, NativeToolProtocol
+from tricoder.protocols import (
+    NATIVE_TEXT_FEEDBACK,
+    NativeToolProtocol,
+    LegacyJsonProtocol,
+)
 
 
 def _tool_result(role: str, *, kind: str = "tool_result") -> Message:
@@ -88,6 +92,14 @@ class ProtocolCompleteRoundTests(unittest.TestCase):
         resolved = NativeToolProtocol().resolve_action(response)
         self.assertEqual((), resolved.actions)
         self.assertIsNotNone(resolved.feedback)
+
+    def test_native_text_feedback_explains_how_to_finish_without_busywork(self) -> None:
+        """纠错必须指向 finish，而不是诱导模型用无关工具充数。"""
+
+        self.assertIn("finish", NATIVE_TEXT_FEEDBACK)
+        self.assertIn("summary", NATIVE_TEXT_FEEDBACK)
+        self.assertIn("无关", NATIVE_TEXT_FEEDBACK)
+        self.assertIn("只有仍有必要工作", NATIVE_TEXT_FEEDBACK)
 
     def test_is_complete_tool_round_none_uses_loose_any(self) -> None:
         """None 协议用宽松判定匹配任一协议，兼容旧 user 消息。"""

@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Callable, Concatenate, Mapping, ParamSpec, Protocol, TypeVar
 
 from tricoder.agent import AgentObserver, CodingAgent
-from tricoder.execution_state import EffectState, ExecutionState, FileEffects
+from tricoder.execution_state import EffectState, FileEffects
 from tricoder.audit import AuditLogger
 from tricoder.changes import (
     ChangeJournal,
+    DirectoryChange,
     FileChange,
     TaskChangeSet,
     UndoExecution,
@@ -69,7 +70,11 @@ from tricoder.session.store import (
 )
 from tricoder.tools import ToolContext, ToolRegistry, UndoConflictError
 from tricoder.workspace.verification import VerificationScope, stable_snapshots
-from tricoder.task_observation import current_task_observation, task_observation_scope
+from tricoder.task_observation import (
+    apply_tool_transition,
+    current_task_observation,
+    task_observation_scope,
+)
 from tricoder.workspace.lock import (
     WorkspaceIdentityError,
     WorkspaceLock,
@@ -210,6 +215,7 @@ class RuntimeStatus:
     verification: str = "未运行"
     context_messages: int = 0
     modified_files: int = 0
+    modified_directories: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +606,7 @@ class SessionRuntime:
             memory=memory,
             context=SessionContext(
                 modified_files=memory.modified_files,
+                modified_directories=original.context.modified_directories,
                 verification=memory.verification,
                 conversation_memory=cleared_conversation,
                 next_message_seq=original.context.next_message_seq,
@@ -819,6 +826,7 @@ class SessionRuntime:
                         "任务已取消",
                         0,
                         modified_files=active.context.modified_files,
+                        modified_directories=active.context.modified_directories,
                         verification=active.context.verification,
                         unknown_effects=active.context.unknown_effects,
                     )
@@ -1306,10 +1314,14 @@ class SessionRuntime:
                 False, "文件影响未确认；请检查实际文件并通过 /clear 明确确认", 0,
                 modified_files=original.context.modified_files, verification="待验证",
                 unknown_effects=True,
+                modified_directories=original.context.modified_directories,
             )
         original.journal.begin_task(
             tuple(original.context.modified_files),
             original.context.verification,
+        )
+        original.journal.set_directory_baseline(
+            tuple(original.context.modified_directories)
         )
         observation = current_task_observation()
         if observation is not None:
@@ -1468,6 +1480,7 @@ class SessionRuntime:
                                      verification="失败" if reconciled.verification_failure is not None else "待验证")
         result = replace(
             turn.result, modified_files=reconciled.modified_files,
+            modified_directories=reconciled.modified_directories,
             summary="任务已取消" if cancelled and turn.result.ok else turn.result.summary,
             cleanup_failed=turn.result.cleanup_failed or bool(
                 current_cleanup() is not None and current_cleanup().failed),
@@ -1527,15 +1540,9 @@ class SessionRuntime:
             effects = FileEffects(EffectState.UNKNOWN)
         if consumed_revision is None and not force and effects.state is EffectState.CONFIRMED:
             effects = FileEffects(EffectState.NONE)
-        state = ExecutionState(context.modified_files, context.verification, context.unknown_effects).observe(effects)
         if effects.state is EffectState.NONE:
             return context
-        return replace(context, modified_files=state.modified_files,
-                       verification=state.verification, unknown_effects=state.unknown_effects,
-                       verification_evidence=None,
-                       verification_failure=(None if effects.state is EffectState.CONFIRMED
-                                             else context.verification_failure),
-                       verification_required=True)
+        return apply_tool_transition(context, effects)
 
     @staticmethod
     def _invalidate_verification(active: ActiveSession, *, force: bool = False) -> ActiveSession:
@@ -1573,10 +1580,17 @@ class SessionRuntime:
         latest = self._require_active_session().journal.latest()
         if latest is None:
             return None
-        if latest.tainted_paths:
-            raise SessionRuntimeError(
-                f"无法显示，任务文件状态冲突：{'、'.join(latest.tainted_paths)}"
-            )
+        if latest.tainted_paths or latest.tainted_directory_paths:
+            if latest.tainted_directory_paths:
+                message = (
+                    "无法显示，任务文件或目录状态冲突："
+                    f"{'、'.join((*latest.tainted_paths, *latest.tainted_directory_paths))}"
+                )
+            else:
+                message = (
+                    f"无法显示，任务文件状态冲突：{'、'.join(latest.tainted_paths)}"
+                )
+            raise SessionRuntimeError(message)
         return render_change_set_diff(latest)
 
     @_idle_runtime_change
@@ -1585,7 +1599,10 @@ class SessionRuntime:
 
         active = self._require_active_session()
         change_set, tools = self._undo_inputs()
-        paths = tuple(change.path for change in change_set.changes)
+        paths = tuple(
+            change.path
+            for change in (*change_set.changes, *change_set.directory_changes)
+        )
         try:
             self._workspace_lock = WorkspaceLock.acquire(active.record.workspace)
         except WorkspaceLockBusyError as exc:
@@ -1669,7 +1686,12 @@ class SessionRuntime:
             self._release_undo_workspace()
             raise SessionRuntimeError("撤销预览不属于当前 Session，请重新预览")
         change_set, tools = self._undo_inputs()
-        paths = tuple(sorted(change.path for change in change_set.changes))
+        paths = tuple(
+            sorted(
+                change.path
+                for change in (*change_set.changes, *change_set.directory_changes)
+            )
+        )
         try:
             candidate = self._workspace_gate.capture_current(
                 active.record.workspace,
@@ -1716,7 +1738,11 @@ class SessionRuntime:
                     else "succeeded"
                 ),
             )
-            self._finish_undo_workspace(binding, accepted=False)
+            self._finish_undo_workspace(
+                binding,
+                accepted=False,
+                compensated_change_set=execution._compensated_change_set,
+            )
             return execution
 
         self.current.journal.clear_latest()
@@ -1729,6 +1755,7 @@ class SessionRuntime:
         context = replace(
             self.current.context,
             modified_files=change_set.before_modified_files,
+            modified_directories=change_set.before_modified_directories,
             verification="待验证",
         )
         self.current = replace(self.current, memory=memory, context=context)
@@ -1744,6 +1771,7 @@ class SessionRuntime:
             binding,
             accepted=True,
             restored_changes=execution._restored_changes,
+            restored_directory_changes=execution._restored_directory_changes,
         ):
             raise SessionRuntimeError("撤销已执行，但工作区收尾扫描或清理失败")
         return execution
@@ -1760,6 +1788,8 @@ class SessionRuntime:
         *,
         accepted: bool,
         restored_changes: tuple[FileChange, ...] = (),
+        restored_directory_changes: tuple[DirectoryChange, ...] = (),
+        compensated_change_set: TaskChangeSet | None = None,
     ) -> bool:
         """撤销收尾复扫；失败或部分效果绝不更新可信基线。"""
 
@@ -1784,19 +1814,91 @@ class SessionRuntime:
                     change.path: change
                     for change in restored_changes
                 }
-                if (
-                    len(restored) != len(restored_changes)
-                    or set(restored) != set(originals)
-                    or any(
-                        restored[path].before != original.after
-                        for path, original in originals.items()
+                original_directories = {
+                    change.path: change
+                    for change in binding.change_set.directory_changes
+                }
+                restored_directories = {
+                    change.path: change
+                    for change in restored_directory_changes
+                }
+                if compensated_change_set is not None:
+                    compensated_files = {
+                        change.path: change
+                        for change in compensated_change_set.changes
+                    }
+                    compensated_directories = {
+                        change.path: change
+                        for change in compensated_change_set.directory_changes
+                    }
+                    if (
+                        len(compensated_files)
+                        != len(compensated_change_set.changes)
+                        or set(compensated_files) != set(originals)
+                        or any(
+                            compensated_files[path].before != original.before
+                            for path, original in originals.items()
+                        )
+                        or len(compensated_directories)
+                        != len(compensated_change_set.directory_changes)
+                        or set(compensated_directories)
+                        != set(original_directories)
+                        or any(
+                            compensated_directories[path].before != original.before
+                            for path, original in original_directories.items()
+                        )
+                    ):
+                        raise ValueError("撤销补偿证据不完整或不匹配")
+                    reversed_change_set = replace(
+                        binding.change_set,
+                        changes=tuple(
+                            FileChange(
+                                path,
+                                originals[path].after,
+                                compensated_files[path].after,
+                            )
+                            for path in sorted(originals)
+                        ),
+                        directory_changes=tuple(
+                            DirectoryChange(
+                                path,
+                                original_directories[path].after,
+                                compensated_directories[path].after,
+                            )
+                            for path in sorted(original_directories)
+                        ),
+                        tainted_paths=(),
+                        tainted_directory_paths=(),
                     )
-                ):
-                    raise ValueError("撤销恢复证据不完整或不匹配")
-                reversed_change_set = replace(
-                    binding.change_set,
-                    changes=tuple(restored[path] for path in sorted(restored)),
-                )
+                else:
+                    if (
+                        len(restored) != len(restored_changes)
+                        or set(restored) != set(originals)
+                        or any(
+                            restored[path].before != original.after
+                            for path, original in originals.items()
+                        )
+                        or len(restored_directories)
+                        != len(restored_directory_changes)
+                        or set(restored_directories) != set(original_directories)
+                        or any(
+                            restored_directories[path].before != original.after
+                            for path, original in original_directories.items()
+                        )
+                    ):
+                        raise ValueError("撤销恢复证据不完整或不匹配")
+                    reversed_change_set = replace(
+                        binding.change_set,
+                        changes=tuple(
+                            restored[path] for path in sorted(restored)
+                        ),
+                        directory_changes=tuple(
+                            restored_directories[path]
+                            for path in sorted(restored_directories)
+                        ),
+                        tainted_paths=(),
+                        tainted_directory_paths=(),
+                    )
                 attributable = task_changes_match_baselines(
                     binding.baseline,
                     current,
@@ -1808,7 +1910,36 @@ class SessionRuntime:
             except (TypeError, ValueError):
                 changed = True
                 attributable = False
-            if accepted and attributable:
+            if compensated_change_set is not None and attributable:
+                try:
+                    self.current.journal.replace_latest(
+                        binding.change_set,
+                        compensated_change_set,
+                    )
+                except Exception:
+                    complete = False
+                    self._workspace_baseline_unresolved.add(binding.session_id)
+                    self._invalidate_current_after_workspace_finish_failure()
+                else:
+                    # 补偿重建会改变目录/文件 identity；即使源码正文相同，
+                    # 旧验证证据绑定的工作区版本也已失效，必须立即撤销 authority。
+                    self.current = self._invalidate_verification(
+                        self.current,
+                        force=True,
+                    )
+                    self._cache_current()
+                    self._memory_dirty = (
+                        self.current.memory != self._persisted_memory
+                    )
+                    if not self._persist_current():
+                        complete = False
+                    self._workspace_baselines[binding.session_id] = current
+                    self._workspace_baseline_unresolved.discard(binding.session_id)
+            elif compensated_change_set is not None:
+                complete = False
+                self._workspace_baseline_unresolved.add(binding.session_id)
+                self._invalidate_current_after_workspace_finish_failure()
+            elif accepted and attributable:
                 self._workspace_baselines[binding.session_id] = current
                 self._workspace_baseline_unresolved.discard(binding.session_id)
             elif accepted:
@@ -2022,6 +2153,9 @@ class SessionRuntime:
             verification=self.current.memory.verification,
             context_messages=len(self.current.context.messages),
             modified_files=len(self.current.memory.modified_files),
+            modified_directories=len(
+                self.current.context.modified_directories
+            ),
         )
 
     def render_memory(self) -> str:

@@ -132,6 +132,9 @@ class ToolBatchExecutor:
                 if self.observation is not None:
                     latest, _ = self.observation.reconcile(state.execution_context())
                     state.modified_files = list(latest.modified_files)
+                    state.modified_directories = list(
+                        latest.modified_directories
+                    )
                     state.verification = latest.verification
                     state.unknown_effects = latest.unknown_effects
                     state.evidence = latest.verification_evidence
@@ -370,7 +373,11 @@ class ToolBatchExecutor:
         ) or (
             self.observation is not None and self.observation.unknown_effects
         ):
-            effects = FileEffects(EffectState.UNKNOWN, effects.paths)
+            effects = FileEffects(
+                EffectState.UNKNOWN,
+                effects.paths,
+                effects.directory_paths,
+            )
         state.file_effects_observed = not interrupted
         candidate = result.verification_evidence
         if not (
@@ -385,6 +392,7 @@ class ToolBatchExecutor:
             candidate,
         )
         state.modified_files = list(observed.modified_files)
+        state.modified_directories = list(observed.modified_directories)
         state.verification = observed.verification
         state.unknown_effects = observed.unknown_effects
         state.evidence = observed.verification_evidence

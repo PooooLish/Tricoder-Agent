@@ -570,6 +570,7 @@ class ToolTests(unittest.TestCase):
                 "search_text",
                 "glob_files",
                 "edit_file",
+                "create_directory",
                 "create_file",
                 "apply_patch",
                 "run_command",
@@ -611,8 +612,20 @@ class ToolTests(unittest.TestCase):
                 },
                 ["path", "old_text", "new_text"],
             ),
+            "create_directory": (
+                {
+                    "path": {"type": "string"},
+                    "parents": {"type": "boolean"},
+                    "exist_ok": {"type": "boolean"},
+                },
+                ["path"],
+            ),
             "create_file": (
-                {"path": {"type": "string"}, "content": {"type": "string"}},
+                {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "create_parents": {"type": "boolean"},
+                },
                 ["path", "content"],
             ),
             "apply_patch": ({"patch": {"type": "string"}}, ["patch"]),

@@ -178,6 +178,30 @@ class EffectStateTests(unittest.TestCase):
         self.assertEqual(("a.py",), updated.modified_files)
         self.assertEqual("待验证", updated.verification)
 
+    def test_directory_effects_stay_separate_and_do_not_clear_previous_failure(self):
+        """目录变更使旧通过失效，但不能冒充文件修复并清除失败快照。"""
+        from tricoder.execution_state import EffectState, FileEffects
+        from tricoder.task_observation import apply_tool_transition
+
+        failure = object()
+        original = SessionContext(
+            verification="失败",
+            verification_failure=failure,  # type: ignore[arg-type]
+            verification_required=True,
+        )
+        updated = apply_tool_transition(
+            original,
+            FileEffects(
+                EffectState.CONFIRMED,
+                directory_paths=("game",),
+            ),
+        )
+
+        self.assertEqual((), updated.modified_files)
+        self.assertEqual(("game",), updated.modified_directories)
+        self.assertIs(failure, updated.verification_failure)
+        self.assertEqual("失败", updated.verification)
+
     def test_uncertainty_survives_a_later_noop(self):
         from tricoder.execution_state import EffectState, ExecutionState, FileEffects
         state = ExecutionState().observe(FileEffects(EffectState.UNKNOWN))

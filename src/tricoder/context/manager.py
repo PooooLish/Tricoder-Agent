@@ -9,9 +9,12 @@ from typing import Iterable, Literal, Sequence
 from tricoder.context.memory import (
     ConversationMemory,
     MemoryValidationError,
+    TASK_TERMINATION_KIND,
+    TASK_TERMINATION_NOTICE,
     merge_candidate,
     merge_review_candidate,
     source_id_for_sequence,
+    with_task_termination_facts,
 )
 from tricoder.models import Message, SessionContext, TokenUsage, ToolDefinition
 from tricoder.protocols import ActionProtocol
@@ -281,6 +284,7 @@ class ContextManager:
             for message in plan.source_messages
             if message.message_seq is not None
         }
+        candidate = with_task_termination_facts(candidate, plan.source_messages)
         merged = merge_candidate(
             previous,
             candidate,
@@ -422,6 +426,7 @@ class ContextManager:
             for message in plan.source_messages
             if message.message_seq is not None
         }
+        candidate = with_task_termination_facts(candidate, plan.source_messages)
         return merge_review_candidate(
             previous,
             candidate,
@@ -707,7 +712,7 @@ class ContextManager:
         return ends
 
     def _is_closed_task_block(self, block: list[Message]) -> bool:
-        """接受已纠正的协议噪声，但必须完整覆盖且最终存在工具回合。"""
+        """只接受完整工具回合，或以可信失败终止组结尾的完整任务。"""
 
         if not block or block[0].kind != "task":
             return False
@@ -715,6 +720,13 @@ class ContextManager:
         groups = self._collect_current_groups(body)
         if sum(len(group) for group in groups) != len(body):
             return False
+        terminal_groups = [
+            index
+            for index, group in enumerate(groups)
+            if len(group) == 2 and self._is_task_termination(group[1])
+        ]
+        if terminal_groups:
+            return terminal_groups == [len(groups) - 1]
         return any(
             self._complete_round_tail(group, 0) == len(group)
             for group in groups
@@ -773,7 +785,10 @@ class ContextManager:
                 message.role == "assistant"
                 and not message.tool_calls
                 and index + 1 < len(messages)
-                and messages[index + 1].kind == "protocol_feedback"
+                and (
+                    messages[index + 1].kind == "protocol_feedback"
+                    or self._is_task_termination(messages[index + 1])
+                )
             ):
                 groups.append(messages[index : index + 2])
                 index += 2
@@ -782,6 +797,18 @@ class ContextManager:
                 groups.append([message])
             index += 1
         return groups
+
+    @staticmethod
+    def _is_task_termination(message: Message) -> bool:
+        """识别程序生成的精确失败终止标记，不接受普通用户文本冒充。"""
+
+        return bool(
+            message.role == "user"
+            and message.kind == TASK_TERMINATION_KIND
+            and message.content == TASK_TERMINATION_NOTICE
+            and not message.tool_calls
+            and message.tool_call_id is None
+        )
 
     def _complete_round_tail(
         self,

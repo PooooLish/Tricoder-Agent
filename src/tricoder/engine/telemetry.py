@@ -123,6 +123,7 @@ def audit_failure_result(
     tool_calls: int,
     modified_files: list[str],
     verification: str,
+    modified_directories: list[str] | None = None,
 ) -> RunResult:
     """构造统一的审计失败结果，不改写已观察到的任务事实。"""
 
@@ -133,6 +134,7 @@ def audit_failure_result(
         tool_calls,
         tuple(modified_files),
         verification,
+        modified_directories=tuple(modified_directories or ()),
     )
 
 
@@ -168,6 +170,13 @@ def audit_arguments(tools: object, action: ToolAction, result: ToolResult) -> di
         return {
             "path": arguments.get("path"),
             "content_chars": len(content) if isinstance(content, str) else 0,
+            "create_parents": arguments.get("create_parents", False),
+        }
+    if action.tool == "create_directory":
+        return {
+            "path": arguments.get("path"),
+            "parents": arguments.get("parents", True),
+            "exist_ok": arguments.get("exist_ok", True),
         }
     if action.tool == "apply_patch":
         patch_text = arguments.get("patch", "")

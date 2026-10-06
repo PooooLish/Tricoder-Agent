@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from tricoder.changes import (
     ChangeBudgetError,
+    DirectorySnapshot,
     FileChange,
     FileSnapshot,
 )
@@ -115,6 +116,12 @@ class ToolHandler:
         if self.context.change_journal is not None:
             self.context.change_journal.reserve(changes)
 
+    def _reserve_directories(self, paths: tuple[str, ...]) -> None:
+        """有活动账本时在审批前预留目录数量预算。"""
+
+        if self.context.change_journal is not None:
+            self.context.change_journal.reserve_directories(paths)
+
     def _record_committed(
         self,
         path: str,
@@ -125,6 +132,30 @@ class ToolHandler:
 
         if self.context.change_journal is not None:
             self.context.change_journal.record_committed(path, before, after)
+
+    def _record_directory_committed(
+        self,
+        path: str,
+        before: DirectorySnapshot | None,
+        after: DirectorySnapshot | None,
+    ) -> None:
+        """仅在目录创建或安全补偿完成后记录真实身份。"""
+
+        if self.context.change_journal is not None:
+            self.context.change_journal.record_directory_committed(
+                path, before, after
+            )
+
+    def _mark_directory_journal_tainted(self, path: str) -> None:
+        """尽力封住无法证明身份或补偿结果的目录路径。"""
+
+        journal = self.context.change_journal
+        if journal is None:
+            return
+        try:
+            journal.mark_directory_tainted(path)
+        except Exception:
+            pass
 
     def _journal_before_is_continuous(
         self,

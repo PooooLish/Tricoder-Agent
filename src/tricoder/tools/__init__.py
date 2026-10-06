@@ -36,6 +36,7 @@ from tricoder.tools.binding import (
     _stat_identity,
 )
 from tricoder.tools.command import FinishTool, GitDiffTool, RunCommandTool
+from tricoder.tools.directory import CreateDirectoryTool
 from tricoder.tools.filesystem import ListFilesTool, ReadFileTool
 from tricoder.tools.gitignore import _GitIgnoreMatcher
 from tricoder.tools.handlers import Approver, InvalidToolArgument, ToolHandler
@@ -49,6 +50,7 @@ _HANDLER_CLASSES = (
     SearchTextTool,
     GlobFilesTool,
     EditFileTool,
+    CreateDirectoryTool,
     CreateFileTool,
     ApplyPatchTool,
     RunCommandTool,
@@ -77,6 +79,7 @@ _BUILTIN_RISKS = {
     "search_text": "read",
     "glob_files": "read",
     "edit_file": "write",
+    "create_directory": "write",
     "create_file": "write",
     "apply_patch": "write",
     "run_command": "process",
@@ -389,8 +392,16 @@ class ToolRegistry:
     def _effect_scope(
         self, name: str, handler: ToolHandler,
     ) -> AbstractContextManager[ChangeJournal | None]:
-        if (self._builtin_handlers.get(name) is handler
-                and type(handler) in (EditFileTool, CreateFileTool, ApplyPatchTool)):
+        if (
+            self._builtin_handlers.get(name) is handler
+            and type(handler)
+            in (
+                EditFileTool,
+                CreateDirectoryTool,
+                CreateFileTool,
+                ApplyPatchTool,
+            )
+        ):
             return handler.collect_effects()
         return nullcontext(None)
 
@@ -439,6 +450,7 @@ class ToolRegistry:
             )) if result.ok else ()
             effects = FileEffects(EffectState.CONFIRMED, legacy) if legacy else FileEffects(EffectState.NONE)
         paths = []
+        directory_paths = []
         uncertain = effects.state is EffectState.UNKNOWN
         for path in effects.paths:
             try:
@@ -449,8 +461,34 @@ class ToolRegistry:
                 paths.append(canonical)
             except (PolicyError, OSError, ValueError):
                 uncertain = True
-        state = EffectState.UNKNOWN if uncertain else EffectState.CONFIRMED if paths else EffectState.NONE
-        return replace(result, file_effects=FileEffects(state, tuple(paths)))
+        for path in effects.directory_paths:
+            try:
+                resolved = self.context.workspace_policy.resolve_path(
+                    path, must_exist=False
+                )
+                canonical = resolved.relative_to(
+                    self.context.workspace_policy.workspace
+                ).as_posix()
+                if canonical != path:
+                    raise ValueError("目录副作用路径不是规范路径")
+                directory_paths.append(canonical)
+            except (PolicyError, OSError, ValueError):
+                uncertain = True
+        state = (
+            EffectState.UNKNOWN
+            if uncertain
+            else EffectState.CONFIRMED
+            if paths or directory_paths
+            else EffectState.NONE
+        )
+        return replace(
+            result,
+            file_effects=FileEffects(
+                state,
+                tuple(paths),
+                tuple(directory_paths),
+            ),
+        )
 
     def _prepare_execution(
         self,

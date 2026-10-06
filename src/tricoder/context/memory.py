@@ -16,6 +16,13 @@ MAX_ARCHIVED_ITEMS = 40
 MAX_ITEM_TEXT_CHARS = 500
 MAX_ITEM_SOURCES = 8
 DEFAULT_SUMMARY_MAX_CHARS = 6_000
+TASK_TERMINATION_KIND = "task_termination"
+TASK_TERMINATION_NOTICE = (
+    "本轮已停止：结束协议纠正失败；任务未完成，结果仍需确认。"
+)
+TASK_TERMINATION_MEMORY_TEXT = (
+    "任务因结束协议纠正失败而停止，未完成结果仍需确认。"
+)
 
 _ITEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SOURCE_ID = re.compile(r"^m([1-9][0-9]*)$")
@@ -141,6 +148,51 @@ def assign_message_sequences(
         task_id = message.task_id or current_task_id
         normalized.append(replace(message, message_seq=sequence, task_id=task_id))
     return tuple(normalized), cursor
+
+
+def with_task_termination_facts(
+    candidate: ConversationMemory,
+    source_messages: Sequence[Message],
+) -> ConversationMemory:
+    """把程序生成的失败终止标记确定性保留为待办。
+
+    摘要模型不能把执行失败变成成功事实，也不能保证主动保留所有失败。
+    因此这里只接受 Runner 生成的精确标记，并用该消息自身作为唯一来源；
+    真正的候选校验、容量限制与合并规则仍由后续统一流程执行。
+    """
+
+    if not isinstance(candidate, ConversationMemory):
+        raise MemoryValidationError("记忆候选类型无效")
+    open_items = list(candidate.open_items)
+    by_id = {item.id: item for item in open_items}
+    for message in source_messages:
+        if message.kind != TASK_TERMINATION_KIND:
+            continue
+        if (
+            message.role != "user"
+            or message.content != TASK_TERMINATION_NOTICE
+            or message.message_seq is None
+            or message.task_id is None
+            or message.tool_calls
+            or message.tool_call_id is not None
+        ):
+            raise MemoryValidationError("任务终止标记无效")
+        item = MemoryItem(
+            id=f"task-termination-{message.message_seq}",
+            text=TASK_TERMINATION_MEMORY_TEXT,
+            source_ids=(source_id_for_sequence(message.message_seq),),
+            scope="task",
+            task_id=message.task_id,
+            state="pending",
+        )
+        existing = by_id.get(item.id)
+        if existing is not None:
+            if existing != item:
+                raise MemoryValidationError("任务终止记忆与摘要候选冲突")
+            continue
+        open_items.append(item)
+        by_id[item.id] = item
+    return replace(candidate, open_items=tuple(open_items))
 
 
 def memory_to_json(memory: ConversationMemory) -> str:

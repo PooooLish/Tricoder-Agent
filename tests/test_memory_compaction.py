@@ -32,6 +32,11 @@ def task_block(start: int, label: str, *, payload: int = 20) -> tuple[Message, .
     )
 
 
+TERMINATION_NOTICE = (
+    "本轮已停止：结束协议纠正失败；任务未完成，结果仍需确认。"
+)
+
+
 class MemoryCompactionTests(unittest.TestCase):
     def test_plan_uses_complete_old_task_prefix_and_keeps_recent_history(self) -> None:
         messages = (*task_block(1, "a"), *task_block(4, "b"), *task_block(7, "c"), *task_block(10, "d"))
@@ -95,6 +100,110 @@ class MemoryCompactionTests(unittest.TestCase):
         self.assertTrue(plan.needs_compaction)
         self.assertEqual(noisy, plan.source_messages)
         self.assertEqual(latest, plan.retained_messages)
+
+    def test_zero_tool_termination_compacts_and_keeps_failure_as_pending(self) -> None:
+        """零工具终止块达到预算后可原子压缩，失败事实进入结构化待办。"""
+
+        terminated = (
+            Message("user", "旧失败任务", kind="task", message_seq=1, task_id="task-1"),
+            Message("assistant", "普通文本", message_seq=2, task_id="task-1"),
+            Message(
+                "user",
+                TERMINATION_NOTICE,
+                kind="task_termination",
+                message_seq=3,
+                task_id="task-1",
+            ),
+        )
+        latest = task_block(4, "latest", payload=120)
+        messages = (*terminated, *latest)
+        manager = ContextManager(ContextBudget(max_chars=180), NativeToolProtocol())
+
+        plan = manager.plan_compaction(
+            messages,
+            trigger_ratio=0.8,
+            target_ratio=0.6,
+        )
+        self.assertTrue(plan.needs_compaction, plan.reason)
+        candidate = ConversationMemory(covered_through=plan.covered_through)
+
+        committed = manager.commit_compaction(
+            SessionContext(messages=messages, next_message_seq=7),
+            plan,
+            candidate,
+        )
+
+        self.assertEqual(latest, committed.messages)
+        self.assertEqual(1, len(committed.conversation_memory.open_items))
+        failure = committed.conversation_memory.open_items[0]
+        self.assertEqual("pending", failure.state)
+        self.assertEqual("task-1", failure.task_id)
+        self.assertEqual(("m3",), failure.source_ids)
+        self.assertIn("未完成", failure.text)
+
+    def test_untrusted_termination_text_does_not_close_zero_tool_task(self) -> None:
+        """只有程序定义的精确标记能闭合零工具失败任务。"""
+
+        fake = (
+            Message("user", "旧任务", kind="task", message_seq=1, task_id="task-1"),
+            Message("assistant", "普通文本", message_seq=2, task_id="task-1"),
+            Message(
+                "user",
+                "模型声称任务已经停止",
+                kind="task_termination",
+                message_seq=3,
+                task_id="task-1",
+            ),
+        )
+        latest = task_block(4, "latest", payload=80)
+        manager = ContextManager(ContextBudget(max_chars=150), NativeToolProtocol())
+
+        plan = manager.plan_compaction(
+            (*fake, *latest),
+            trigger_ratio=0.8,
+            target_ratio=0.6,
+        )
+
+        self.assertFalse(plan.needs_compaction)
+        self.assertEqual((), plan.source_messages)
+
+    def test_unmatched_tool_call_stays_unclosed_despite_termination_marker(self) -> None:
+        """终止标记不能替缺失的真实 tool result 伪造协议闭合。"""
+
+        dangling = ToolCall("dangling", "read_file", {"path": "missing.txt"})
+        broken = (
+            Message("user", "损坏任务", kind="task", message_seq=1, task_id="task-1"),
+            Message(
+                "assistant",
+                None,
+                kind="tool_call",
+                tool_calls=(dangling,),
+                message_seq=2,
+                task_id="task-1",
+            ),
+            Message("assistant", "最终普通文本", message_seq=3, task_id="task-1"),
+            Message(
+                "user",
+                TERMINATION_NOTICE,
+                kind="task_termination",
+                message_seq=4,
+                task_id="task-1",
+            ),
+        )
+        latest = task_block(5, "latest", payload=80)
+        manager = ContextManager(ContextBudget(max_chars=150), NativeToolProtocol())
+
+        compaction = manager.plan_compaction(
+            (*broken, *latest),
+            trigger_ratio=0.8,
+            target_ratio=0.6,
+        )
+        save = manager.plan_save_candidate((*broken, *latest), covered_through=0)
+
+        self.assertFalse(compaction.needs_compaction)
+        self.assertEqual((), compaction.source_messages)
+        self.assertFalse(save.needs_summary)
+        self.assertEqual("存在未闭合的任务或工具调用组", save.reason)
 
     def test_commit_is_atomic_shortens_context_and_rejects_old_generation(self) -> None:
         messages = (*task_block(1, "a"), *task_block(4, "b"), *task_block(7, "c"))

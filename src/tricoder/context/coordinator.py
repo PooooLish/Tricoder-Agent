@@ -335,12 +335,20 @@ class MemoryCoordinator:
                     ),
                 ),
             )
-            committed = self.context_manager.commit_compaction(
-                context,
-                plan,
-                summary_result.candidate,
-                summary_max_chars=self.memory_config.summary_max_chars,
-            )
+            try:
+                committed = self.context_manager.commit_compaction(
+                    context,
+                    plan,
+                    summary_result.candidate,
+                    summary_max_chars=self.memory_config.summary_max_chars,
+                )
+            except MemoryValidationError as exc:
+                # 候选解析成功后仍可能在合并时触发容量、来源或过期校验；
+                # 统一转成安全摘要失败，确保原历史不会因底层异常被替换。
+                raise MemorySummaryError(
+                    "记忆摘要候选提交失败",
+                    code="commit",
+                ) from exc
             if not self.log(
                 {
                     "status": "memory_compacted",

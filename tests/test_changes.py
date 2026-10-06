@@ -10,6 +10,8 @@ from tricoder.changes import (
     ChangeBudgetError,
     ChangeJournal,
     ChangeJournalError,
+    DirectoryChange,
+    DirectorySnapshot,
     FileChange,
     FileIdentity,
     FileSnapshot,
@@ -67,6 +69,61 @@ class ChangeJournalTests(unittest.TestCase):
         journal.record_committed("new.py", created, None)
 
         self.assertIsNone(journal.seal_task((), "not-run"))
+
+    def test_directory_create_and_compensation_are_net_zero_but_advance_revision(self) -> None:
+        """目录补偿不能留下可撤销净变化，但异常观察游标必须看见两次提交。"""
+        journal = ChangeJournal()
+        created = DirectorySnapshot("game", 0o755, FileIdentity(1, 30))
+        journal.begin_task((), "未运行")
+
+        journal.record_directory_committed("game", None, created)
+        first_revision = journal.active_revision
+        journal.record_directory_committed("game", created, None)
+
+        self.assertGreater(journal.active_revision, first_revision)
+        effects = journal.active_effects_since(0)
+        self.assertEqual(("game",), effects.directory_paths)
+        self.assertIsNone(journal.seal_task((), "未运行"))
+
+    def test_directory_changes_preserve_real_identity_and_modified_directory_state(self) -> None:
+        """目录必须使用独立快照，不能作为空内容文件混入 modified_files。"""
+        journal = ChangeJournal()
+        created = DirectorySnapshot("game/src", 0o755, FileIdentity(2, 40))
+        journal.begin_task(("old.py",), "通过", ("existing",))
+
+        journal.record_directory_committed("game/src", None, created)
+        change_set = journal.seal_task(
+            ("old.py",),
+            "待验证",
+            ("existing", "game/src"),
+        )
+
+        self.assertIsNotNone(change_set)
+        assert change_set is not None
+        self.assertEqual((), change_set.changes)
+        self.assertEqual(
+            (DirectoryChange("game/src", None, created),),
+            change_set.directory_changes,
+        )
+        self.assertEqual(("existing",), change_set.before_modified_directories)
+        self.assertEqual(
+            ("existing", "game/src"),
+            change_set.after_modified_directories,
+        )
+
+    def test_directory_budget_rejects_projected_total_before_commit(self) -> None:
+        """单任务目录数量上限必须在写盘前拒绝，而不是事后截断账本。"""
+        journal = ChangeJournal(max_directories=1)
+        journal.begin_task((), "未运行")
+        journal.reserve_directories(("game",))
+        journal.record_directory_committed(
+            "game",
+            None,
+            DirectorySnapshot("game", 0o755, FileIdentity(1, 1)),
+        )
+
+        with self.assertRaises(ChangeBudgetError):
+            journal.reserve_directories(("game/src",))
 
     def test_record_committed_requires_active_task(self) -> None:
         """防止未开始任务时写入无法归属的变更。"""

@@ -9,7 +9,7 @@ from tricoder.context.coordinator import (
     MemoryStepProgress,
 )
 from tricoder.context.manager import CompactionPlan, SaveCandidatePlan
-from tricoder.context.memory import ConversationMemory
+from tricoder.context.memory import ConversationMemory, MemoryValidationError
 from tricoder.context.summarizer import MemorySummaryError, MemorySummaryResult
 from tricoder.core.cancellation import CancellationToken
 from tricoder.engine.state import AgentRunState
@@ -65,6 +65,14 @@ class _TwoBatchManager:
     def plan_save_candidate(messages, *, covered_through):  # type: ignore[no-untyped-def]
         copied = tuple(messages)
         return SaveCandidatePlan(copied[:1], max(covered_through, 1), True)
+
+
+class _CommitRejectingManager(_TwoBatchManager):
+    """模拟终止待办触发容量或来源校验失败。"""
+
+    @staticmethod
+    def commit_compaction(context, plan, candidate, **_kwargs):  # type: ignore[no-untyped-def]
+        raise MemoryValidationError("synthetic commit rejection")
 
 
 class _TwoBatchSummarizer:
@@ -153,6 +161,30 @@ async def _prepare_review(
 
 
 class AgentMemoryBoundaryCharacterizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compaction_commit_rejection_becomes_safe_summary_failure(self) -> None:
+        """提交校验失败必须保留原历史，并进入既有安全摘要失败路径。"""
+
+        state = _state()
+        original_messages = tuple(state.messages[state.history_start :])
+        original_memory = state.conversation_memory
+        coordinator = MemoryCoordinator(
+            _CommitRejectingManager(),  # type: ignore[arg-type]
+            MemoryConfig(compaction="structured"),
+            _TwoBatchSummarizer(),
+            lambda _message: None,
+            lambda _event: True,
+            audit_failure_message="audit failed",
+        )
+
+        with self.assertRaises(MemorySummaryError) as captured:
+            await _prepare_compaction(coordinator, state, CancellationToken())
+
+        self.assertEqual("commit", captured.exception.code)
+        self.assertEqual(original_messages, tuple(state.messages[state.history_start :]))
+        self.assertIs(original_memory, state.conversation_memory)
+        self.assertEqual(1, state.memory_calls)
+        self.assertEqual(TokenUsage(11, 1), state.memory_usage)
+
     async def test_coordinator_accepts_snapshot_without_engine_state(self) -> None:
         from tricoder.context import coordinator as module
 

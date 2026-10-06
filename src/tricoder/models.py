@@ -374,6 +374,7 @@ class RunResult:
     usage: TokenUsage | None = None
     unknown_effects: bool = False
     cleanup_failed: bool = False
+    modified_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.cleanup_failed:
@@ -408,6 +409,8 @@ class SessionContext:
     # 仅用于下一次 Provider 请求的本地可信提醒；Agent 返回时必须清空，
     # 不进入持久化摘要、语义记忆或历史消息。
     workspace_change_notice: str = ""
+    # 仅进程内跟踪目录副作用；本轮不修改 SQLite schema。
+    modified_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.next_message_seq) is not int or self.next_message_seq <= 0:

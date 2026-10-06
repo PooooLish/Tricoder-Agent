@@ -1,5 +1,46 @@
 # Project: tricoder-cli
 
+## 2026-10-06 后续开发目标与阶段划分（用户已确认，待设计实施）
+
+- 下一阶段聚焦三项：**任务验证、需求澄清与等待、失败收敛**。这是优先级与范围记录，不代表功能已实现，也不自动启动代码修改。
+- **任务验证**：将任务目标、实际变更、验证命令及其结果关联起来；区分文件创建、语法检查、指定测试通过和功能验收。无关测试通过不能作为本次需求完成的依据，无法证明的覆盖应明确显示为未知或未验证。
+- **需求澄清与等待**：支持提出具体问题、等待用户回答后继续，并区分等待、失败与成功。等待期间可取消；若释放工作区锁，恢复前必须重新获取锁并检查工作区变化。用户回答不能自动变成后续写入或命令的审批。
+- **失败收敛**：在现有结束协议预算之外，识别相同代码状态下的重复失败、无效重复操作与修改来回抵消；引导最小诊断、针对性修复和验证，达到预算后带证据停止或请求澄清。不能为通过而自动降低测试预期，也不能以“执行过任意工具”作为有效进展。
+- 建议实施顺序：先建立任务验证事实与展示，再实现澄清/等待生命周期，最后基于前两者实现失败收敛。各项单独形成可验收的执行文档，小步实施；具体数据结构、阈值和接口尚待设计。
+- **后续提升阶段**：任务计划的设计与维护，包括基于项目探索制定计划、步骤状态、完成依据、阻塞原因与计划调整；不在上面三项中顺带引入复杂规划器或强制五阶段流程。
+- 前置检查：结束协议 P2“提前停止后的历史闭合与记忆兼容”仍需确认修复并复审；不能以新增能力替代该遗留问题的验收。
+- 本轮只记录目标，没有修改源码或运行功能测试。下一动作：在最新代码与 P2 状态明确后，为“任务验证”编写具体实施方案，并保留三项之间的接口约束。
+
+## 2026-10-06 ReAct 结束协议复审 P2 修复（已完成）
+
+- 根因确认：第三次 native 无工具响应只返回失败结果，没有在原始会话历史中写入闭合表示。最后一条 assistant 文本既不是完整工具回合，也没有反馈配对；旧失败任务因此阻断 `plan_compaction` 与 `plan_save_candidate`。普通 `protocol_feedback` 又会被摘要器当作噪声，且不能单独证明零工具任务已经终止。
+- RED 证据：零工具用例期望末条为 user 终止标记、实际仍为 assistant；“list_files → 三次文本 → 同一上下文正常 finish”用例期望摘要器调用 1 次、实际为 0。取消/审计失败与孤立 ToolCall 的保护用例在修复前保持通过，证明问题限定在专项终止提交与历史闭合。
+- Runner 现在只在第三次响应的 invalid_action 审计成功、且再次确认未取消之后，追加固定 `task_termination` user 消息。内容明确“本轮已停止、任务未完成、结果仍需确认”，不要求下一轮继续调用工具；没有伪造 finish、tool result、验证通过或业务完成。失败任务不推进 `latest_completed_task_seq`，也不触发成功收尾或额外 Provider 请求。
+- `ContextManager` 只把“无 tool_calls 的 assistant + 精确程序终止标记”识别为失败终止组。任务全部消息必须被完整分组，终止组必须位于末尾；任何真实 ToolCall 缺少匹配结果时仍拒绝压缩和保存。该规则同时覆盖停止前已有完整工具回合及完全没有工具回合的任务。
+- 压缩提交和保存候选合并会根据可信终止标记确定性加入一条 task 作用域的 pending 待办，来源只引用标记消息序号。摘要模型被要求不要重复生成或把它解释成权限、批准、验证或文件状态；即使 fake 摘要器返回空语义候选，失败事实仍会保留。容量、来源、generation、覆盖边界和原子提交校验保持原样；合并阶段的校验拒绝会转换为现有 `MemorySummaryError(code="commit")`，保留原历史及已经发生的摘要用量。
+- 新鲜验证（Windows / Python 3.11.6）：结束专项 20 项、记忆压缩 9 项、全部记忆测试 87 项、全部 Agent 测试 153 项、SessionRuntime 64 项、协议 10 项均通过；内存语法检查与 `git diff --check` 退出 0。最终完整项目 `Ran 1447 tests in 215.891s`，OK（13 skipped）。未调用真实 Provider、未读取 `.env.local`、真实密钥或用户会话库，未安装依赖、提交或推送。
+- 剩余限制：本修复只识别新版本生成的专项终止标记；已存在且缺少该标记的旧进程内历史不会自动迁移。每个失败终止任务会占用一条结构化待办，达到既有每区 20 条容量时摘要按原规则保守失败并保留原历史，需要用户审阅、完成或归档条目。真实 Provider、Linux/macOS、Python 3.12 与手工 TUI 展示仍未验证。
+
+## 2026-10-05 ReAct 结束协议修复（S0—S4 已实施）
+
+- 执行文档：`docs/superpowers/plans/2026-10-05-react-termination-recovery.md`；阶段和 RED/GREEN 证据位于 `runtime/react-termination-recovery/`。本轮以 `de0af48` 和已有未提交工作树为事实基线，保留了常用文件工具第一轮的全部改动，没有从 HEAD 覆盖重叠文件。
+- 系统提示、原生纠错反馈和 `finish` 工具定义现在明确要求：完成、无法继续或需要用户信息时必须显式调用 `finish(summary=...)`。普通文本、完成字样和 `finish_reason=stop` 不会成为成功证据；正常 `finish` 仍经过既有本地验证、取消、清理和 UNKNOWN 判定。
+- `AgentRunState` 新增单任务累计计数；仅 native 的 `ToolCallCountError` 且无 actions 会计入。第 1/2 次反馈 1/3、2/3，第 3 次在保留该轮 usage、assistant 历史和审计后，经统一 finalizer 以未完成停止；普通工具、写入和测试成功不清零，新任务及不同 Agent 实例从 0 开始。`legacy_json`、重复 call ID、普通工具失败与 max_rounds 保持原语义。
+- 专项停止不会调用成功收尾或生成成功记忆候选，也不会撤销已提交文件、目录、账本或验证证据。真实文件工具 + SessionRuntime 集成测试证明账本正常封存、工作区锁释放且下一任务可以继续；取消和审计失败仍保持更高优先级。同批 `finish` 后续动作仍只补 `skipped` 结果，不执行写入。
+- 审计新增固定 `native_missing_tool_call` 原因码、计数、上限和 `will_stop`；仅该预定义原因码允许原样写入，任意自由文本 `reason` 继续按字符数脱敏。专项停止固定摘要不会记录模型正文或源码。
+- 新鲜验证（Windows / Python 3.11.6）：结束专项 17 项、协议 10 项、Agent 邻接 149 项、SessionRuntime 64 项、tools 97 项、audit 6 项均通过；最后代码状态的完整项目 `Ran 1440 tests in 199.758s`，OK（13 skipped）。未调用真实 Provider、未读取真实密钥或用户会话库，未安装依赖、提交或推送。
+- 剩余限制：这是 native 无工具响应的有界纠错，不是通用无进展检测；不会识别重复工具、测试失败振荡或业务覆盖不足。真实 Provider 调用 `finish` 的改善幅度、Linux/macOS、Python 3.12 和手工 TUI 展示仍未验证。
+
+## 2026-10-05 常用文件工具第一轮（S0—S5 已实施）
+
+- 执行方案：`docs/superpowers/plans/2026-10-05-filesystem-tools-round1.md`；阶段证据位于 `runtime/filesystem-tools-round1/`。实现基线为 `de0af48`，保留了开始时已有的 `project.md` 与计划文档改动。
+- 新增内置 write 工具 `create_directory`；`parents`/`exist_ok` 默认 `true`，单次最多 16 层、单任务最多 128 个目录。`create_file` 增加可选 `create_parents`，默认 `false` 保持旧行为；`apply_patch` 仍要求先建立父目录。未放宽 `run_command` 白名单。
+- 目录使用独立快照、identity、账本、副作用和 Runtime 状态。审批前安全祖先绑定跨审批持有，随后按 Windows 句柄链或 POSIX `dir_fd` 逐层下潜；审批后替换、链接/reparse point、身份变化、补偿不完整和临时发布不确定性均保守拒绝或升级为 UNKNOWN。
+- 撤销先全量核对文件、目录身份和内容所有权，再恢复文件并最深层移除本任务创建的空目录。中途失败后若可完整补偿，会以新 identity 刷新最近账本和工作区基线，并立即撤销旧验证 authority；用户新增内容、替换目录和既有父目录不会被递归删除。
+- fake Provider 端到端覆盖目录、实现与测试文件、真实 unittest、finish、整组撤销、下一任务无需虚假外部修改确认，以及 native/legacy、同步/异步和三条创建路径。纯目录任务可完成但验证保持“未运行”，目录变化不能伪造通过或清除失败/UNKNOWN。
+- 新鲜验证：目录/账本/工作区/Session 组合 `Ran 325`，OK（3 skipped）；Agent/Provider/Eval/协议/CLI/TUI 组合 `Ran 230`，OK；最终完整回归 `Ran 1420 tests in 203.884s`，OK（13 skipped）。188 个 Python 文件内存语法检查、CLI `--help` 与 `git diff --check` 退出 0；独立复核无 Critical/Important。
+- 未调用真实 Provider、未读取 `.env.local`、真实密钥或用户会话库，未安装依赖、提交或推送。Windows 目录符号链接用例因当前账户权限跳过；Linux/macOS、Python 3.12、手工 TUI 与真实 Provider 仍未验证。目录撤销账本和 `modified_directories` 只在当前进程有效，不跨重启持久化。
+
 ## 2026-10-05 Windows CI 修复（本地完成，等待远端验证）
 
 - 按用户要求取消 Linux CI，保留 Windows Python 3.11/3.12。新增 `test` 可选依赖 `setuptools>=68`，CI 安装 `.[test]`，解决包发现测试缺少构建工具的问题；未在本机安装依赖。
@@ -510,7 +551,7 @@ Hcode capabilities through the approved native-adaptation roadmap.
 
 ## Next Action
 
-- 第二轮模块整理代码与本地回归已完成，等待用户决定是否提交；本任务没有自动提交或推送。
+- ReAct 结束协议 S0—S4 及复审 P2 历史闭合修复已实现并通过本地完整回归；当前工作树还包含此前常用文件工具第一轮改动，均保持未提交、未推送。下一步由用户决定是否继续人工真实 Provider 验收或统一审查并提交当前工作树。
 - 如需补齐分发验收，应另行授权准备满足 `setuptools>=68` 的现有隔离构建环境及 `build/wheel`，
   再从解压 wheel 执行冷导入、CLI `--help` 和 Eval 隐藏 helper 冒烟，不能复用开发树。
 - 后续若要拆分 `SessionRuntime`，应另立计划并重新固定锁、取消、记忆异常进度和资源所有权；

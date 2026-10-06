@@ -38,9 +38,11 @@ class _DirectoryBinding:
             or isinstance(nofollow, bool)
             or nofollow == 0
             or not {
+                os.mkdir,
                 os.rename,
                 os.open,
                 os.link,
+                os.rmdir,
                 os.unlink,
                 os.stat,
             }.issubset(os.supports_dir_fd)
@@ -75,6 +77,38 @@ class _DirectoryBinding:
 
     def chmod(self, name: str, mode: int) -> None:
         raise NotImplementedError
+
+    def create_directory(self, name: str) -> FileIdentity:
+        raise NotImplementedError
+
+    def directory_status(self, name: str) -> tuple[FileIdentity, int]:
+        raise NotImplementedError
+
+    def directory_identity(self, name: str) -> FileIdentity:
+        return self.directory_status(name)[0]
+
+    def remove_empty_directory(self, name: str, expected: FileIdentity) -> None:
+        raise NotImplementedError
+
+    def open_child_directory(
+        self,
+        name: str,
+        expected: FileIdentity,
+    ) -> "_DirectoryBinding":
+        """相对当前绑定打开已核验子目录，避免按完整路径重新跟随。"""
+
+        raise NotImplementedError
+
+    @staticmethod
+    def _validate_component(name: str) -> None:
+        if (
+            not isinstance(name, str)
+            or name in {"", ".", ".."}
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+        ):
+            raise PolicyError("目录操作只接受单个安全路径组件")
 
     @staticmethod
     def _temporary_names(target_name: str) -> Any:
@@ -187,6 +221,49 @@ class _PosixDirectoryBinding(_DirectoryBinding):
         finally:
             os.close(descriptor)
 
+    def create_directory(self, name: str) -> FileIdentity:
+        self._validate_component(name)
+        os.mkdir(name, mode=0o755, dir_fd=self._fd)
+        return self.directory_identity(name)
+
+    def directory_status(self, name: str) -> tuple[FileIdentity, int]:
+        self._validate_component(name)
+        metadata = os.stat(name, dir_fd=self._fd, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("目标不是普通目录")
+        return _stat_identity(metadata), stat.S_IMODE(metadata.st_mode)
+
+    def remove_empty_directory(self, name: str, expected: FileIdentity) -> None:
+        self._validate_component(name)
+        identity, _mode = self.directory_status(name)
+        if identity != expected:
+            raise PolicyError("目录身份已变化，拒绝删除")
+        os.rmdir(name, dir_fd=self._fd)
+
+    def open_child_directory(
+        self,
+        name: str,
+        expected: FileIdentity,
+    ) -> "_DirectoryBinding":
+        self._validate_component(name)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+        descriptor = os.open(name, flags, dir_fd=self._fd)
+        try:
+            metadata = os.fstat(descriptor)
+            identity = _stat_identity(metadata)
+            if not stat.S_ISDIR(metadata.st_mode) or identity != expected:
+                raise PolicyError("新目录身份发生变化，拒绝继续创建")
+            child = object.__new__(_PosixDirectoryBinding)
+            _DirectoryBinding.__init__(child, self.parent / name)
+            child._fd = descriptor
+            child._identity = identity
+            descriptor = -1
+            return child
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
 
 class _WindowsDirectoryBinding(_DirectoryBinding):
     """用不共享删除权限的目录句柄锁住 Windows 路径的每个目录组件。"""
@@ -196,11 +273,15 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
     _FILE_SHARE_WRITE = 0x00000002
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 
     def __init__(self, workspace: Path, parent: Path) -> None:
         super().__init__(parent)
         if not parent.is_relative_to(workspace):
             raise PolicyError("写入目标的父目录不属于工作区")
+        self._workspace = workspace
         self._handles: list[int] = []
         try:
             for component in self._path_chain(parent):
@@ -264,7 +345,7 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
             cls._FILE_SHARE_READ | cls._FILE_SHARE_WRITE,
             None,
             cls._OPEN_EXISTING,
-            cls._FILE_FLAG_BACKUP_SEMANTICS,
+            cls._FILE_FLAG_BACKUP_SEMANTICS | cls._FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
         invalid_handle = ctypes.c_void_p(-1).value
@@ -281,6 +362,12 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
             error = ctypes.WinError(ctypes.get_last_error())
             kernel32.CloseHandle(handle)
             raise error
+        if (
+            not information.file_attributes & cls._FILE_ATTRIBUTE_DIRECTORY
+            or information.file_attributes & cls._FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            kernel32.CloseHandle(handle)
+            raise OSError("目标不是安全的普通目录")
         identity = FileIdentity(
             information.volume_serial_number,
             (information.file_index_high << 32) | information.file_index_low,
@@ -361,3 +448,39 @@ class _WindowsDirectoryBinding(_DirectoryBinding):
 
     def chmod(self, name: str, mode: int) -> None:
         os.chmod(self.parent / name, mode)
+
+    def create_directory(self, name: str) -> FileIdentity:
+        self._validate_component(name)
+        os.mkdir(self.parent / name)
+        return self.directory_identity(name)
+
+    def directory_status(self, name: str) -> tuple[FileIdentity, int]:
+        self._validate_component(name)
+        path = self.parent / name
+        handle, identity = self._open_handle(path)
+        try:
+            metadata = path.stat(follow_symlinks=False)
+            if _stat_identity(metadata) != identity or not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("目录身份核验失败")
+            return identity, stat.S_IMODE(metadata.st_mode)
+        finally:
+            self._close_handle(handle)
+
+    def remove_empty_directory(self, name: str, expected: FileIdentity) -> None:
+        self._validate_component(name)
+        identity, _mode = self.directory_status(name)
+        if identity != expected:
+            raise PolicyError("目录身份已变化，拒绝删除")
+        os.rmdir(self.parent / name)
+
+    def open_child_directory(
+        self,
+        name: str,
+        expected: FileIdentity,
+    ) -> "_DirectoryBinding":
+        self._validate_component(name)
+        child = _WindowsDirectoryBinding(self._workspace, self.parent / name)
+        if child._identity != expected:
+            child.close()
+            raise PolicyError("新目录身份发生变化，拒绝继续创建")
+        return child

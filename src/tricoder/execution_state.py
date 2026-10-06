@@ -53,15 +53,29 @@ class EffectState(str, Enum):
 class FileEffects:
     state: EffectState
     paths: tuple[str, ...] = ()
+    # 保留类名与原有第二位置参数兼容；目录路径始终独立于普通文件路径。
+    directory_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.state, EffectState) or not isinstance(self.paths, tuple):
+        if (
+            not isinstance(self.state, EffectState)
+            or not isinstance(self.paths, tuple)
+            or not isinstance(self.directory_paths, tuple)
+        ):
             raise ValueError("文件副作用状态无效")
-        if self.state is EffectState.NONE and self.paths:
+        if self.state is EffectState.NONE and (self.paths or self.directory_paths):
             raise ValueError("无副作用状态不能携带路径")
-        if self.state is EffectState.CONFIRMED and not self.paths:
+        if self.state is EffectState.CONFIRMED and not (
+            self.paths or self.directory_paths
+        ):
             raise ValueError("已确认副作用必须携带路径")
-        for path in self.paths:
+        if len(self.directory_paths) > 128:
+            raise ValueError("目录副作用路径超过单任务上限")
+        if len(set(self.paths)) != len(self.paths) or len(set(self.directory_paths)) != len(
+            self.directory_paths
+        ):
+            raise ValueError("副作用路径不能重复")
+        for path in (*self.paths, *self.directory_paths):
             if (not isinstance(path, str) or not path or "\\" in path
                     or not all(character.isprintable() for character in path)
                     or PurePosixPath(path).is_absolute() or PureWindowsPath(path).drive
@@ -82,12 +96,23 @@ class ExecutionState:
     modified_files: tuple[str, ...] = ()
     verification: str = "未运行"
     unknown_effects: bool = False
+    modified_directories: tuple[str, ...] = ()
 
     def observe(self, effects: FileEffects) -> "ExecutionState":
         if not isinstance(effects, FileEffects):
             raise ValueError("文件副作用证据无效")
+        verification = self.verification
+        if effects.state is EffectState.UNKNOWN or effects.paths:
+            verification = "待验证"
+        elif effects.directory_paths and verification in {"通过", "passed"}:
+            verification = "待验证"
         return ExecutionState(
             tuple(dict.fromkeys((*self.modified_files, *effects.paths))),
-            "待验证" if effects.state is not EffectState.NONE else self.verification,
+            verification,
             self.unknown_effects or effects.state is EffectState.UNKNOWN,
+            tuple(
+                dict.fromkeys(
+                    (*self.modified_directories, *effects.directory_paths)
+                )
+            ),
         )

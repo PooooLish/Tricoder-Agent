@@ -99,6 +99,7 @@ class TaskFinalizer:
                 ),
                 persisted_summary=context.persisted_summary,
                 modified_files=tuple(state.modified_files),
+                modified_directories=tuple(state.modified_directories),
                 verification=state.verification,
                 unknown_effects=state.unknown_effects,
                 verification_evidence=state.evidence,

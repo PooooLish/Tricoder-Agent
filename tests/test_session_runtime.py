@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
+from tricoder.agent import CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.changes import (
     ChangeJournal,
@@ -1215,6 +1216,121 @@ class SessionRuntimeTests(unittest.TestCase):
         ownership = WorkspaceLock.acquire(self.workspace)
         ownership.close()
 
+    def test_react_termination_stop_seals_changes_and_releases_workspace_lock(self) -> None:
+        """专项停止保留真实写入和账本，并允许同一 Runtime 启动后续任务。"""
+
+        class Provider:
+            def __init__(inner, responses):  # type: ignore[no-untyped-def]
+                inner.responses = list(responses)
+                inner.calls = 0
+
+            def complete(inner, _messages, _tools=()):  # type: ignore[no-untyped-def]
+                inner.calls += 1
+                if not inner.responses:
+                    raise AssertionError("专项停止后发生额外 Provider 请求")
+                return inner.responses.pop(0)
+
+        journal = ChangeJournal()
+        registry = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(),
+                lambda _action, _detail: True,
+                change_journal=journal,
+            )
+        )
+        target = self.workspace / "termination-owned.py"
+        stopping_provider = Provider(
+            [
+                ProviderResponse(content="文本一"),
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "create",
+                            "create_file",
+                            {"path": target.name, "content": "owned = True\n"},
+                        ),
+                    )
+                ),
+                ProviderResponse(content="文本二"),
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "verify",
+                            "run_command",
+                            {"command": "python -m compileall -q termination-owned.py"},
+                        ),
+                    )
+                ),
+                ProviderResponse(content="文本三"),
+            ]
+        )
+        audit = AuditLogger(self.root / "audit" / "termination-runtime.jsonl")
+        stopping_agent = CodingAgent(
+            stopping_provider,
+            registry,
+            max_rounds=10,
+            plan_enabled=False,
+            audit=audit,
+        )
+        self.runtime.current = replace(
+            self.runtime.current,
+            agent=stopping_agent,
+            tools=registry,
+            journal=journal,
+            audit=audit,
+        )
+        self.runtime._cache_current()
+
+        stopped = self.runtime.run_task("写入后触发结束预算")
+
+        self.assertFalse(stopped.ok)
+        self.assertTrue(target.exists())
+        self.assertEqual((target.name,), stopped.modified_files)
+        self.assertIsNotNone(journal.latest())
+        self.assertEqual(
+            "task_termination",
+            self.runtime.current.context.messages[-1].kind,
+        )
+        ownership = WorkspaceLock.acquire(self.workspace)
+        ownership.close()
+
+        finishing_provider = Provider(
+            [
+                ProviderResponse(
+                    tool_calls=(
+                        ToolCall(
+                            "finish-next",
+                            "finish",
+                            {"summary": "后续任务完成"},
+                        ),
+                    )
+                )
+            ]
+        )
+        self.runtime.current = replace(
+            self.runtime.current,
+            agent=CodingAgent(
+                finishing_provider,
+                registry,
+                max_rounds=1,
+                plan_enabled=False,
+                audit=audit,
+            ),
+        )
+        self.runtime._cache_current()
+
+        following = self.runtime.run_task("后续任务")
+
+        self.assertTrue(following.ok, following)
+        self.assertEqual(1, finishing_provider.calls)
+        self.assertTrue(
+            any(
+                message.kind == "task_termination"
+                for message in self.runtime.current.context.messages
+            )
+        )
+
     def test_successful_undo_does_not_absorb_unrelated_write_during_execution(self) -> None:
         """撤销本身成功也不能把执行窗口内的无关外部修改并入可信基线。"""
 
@@ -1875,6 +1991,7 @@ class SessionRuntimeTests(unittest.TestCase):
         # relaxed 下 run_command 一律人工审批（不再放行 Python/测试/脚本）
         self.assertFalse(self.runtime._effective_approver("run_command", "detail"))
         self.assertFalse(self.runtime._effective_approver("edit_file", "detail"))
+        self.assertFalse(self.runtime._effective_approver("create_directory", "detail"))
         self.assertFalse(self.runtime._effective_approver("create_file", "detail"))
         self.assertFalse(self.runtime._effective_approver("apply_patch", "detail"))
         # strict 下同样人工审批
@@ -1928,7 +2045,13 @@ class SessionRuntimeTests(unittest.TestCase):
         """fullaccess 放行全部现有工具（明确非沙盒）；危险工具集合仍审批。"""
         self.runtime.set_permission("fullaccess")
         self.assertEqual("fullaccess", self.runtime.permission_level)
-        for action in ("edit_file", "create_file", "apply_patch", "run_command"):
+        for action in (
+            "edit_file",
+            "create_directory",
+            "create_file",
+            "apply_patch",
+            "run_command",
+        ):
             with self.subTest(action=action):
                 self.assertTrue(self.runtime._effective_approver(action, "detail"))
         # 非法值仍拒绝

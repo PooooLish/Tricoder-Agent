@@ -271,7 +271,10 @@ class GitDiffTool(ToolHandler):
 
 class FinishTool(ToolHandler):
     name = "finish"
-    description = "提交本轮任务的文字总结。"
+    description = (
+        "结束本轮任务并提交文字总结；完成、无法继续或需要用户补充信息时必须调用。"
+        "本工具只请求结束，成功状态仍由本地验证结果决定。"
+    )
     parameters = ToolHandler._schema({"summary": {"type": "string"}}, ["summary"])
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:

@@ -19,13 +19,31 @@ from tricoder.workspace.verification import (
 def apply_tool_transition(state: SessionContext, effects: FileEffects,
                           candidate: VerificationEvidence | None = None) -> SessionContext:
     """纯转换：调用方须先核验 builtin 身份/authority；重复消费同一事实幂等。"""
-    observed = ExecutionState(state.modified_files, state.verification, state.unknown_effects).observe(effects)
+    observed = ExecutionState(
+        state.modified_files,
+        state.verification,
+        state.unknown_effects,
+        state.modified_directories,
+    ).observe(effects)
     evidence, failure, required = state.verification_evidence, state.verification_failure, state.verification_required
     verification = observed.verification
-    if effects.state is not EffectState.NONE:
+    if effects.state is EffectState.UNKNOWN:
+        evidence, required = None, True
+    elif effects.paths:
         evidence, required = None, True
         if effects.state is EffectState.CONFIRMED:
             failure = None
+    elif effects.directory_paths:
+        # 目录变化会使旧的工作区通过证据失效，但不能把失败当作已修复；
+        # 一个从干净状态开始的纯目录任务不需要伪造测试证据。
+        had_verification_authority = (
+            evidence is not None
+            or failure is not None
+            or state.verification_required
+            or state.verification in {"通过", "passed", "失败", "failed", "待验证"}
+        )
+        evidence = None
+        required = required or had_verification_authority
     if candidate is not None:
         required = True
         if failure is not None and proves_new_file_version(failure, candidate.before):
@@ -37,7 +55,9 @@ def apply_tool_transition(state: SessionContext, effects: FileEffects,
             verification = "失败" if failure is not None else "通过"
         else:
             evidence, verification = None, "待验证"
-    return replace(state, modified_files=observed.modified_files, verification=verification,
+    return replace(state, modified_files=observed.modified_files,
+                   modified_directories=observed.modified_directories,
+                   verification=verification,
                    unknown_effects=observed.unknown_effects, verification_evidence=evidence,
                    verification_failure=failure, verification_required=required)
 
@@ -115,6 +135,11 @@ class TaskObservation:
             original = replace(original,
                                # Registry 逐工具路径不是任务净变化；custom Agent 的路径由 T1 账本补齐。
                                modified_files=state.modified_files if agent_published else original.modified_files,
+                               modified_directories=(
+                                   state.modified_directories
+                                   if agent_published
+                                   else original.modified_directories
+                               ),
                                verification=state.verification, unknown_effects=state.unknown_effects,
                                verification_evidence=state.verification_evidence,
                                verification_failure=state.verification_failure,

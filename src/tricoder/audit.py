@@ -22,6 +22,7 @@ _FREE_TEXT_KEYS = {
     "reason",
     "summary",
 }
+_SAFE_REASON_CODES = {"native_missing_tool_call"}
 
 
 class AuditError(OSError):
@@ -37,6 +38,12 @@ def redact(value: Any) -> Any:
             lowered = str(key).lower()
             if any(marker in lowered for marker in _SECRET_MARKERS):
                 cleaned[str(key)] = "***"
+            elif (
+                lowered == "reason"
+                and isinstance(item, str)
+                and item in _SAFE_REASON_CODES
+            ):
+                cleaned[str(key)] = item
             elif lowered in _FREE_TEXT_KEYS and isinstance(item, str):
                 cleaned[f"{key}_chars"] = len(item)
             else:

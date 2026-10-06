@@ -48,7 +48,9 @@ class AgentRunState:
     conversation_memory: ConversationMemory
     review_memory_candidate: ConversationMemory | None
     latest_completed_task_seq: int
+    native_missing_tool_responses: int = 0
     modified_files: list[str] = field(default_factory=list)
+    modified_directories: list[str] = field(default_factory=list)
     verification: str = "未运行"
     evidence: Any = None
     failed_snapshot: Any = None
@@ -113,6 +115,7 @@ class AgentRunState:
             review_memory_candidate=context.review_memory_candidate,
             latest_completed_task_seq=context.latest_completed_task_seq,
             modified_files=list(context.modified_files),
+            modified_directories=list(context.modified_directories),
             verification=context.verification,
             evidence=context.verification_evidence,
             failed_snapshot=context.verification_failure,
@@ -146,6 +149,7 @@ class AgentRunState:
         context = self.source_context
         return SessionContext(
             modified_files=tuple(self.modified_files),
+            modified_directories=tuple(self.modified_directories),
             verification=self.verification,
             unknown_effects=self.unknown_effects,
             verification_evidence=self.evidence,

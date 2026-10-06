@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 from tricoder.changes import (
     ChangeJournal,
+    DirectorySnapshot,
     FileChange,
     FileIdentity,
     FileSnapshot,
@@ -27,6 +28,14 @@ from tricoder.patches import (
 from tricoder.policy import PolicyError
 
 from tricoder.tools.binding import _DirectoryBinding
+from tricoder.tools.directory import (
+    CreatedDirectory,
+    compensate_created_directories,
+    create_planned_directories,
+    plan_directory_creation,
+    render_directory_approval,
+    revalidate_directory_plan,
+)
 from tricoder.tools.handlers import ToolHandler
 
 
@@ -75,6 +84,29 @@ class _FileWriteTool(ToolHandler):
         if operation is not None:
             operation.record_committed(path, before, after)
         super()._record_committed(path, before, after)
+
+    def _reserve_directories(self, paths: tuple[str, ...]) -> None:
+        operation = _operation_journal.get()
+        if operation is not None:
+            operation.reserve_directories(paths)
+        super()._reserve_directories(paths)
+
+    def _record_directory_committed(
+        self,
+        path: str,
+        before: DirectorySnapshot | None,
+        after: DirectorySnapshot | None,
+    ) -> None:
+        operation = _operation_journal.get()
+        if operation is not None:
+            operation.record_directory_committed(path, before, after)
+        super()._record_directory_committed(path, before, after)
+
+    def _mark_directory_journal_tainted(self, path: str) -> None:
+        operation = _operation_journal.get()
+        if operation is not None:
+            operation.mark_directory_tainted(path)
+        super()._mark_directory_journal_tainted(path)
 
     def _mark_journal_tainted(self, path: str) -> None:
         operation = _operation_journal.get()
@@ -215,7 +247,11 @@ class CreateFileTool(_FileWriteTool):
     name = "create_file"
     description = "经审批后在工作区内创建新的 UTF-8 文件。"
     parameters = ToolHandler._schema(
-        {"path": {"type": "string"}, "content": {"type": "string"}},
+        {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "create_parents": {"type": "boolean"},
+        },
         ["path", "content"],
     )
 
@@ -229,10 +265,39 @@ class CreateFileTool(_FileWriteTool):
             must_exist=False,
         )
         content = self._required_str(arguments, "content", allow_empty=True)
+        create_parents = arguments.get("create_parents", False)
+        directory_plan = None
         if not path.parent.is_dir():
-            return tool_failure(ErrorCode.INVALID_ARGUMENT, "create_file 的父目录必须存在")
+            if not create_parents:
+                return tool_failure(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "create_file 的父目录必须存在；请先调用 create_directory，"
+                    "或显式设置 create_parents=true",
+                )
+            parent_raw = Path(raw_path).parent.as_posix()
+            directory_plan = plan_directory_creation(
+                self.context.workspace_policy,
+                parent_raw,
+                parents=True,
+                exist_ok=True,
+            )
         if path.exists():
             return tool_failure(ErrorCode.POLICY_DENIED, "create_file 的目标文件已存在，拒绝覆盖")
+
+        workspace = self.context.workspace_policy.workspace
+        approval_parent = (
+            directory_plan.existing_parent
+            if directory_plan is not None
+            else path.parent
+        )
+        # 与旧实现一致：平台缺少安全绑定能力时必须在请求审批前失败。
+        approval_binding = _DirectoryBinding.open(workspace, approval_parent)
+        if not approval_binding.verify_parent(approval_parent):
+            approval_binding.close()
+            return tool_failure(
+                ErrorCode.POLICY_DENIED,
+                "目标父目录身份发生变化，拒绝请求审批",
+            )
 
         relative = path.relative_to(self.context.workspace_policy.workspace)
         diff = (
@@ -252,25 +317,17 @@ class CreateFileTool(_FileWriteTool):
             )
         )
 
-        binding = _DirectoryBinding.open(
-            self.context.workspace_policy.workspace,
-            path.parent,
-        )
-        temporary_name: str | None = None
-        committed = False
-        cleanup_warning = False
-        close_warning = False
-        verification_failed = False
+        created_directories: tuple[CreatedDirectory, ...] = ()
+        binding: _DirectoryBinding | None = None
         try:
-            preapproved = self.context.workspace_policy.resolve_path(
-                raw_path,
-                must_exist=False,
-            )
-            if preapproved != path or not binding.verify_parent(preapproved.parent):
-                return tool_failure(ErrorCode.POLICY_DENIED, "目标父目录身份发生变化，拒绝请求审批")
+            if directory_plan is not None:
+                self._reserve_directories(directory_plan.missing_relative)
             relative_path = relative.as_posix()
             if not self._journal_before_is_continuous(relative_path, None):
-                return tool_failure(ErrorCode.RESULT_UNCERTAIN, f"任务内文件状态不连续：{relative_path}")
+                return tool_failure(
+                    ErrorCode.RESULT_UNCERTAIN,
+                    f"任务内文件状态不连续：{relative_path}",
+                )
             projected_after = FileSnapshot(
                 relative_path,
                 content,
@@ -278,16 +335,71 @@ class CreateFileTool(_FileWriteTool):
                 FileIdentity(0, 0),
             )
             self._reserve_change(FileChange(relative_path, None, projected_after))
-            if not self._approve("create_file", diff):
+            approval_detail = (
+                (
+                    render_directory_approval(directory_plan.missing_relative)
+                    if directory_plan is not None
+                    else ""
+                )
+                + diff
+            )
+            if not self._approve("create_file", approval_detail):
                 return tool_failure(ErrorCode.APPROVAL_DENIED, "用户拒绝了创建文件")
+            if not approval_binding.verify_parent(approval_parent):
+                return tool_failure(
+                    ErrorCode.POLICY_DENIED,
+                    "审批后既有祖先目录身份发生变化，拒绝写入",
+                )
+            if directory_plan is not None:
+                revalidate_directory_plan(
+                    self.context.workspace_policy,
+                    Path(raw_path).parent.as_posix(),
+                    directory_plan,
+                    parents=True,
+                    exist_ok=True,
+                )
+                owned_binding = approval_binding
+                approval_binding = None
+                created_directories, binding = create_planned_directories(
+                    self,
+                    directory_plan,
+                    owned_binding,
+                )
+            else:
+                binding = approval_binding
+                approval_binding = None
+        except BaseException:
+            if created_directories:
+                compensate_created_directories(self, created_directories)
+            raise
+        finally:
+            if approval_binding is not None:
+                approval_binding.close()
 
+        temporary_name: str | None = None
+        committed = False
+        cleanup_warning = False
+        close_warning = False
+        verification_failed = False
+        try:
+            if binding is None:
+                binding = _DirectoryBinding.open(workspace, path.parent)
+            preapproved = self.context.workspace_policy.resolve_path(
+                raw_path,
+                must_exist=False,
+            )
+            if preapproved != path or not binding.verify_parent(preapproved.parent):
+                compensate_created_directories(self, created_directories)
+                return tool_failure(ErrorCode.POLICY_DENIED, "目标父目录身份发生变化，拒绝请求审批")
             verified = self.context.workspace_policy.resolve_path(
                 raw_path,
                 must_exist=False,
             )
             if not binding.verify_parent(verified.parent) or verified != path:
+                compensate_created_directories(self, created_directories)
                 return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标父目录身份发生变化，拒绝写入")
             if binding.target_exists(path.name):
+                compensate_created_directories(self, created_directories)
                 return tool_failure(ErrorCode.POLICY_DENIED, "审批后目标文件已存在，拒绝覆盖")
 
             temporary_name = binding.create_temporary(path.name, content, 0o600)
@@ -295,6 +407,19 @@ class CreateFileTool(_FileWriteTool):
             try:
                 binding.link(temporary_name, path.name)
             except OSError:
+                try:
+                    binding.unlink(temporary_name)
+                except OSError:
+                    # 发布与清理均未能证明完成时，以用户批准的目标路径标记
+                    # UNKNOWN；不把随机临时名混入已确认 modified_files。
+                    self._mark_journal_tainted(relative_path)
+                    for entry in created_directories:
+                        self._mark_directory_journal_tainted(
+                            entry.snapshot.path
+                        )
+                else:
+                    temporary_name = None
+                compensate_created_directories(self, created_directories)
                 return tool_failure(ErrorCode.EXECUTION_FAILED, "create_file 无法原子发布文件，拒绝覆盖")
             committed = True
             snapshot_failed = False
@@ -326,18 +451,27 @@ class CreateFileTool(_FileWriteTool):
                 cleanup_warning = True
             else:
                 temporary_name = None
+        except BaseException:
+            if not committed:
+                compensate_created_directories(self, created_directories)
+            raise
         finally:
             if temporary_name is not None:
                 try:
-                    binding.unlink(temporary_name)
+                    if binding is not None:
+                        binding.unlink(temporary_name)
                 except OSError:
-                    pass
-            try:
-                binding.close()
-            except OSError:
-                if not committed:
-                    raise
-                close_warning = True
+                    # 发布失败时清理也失败，目标是否已出现无法证明；成功发布后
+                    # 的临时硬链接清理警告沿用既有行为，由任务末工作区对账发现。
+                    if not committed:
+                        self._mark_journal_tainted(relative_path)
+            if binding is not None:
+                try:
+                    binding.close()
+                except OSError:
+                    if not committed:
+                        raise
+                    close_warning = True
         if verification_failed:
             output = f"文件发布后状态无法验证：{relative_path}"
             if cleanup_warning:
@@ -382,7 +516,10 @@ class ApplyPatchTool(_FileWriteTool):
                 return tool_failure(ErrorCode.INVALID_ARGUMENT, f"补丁目标重复：{relative_path}")
             seen_targets.add(relative_path)
             if not path.parent.is_dir():
-                return tool_failure(ErrorCode.INVALID_ARGUMENT, f"补丁目标父目录不存在：{relative_path}")
+                return tool_failure(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"补丁目标父目录不存在：{relative_path}；请先调用 create_directory",
+                )
             if file_patch.create:
                 if path.exists():
                     return tool_failure(ErrorCode.POLICY_DENIED, f"补丁创建目标已存在：{relative_path}")

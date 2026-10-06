@@ -15,7 +15,11 @@ from tricoder.context.coordinator import (
     MemoryStepResult,
 )
 from tricoder.context.manager import ContextManager
-from tricoder.context.memory import ConversationMemory
+from tricoder.context.memory import (
+    ConversationMemory,
+    TASK_TERMINATION_KIND,
+    TASK_TERMINATION_NOTICE,
+)
 from tricoder.context.summarizer import MemorySummaryError
 from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.core.events import (
@@ -48,6 +52,11 @@ from tricoder.workspace.verification import VerificationScope, proves_new_file_v
 
 AUDIT_FAILURE_MESSAGE = "无法写入审计日志，运行已安全停止"
 PROVIDER_FAILURE_MESSAGE = "模型请求失败，运行已安全停止"
+MAX_NATIVE_MISSING_TOOL_RESPONSES = 3
+NATIVE_TERMINATION_FAILURE = (
+    "结束协议纠正失败：本任务累计 3 次未提交工具调用，"
+    "已停止继续请求；任务结果仍需确认。"
+)
 
 
 class AgentRunner:
@@ -133,6 +142,7 @@ class AgentRunner:
                     "文件影响未确认；请检查实际文件并通过 /clear 明确确认",
                     0,
                     modified_files=tuple(state.modified_files),
+                    modified_directories=tuple(state.modified_directories),
                     verification="待验证",
                 )
             )
@@ -318,22 +328,86 @@ class AgentRunner:
                     PROTOCOL_FEEDBACK,
                     "protocol_feedback",
                 )
-                self.observer.on_error(feedback.content or "")
-                state.messages.append(feedback)
+                native_missing_tool = (
+                    self.tool_protocol == "native"
+                    and resolved.audit_error_type == "ToolCallCountError"
+                )
+                if native_missing_tool:
+                    state.native_missing_tool_responses += 1
+                    correction_count = state.native_missing_tool_responses
+                    will_stop = correction_count >= MAX_NATIVE_MISSING_TOOL_RESPONSES
+                    if not will_stop:
+                        suffix = f" 当前累计 {correction_count}/{MAX_NATIVE_MISSING_TOOL_RESPONSES}。"
+                        if correction_count == MAX_NATIVE_MISSING_TOOL_RESPONSES - 1:
+                            suffix = (
+                                f" 当前累计 {correction_count}/{MAX_NATIVE_MISSING_TOOL_RESPONSES}；"
+                                "再次发生将停止本任务。"
+                            )
+                        feedback = self._feedback_message(
+                            f"{feedback.content or PROTOCOL_FEEDBACK}{suffix}",
+                            "protocol_feedback",
+                        )
+                    public_error = (
+                        NATIVE_TERMINATION_FAILURE
+                        if will_stop
+                        else feedback.content or PROTOCOL_FEEDBACK
+                    )
+                else:
+                    correction_count = None
+                    will_stop = False
+                    public_error = feedback.content or PROTOCOL_FEEDBACK
+                cancelled_after_response = cancellation.is_cancelled
+                if cancelled_after_response:
+                    public_error = "任务已取消"
+                self.observer.on_error(public_error)
+                if not will_stop and not cancelled_after_response:
+                    state.messages.append(feedback)
+                audit_event: dict[str, Any] = {
+                    "round": round_number,
+                    "status": "invalid_action",
+                    "error_type": (
+                        resolved.audit_error_type or "ActionProtocolError"
+                    ),
+                    "error_chars": len(public_error),
+                    "duration_ms": elapsed_ms(started),
+                }
+                if native_missing_tool:
+                    audit_event.update(
+                        {
+                            "reason": "native_missing_tool_call",
+                            "correction_count": correction_count,
+                            "correction_limit": MAX_NATIVE_MISSING_TOOL_RESPONSES,
+                            "will_stop": will_stop,
+                        }
+                    )
                 if not self._log(
-                    {
-                        "round": round_number,
-                        "status": "invalid_action",
-                        "error_type": (
-                            resolved.audit_error_type or "ActionProtocolError"
-                        ),
-                        "error_chars": len(feedback.content or ""),
-                        "duration_ms": elapsed_ms(started),
-                    }
+                    audit_event
                 ):
                     return finalizer.finish(
                         self._audit_failure(state, round_number),
                         rollback_task=True,
+                    )
+                # 审计可能触发同步回调，取消也可能在写日志期间从其他线程到达；
+                # 审计成功后必须重新读取令牌，不能使用上方仅用于反馈的旧快照。
+                if cancellation.is_cancelled:
+                    return finalizer.finish(
+                        self._result(state, False, "任务已取消", round_number),
+                        rollback_task=True,
+                    )
+                if will_stop:
+                    state.messages.append(
+                        self._feedback_message(
+                            TASK_TERMINATION_NOTICE,
+                            TASK_TERMINATION_KIND,
+                        )
+                    )
+                    return finalizer.finish(
+                        self._result(
+                            state,
+                            False,
+                            NATIVE_TERMINATION_FAILURE,
+                            round_number,
+                        )
                     )
                 continue
 
@@ -644,6 +718,7 @@ class AgentRunner:
             state.tool_calls,
             tuple(state.modified_files),
             state.verification,
+            modified_directories=tuple(state.modified_directories),
         )
 
     @staticmethod
@@ -654,4 +729,5 @@ class AgentRunner:
             state.tool_calls,
             state.modified_files,
             state.verification,
+            state.modified_directories,
         )

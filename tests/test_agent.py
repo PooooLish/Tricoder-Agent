@@ -1864,7 +1864,11 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(("created.py",), result.modified_files)
         self.assertEqual("secret = 987654\n", (self.workspace / "created.py").read_text(encoding="utf-8"))
         self.assertEqual(
-            {"path": "created.py", "content_chars": 16},
+            {
+                "path": "created.py",
+                "content_chars": 16,
+                "create_parents": False,
+            },
             create_event["arguments"],
         )
         self.assertNotIn("secret = 987654", audit_path.read_text(encoding="utf-8"))

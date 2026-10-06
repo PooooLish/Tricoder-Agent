@@ -458,6 +458,10 @@ class TricoderApp(App[None]):
         content.append("修改文件", style="bold")
         content.append("\n")
         content.append(_p(status.modified_files))
+        content.append("\n\n")
+        content.append("新增目录", style="bold")
+        content.append("\n")
+        content.append(_p(status.modified_directories))
         self.query_one("#sidebar-content", Static).update(content)
 
     def begin_round(self, round_number: int, max_rounds: int) -> None:
@@ -554,7 +558,8 @@ class TricoderApp(App[None]):
         state = "完成" if result.ok else "未完成"
         status_text = Text.assemble(
             (state, color),
-            f" · 工具调用 {result.tool_calls} · 修改文件 {len(result.modified_files)}",
+            f" · 工具调用 {result.tool_calls} · 修改文件 {len(result.modified_files)}"
+            f" · 新增目录 {len(result.modified_directories)}",
         )
         lines = [
             status_text,
@@ -890,7 +895,7 @@ class TricoderApp(App[None]):
             self.log_line_safe(_p(line))
         approved = False
         try:
-            approved = self._confirm("撤销最近一条任务的全部文件修改？")
+            approved = self._confirm("撤销最近一条任务的全部文件与目录修改？")
         finally:
             if not approved and self.runtime is not None:
                 self.runtime.cancel_undo()
@@ -905,7 +910,7 @@ class TricoderApp(App[None]):
             self.log_line_safe(Text.assemble(("", "red"), _p(exc)))
             return
         if execution.ok:
-            self.log_line_safe("[yellow]已撤销最近一条任务的全部文件修改。[/yellow]")
+            self.log_line_safe("[yellow]已撤销最近一条任务的全部文件与目录修改。[/yellow]")
         elif execution.conflicts:
             self.log_line_safe(
                 Text.assemble(("撤销冲突，未执行：", "red"), _p("、".join(execution.conflicts)))
@@ -918,7 +923,7 @@ class TricoderApp(App[None]):
                 )
             )
         else:
-            self.log_line_safe("[red]撤销未完成，文件未被修改。[/red]")
+            self.log_line_safe("[red]撤销未完成；工作区状态已按安全补偿结果保留。[/red]")
 
     def _permission(self, argument: str | None) -> None:
         if argument is None:

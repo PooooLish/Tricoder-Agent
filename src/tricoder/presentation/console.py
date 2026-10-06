@@ -27,6 +27,7 @@ _PROVIDER_LABELS = {
 
 _APPROVAL_TITLES = {
     "edit_file": "文件修改 · 需要审批",
+    "create_directory": "目录创建 · 需要审批",
     "create_file": "文件创建 · 需要审批",
     "apply_patch": "补丁应用 · 需要审批",
     "run_command": "命令执行 · 需要审批",
@@ -253,6 +254,7 @@ class TerminalUI:
         table.add_row("权限", Text(status.permission_level))  # type: ignore[attr-defined]
         table.add_row("上次文件状态检查", Text(status.verification))  # type: ignore[attr-defined]
         table.add_row("检查边界", "受覆盖文件，非业务验收")
+        table.add_row("新增目录", str(getattr(status, "modified_directories", 0)))
         table.add_row("上下文消息", str(status.context_messages))  # type: ignore[attr-defined]
         if status.unsaved_memory:  # type: ignore[attr-defined]
             table.add_row("记忆", Text(status.warning or "本次记忆未持久化", style="yellow"))  # type: ignore[attr-defined]
@@ -382,6 +384,7 @@ class TerminalUI:
         table.add_row("状态", "成功" if result.ok else "未完成")
         table.add_row("摘要", Text(result.summary))
         table.add_row("修改文件", str(len(result.modified_files)))
+        table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         if result.usage is not None:
@@ -407,6 +410,7 @@ class TerminalUI:
         table.add_row("摘要", Text(result.summary))
         table.add_row("工具调用", str(result.tool_calls))
         table.add_row("修改文件", str(len(result.modified_files)))
+        table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("模型轮数", str(result.rounds))
@@ -426,7 +430,7 @@ class TerminalUI:
 
     def approve(self, action: str, detail: str) -> bool:
         self._stop_status()
-        if action in {"edit_file", "create_file", "apply_patch"}:
+        if action in {"edit_file", "create_directory", "create_file", "apply_patch"}:
             renderable = Syntax(
                 detail,
                 "diff",
