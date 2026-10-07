@@ -204,7 +204,7 @@ class AgentMemoryBoundaryCharacterizationTests(unittest.IsolatedAsyncioTestCase)
         progress = progress_type()
         coordinator = MemoryCoordinator(
             _TwoBatchManager(),  # type: ignore[arg-type]
-            MemoryConfig(),
+            MemoryConfig(compaction="off", persistence="off"),
             None,
             lambda _message: None,
             lambda _event: True,

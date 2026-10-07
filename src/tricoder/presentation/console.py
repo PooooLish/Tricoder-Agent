@@ -111,6 +111,18 @@ def _validation_records(result: RunResult) -> str:
     return "\n".join(lines) if lines else "无"
 
 
+def _current_verification_obligation(result: RunResult) -> str:
+    return "待验证（本轮修改）" if result.current_verification_required else "本轮未产生修改验证义务"
+
+
+def _historical_verification_obligation(result: RunResult) -> str:
+    if result.verification_obligation == "pending":
+        return f"尚未确认（{len(result.pending_verification_paths)} 项）"
+    if result.verification_obligation == "legacy_unknown":
+        return "来源待确认"
+    return "无"
+
+
 def _safe_base_url(value: str) -> str:
     """仅保留诊断所需的协议、主机、端口和路径。"""
 
@@ -297,6 +309,17 @@ class TerminalUI:
         table.add_row("模式", "只读" if status.read_only else "可编辑 · 人工审批")  # type: ignore[attr-defined]
         table.add_row("权限", Text(status.permission_level))  # type: ignore[attr-defined]
         table.add_row("上次文件状态检查", Text(status.verification))  # type: ignore[attr-defined]
+        obligation = getattr(status, "verification_obligation", "none")
+        table.add_row(
+            "历史修改验证",
+            (
+                f"尚未确认（{getattr(status, 'pending_verification_paths', 0)} 项）"
+                if obligation == "pending"
+                else "来源待确认"
+                if obligation == "legacy_unknown"
+                else "无"
+            ),
+        )
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("新增目录", str(getattr(status, "modified_directories", 0)))
         table.add_row("上下文消息", str(status.context_messages))  # type: ignore[attr-defined]
@@ -430,6 +453,8 @@ class TerminalUI:
         table.add_row("修改文件", str(len(result.modified_files)))
         table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
+        table.add_row("本轮验证义务", _current_verification_obligation(result))
+        table.add_row("历史修改验证", _historical_verification_obligation(result))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("任务验证", _validation_status(result.task_validation.status))
         table.add_row("检查记录", Text(_validation_records(result)))
@@ -464,6 +489,8 @@ class TerminalUI:
         table.add_row("修改文件", str(len(result.modified_files)))
         table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
+        table.add_row("本轮验证义务", _current_verification_obligation(result))
+        table.add_row("历史修改验证", _historical_verification_obligation(result))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("任务验证", _validation_status(result.task_validation.status))
         table.add_row("检查记录", Text(_validation_records(result)))

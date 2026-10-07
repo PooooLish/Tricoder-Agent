@@ -337,9 +337,11 @@ class RuntimeEffectTests(unittest.TestCase):
                 self.assertEqual("待验证", runtime.current.context.verification)
                 self.assertEqual("待验证", self.store.load_memory(runtime.current.record.id).verification)
                 self.assertEqual("待验证", runtime.current.journal.latest().after_verification)
-                finished = runtime.run_task("finish without new verification")
-                self.assertFalse(finished.ok)
+                finished = runtime.run_task("只读回顾未验证修改")
+                self.assertTrue(finished.ok)
                 self.assertEqual("待验证", finished.verification)
+                self.assertEqual("pending", finished.verification_obligation)
+                self.assertEqual(("same.py",), finished.pending_verification_paths)
 
     def test_consumed_same_path_write_and_real_verification_can_finish_successfully(self):
         target = self.workspace / "same.py"

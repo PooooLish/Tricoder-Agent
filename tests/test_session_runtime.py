@@ -714,7 +714,8 @@ class SessionRuntimeTests(unittest.TestCase):
             self.assertIs(original.audit, manager.audit)
             self.assertEqual(source_env, manager.source_env)
         for task_agent in factory.task_agents:
-            self.assertIs(original.context, task_agent.context)  # type: ignore[attr-defined]
+            self.assertEqual(original.context, task_agent.context)  # type: ignore[attr-defined]
+            self.assertIsNot(original.context, task_agent.context)  # type: ignore[attr-defined]
             self.assertIs(original.tools.context.change_journal, task_agent.tools.context.change_journal)  # type: ignore[union-attr]
             self.assertIs(original.tools.context.spill_store, task_agent.tools.context.spill_store)  # type: ignore[union-attr]
             self.assertIs(original.tools.context.approver, task_agent.tools.context.approver)  # type: ignore[union-attr]
@@ -1669,10 +1670,12 @@ class SessionRuntimeTests(unittest.TestCase):
 
         self.assertEqual((), restored_first.context.messages)
         self.assertEqual((), restored_second.context.messages)
-        self.assertEqual("待验证", restored_first.context.verification)
-        self.assertEqual("待验证", restored_second.context.verification)
+        self.assertEqual("passed", restored_first.context.verification)
+        self.assertEqual("passed", restored_second.context.verification)
         self.assertIsNone(restored_first.context.verification_evidence)
         self.assertIsNone(restored_second.context.verification_evidence)
+        self.assertFalse(restored_first.context.verification_required)
+        self.assertFalse(restored_second.context.verification_required)
         self.assertIsNot(first_active.agent, restored_first.agent)
         self.assertIsNot(second_active.agent, restored_second.agent)
         self.assertIsNot(restored_first.agent, restored_second.agent)
@@ -1895,7 +1898,7 @@ class SessionRuntimeTests(unittest.TestCase):
 
         self.assertEqual("", runtime.current.memory.summary)
         self.assertEqual(files, runtime.current.memory.modified_files)
-        self.assertEqual("待验证", runtime.current.memory.verification)
+        self.assertEqual("passed", runtime.current.memory.verification)
         self.assertTrue(runtime.status().unsaved_memory)
         wrapped_store.fail_writes = False
 

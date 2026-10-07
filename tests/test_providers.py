@@ -889,6 +889,7 @@ class ProviderTests(unittest.TestCase):
                 "create_directory.parents",
                 "create_directory.exist_ok",
                 "create_file.create_parents",
+                "finish.outcome",
             },
             optional_fields,
         )

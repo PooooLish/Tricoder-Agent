@@ -1197,7 +1197,11 @@ class CliTests(unittest.TestCase):
                     "--max-context-chars",
                     "1",
                 ],
-                environ={"ZAI_API_KEY": "test-key"},
+                environ={
+                    "ZAI_API_KEY": "test-key",
+                    "TRICODER_MEMORY_COMPACTION": "off",
+                    "TRICODER_MEMORY_PERSISTENCE": "off",
+                },
                 provider_factory=lambda _config, _timeout: provider,
                 input_fn=lambda _prompt: "n",
                 output=output,

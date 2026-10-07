@@ -286,7 +286,16 @@ class ToolBatchExecutor:
             if stop_task:
                 return ToolBatchOutcome(ToolBatchStop.FATAL, result)
             if finished:
-                return ToolBatchOutcome(ToolBatchStop.FINISH, result)
+                finish_outcome = action.arguments.get("outcome", "completed")
+                if finish_outcome not in {"completed", "incomplete"}:
+                    # 生产内置 finish 已在处理器 Schema 和 run() 中校验；这里仍
+                    # fail closed，避免测试替身或错误接线伪造交付状态。
+                    return ToolBatchOutcome(ToolBatchStop.FATAL, result)
+                return ToolBatchOutcome(
+                    ToolBatchStop.FINISH,
+                    result,
+                    finish_outcome=finish_outcome,
+                )
 
             try:
                 decision = await self._observe_progress(action, result)

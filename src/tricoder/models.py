@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError
 
@@ -233,10 +233,10 @@ class AgentsConfig:
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfig:
-    """会话语义记忆开关与有界摘要参数；默认完全关闭。"""
+    """默认启用结构化压缩与经用户审阅后保存的会话记忆。"""
 
-    compaction: str = "off"
-    persistence: str = "off"
+    compaction: str = "structured"
+    persistence: str = "reviewed_summary"
     trigger_ratio: float = 0.80
     target_ratio: float = 0.65
     summary_max_chars: int = 6_000
@@ -368,6 +368,9 @@ class SessionMemory:
     verification: str = "未运行"
     permission_level: str = "strict"
     unknown_effects: bool = False
+    # 宿主签发的跨任务验证义务；与 verification 展示字符串相互独立。
+    verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
+    pending_verification_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +391,10 @@ class RunResult:
     task_validation: TaskValidationReport = field(
         default_factory=lambda: _empty_task_validation_report()
     )
+    # 以下三个字段只描述宿主状态，不接受 Provider 或语义记忆自报。
+    current_verification_required: bool = False
+    verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
+    pending_verification_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.cleanup_failed:
@@ -414,8 +421,8 @@ class SessionContext:
     # 注入下一轮模型请求，也不会改变运行时压缩边界。
     review_memory_candidate: Any | None = None
     next_message_seq: int = 1
-    # 仅由 Agent 在可信成功终态推进；本地记忆编辑不会改变该水位。
-    # 保存入口据此判断候选是否覆盖最新已完成任务，即使对应原始消息已被压缩。
+    # 仅由 Agent 在任务终态且连续历史闭合后推进；本地记忆编辑不会改变该水位。
+    # 字段名为数据库兼容保留，语义是“最新可纳入记忆的已结束任务”。
     latest_completed_task_seq: int = 0
     persisted_memory_revision: int | None = None
     memory_pending_clear: bool = False
@@ -424,6 +431,9 @@ class SessionContext:
     workspace_change_notice: str = ""
     # 仅进程内跟踪目录副作用；本轮不修改 SQLite schema。
     modified_directories: tuple[str, ...] = ()
+    # 跨任务义务与上面的单任务门禁分开；恢复时只恢复这里，不恢复 evidence。
+    verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
+    pending_verification_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.next_message_seq) is not int or self.next_message_seq <= 0:

@@ -326,7 +326,7 @@ class ClarificationAgentTests(unittest.TestCase):
         self.assertEqual(3, len(provider.histories))
         self.assertIn("提问次数", turn.result.summary)
         self.assertEqual("task_termination", turn.context.messages[-1].kind)
-        self.assertEqual(0, turn.context.latest_completed_task_seq)
+        self.assertGreater(turn.context.latest_completed_task_seq, 0)
         plan = ContextManager(
             ContextBudget(max_chars=100_000), NativeToolProtocol()
         ).plan_save_candidate(turn.context.messages, covered_through=0)
@@ -349,7 +349,7 @@ class ClarificationAgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertTrue(succeeded.result.ok, succeeded.result.summary)
-        self.assertEqual(0, failed.context.latest_completed_task_seq)
+        self.assertGreater(failed.context.latest_completed_task_seq, 0)
         self.assertGreater(succeeded.context.latest_completed_task_seq, 0)
         old_terminal = next(
             message for message in failed.context.messages if message.kind == "task_termination"
@@ -411,7 +411,7 @@ class ClarificationAgentTests(unittest.TestCase):
 
         self.assertFalse(turn.result.ok)
         self.assertEqual("任务已取消", turn.result.summary)
-        self.assertEqual(0, turn.context.latest_completed_task_seq)
+        self.assertGreater(turn.context.latest_completed_task_seq, 0)
         tool_results = [
             message
             for message in turn.context.messages

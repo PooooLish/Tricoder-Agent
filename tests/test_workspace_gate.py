@@ -120,9 +120,11 @@ class WorkspaceGateRuntimeTests(unittest.TestCase):
 
         result = runtime.run_task("after-confirm")
 
-        # 任务确实执行一次，但外部变化使旧验证失效；这个 synthetic Agent
-        # 没有重新验证，因此沿用现有完成门槛返回未完成。
-        self.assertFalse(result.ok)
+        # 任务确实执行一次，外部变化使旧验证失效并建立历史义务；这个
+        # synthetic Agent 没有产生本轮修改，因此回顾可交付但义务不能丢失。
+        self.assertTrue(result.ok)
+        self.assertEqual("pending", runtime.current.memory.verification_obligation)
+        self.assertIn("code.py", runtime.current.memory.pending_verification_paths)
         self.assertEqual(["baseline", "after-confirm"], agent.calls)
         self.assertEqual(2, len(previews))
         self.assertNotEqual(previews[0].candidate_id, previews[1].candidate_id)

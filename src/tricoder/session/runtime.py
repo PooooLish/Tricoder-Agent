@@ -32,6 +32,7 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.core.clarification import Clarifier
 from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
+from tricoder.context.manager import ContextManager
 from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.context.summarizer import (
     MemorySummaryError,
@@ -62,6 +63,7 @@ from tricoder.models import (
 from tricoder.mcp.security import MCP_START_APPROVAL_ACTION
 from tricoder.policy import CommandPolicy, PolicyError, WorkspacePolicy
 from tricoder.providers import ModelProvider, create_provider
+from tricoder.engine.finalization import close_runtime_failure_context
 from tricoder.session.lock import SessionLock, SessionLockBusyError
 from tricoder.session.store import (
     SessionError,
@@ -217,6 +219,8 @@ class RuntimeStatus:
     context_messages: int = 0
     modified_files: int = 0
     modified_directories: int = 0
+    verification_obligation: str = "none"
+    pending_verification_paths: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +333,62 @@ def _persisted_run_summary(result: RunResult, verification: str) -> str:
     """根据受控结构字段生成摘要，绝不拼接任务或模型返回原文。"""
     outcome = "succeeded" if result.ok else "failed"
     return f"run: {outcome}; modified_files={len(result.modified_files)}; verification={verification}"
+
+
+def _check_target_covers_path(target: str, path: str) -> bool:
+    """保守判断宿主检查目标是否覆盖一个待验证相对路径。"""
+
+    normalized_target = target.replace("\\", "/").rstrip("/") or "."
+    normalized_path = path.replace("\\", "/").rstrip("/")
+    if normalized_target == ".":
+        return True
+    return normalized_path == normalized_target or normalized_path.startswith(
+        normalized_target + "/"
+    )
+
+
+def _merge_verification_obligation(
+    memory: SessionMemory,
+    effects: FileEffects,
+    result: RunResult,
+    *,
+    trusted_pass: bool,
+) -> tuple[str, tuple[str, ...]]:
+    """将本轮宿主事实原子合并进跨任务义务，不信任模型摘要。"""
+
+    pending = list(memory.pending_verification_paths)
+    for path in (*effects.paths, *effects.directory_paths):
+        if path not in pending:
+            pending.append(path)
+
+    successful_targets: list[str] = []
+    if trusted_pass:
+        for record in result.task_validation.records:
+            if (
+                record.kind != "information"
+                and record.execution_complete
+                and record.workspace_stable
+                and record.returncode == 0
+            ):
+                successful_targets.extend(record.targets)
+        if successful_targets:
+            pending = [
+                path
+                for path in pending
+                if not any(
+                    _check_target_covers_path(target, path)
+                    for target in successful_targets
+                )
+            ]
+
+    if pending:
+        return "pending", tuple(pending)
+    if memory.verification_obligation == "legacy_unknown":
+        # 旧数据只有完整工作区检查才足以消除来源不明状态。
+        if trusted_pass and "." in successful_targets:
+            return "none", ()
+        return "legacy_unknown", ()
+    return "none", ()
 
 
 class SessionRuntime:
@@ -597,6 +657,8 @@ class SessionRuntime:
             modified_files=original.memory.modified_files,
             verification=("待验证" if original.memory.unknown_effects else original.memory.verification),
             permission_level=original.memory.permission_level,
+            verification_obligation=original.memory.verification_obligation,
+            pending_verification_paths=original.memory.pending_verification_paths,
         )
         previous_conversation = original.context.conversation_memory
         if not isinstance(previous_conversation, ConversationMemory):
@@ -611,6 +673,8 @@ class SessionRuntime:
                 modified_files=memory.modified_files,
                 modified_directories=original.context.modified_directories,
                 verification=memory.verification,
+                verification_obligation=memory.verification_obligation,
+                pending_verification_paths=memory.pending_verification_paths,
                 conversation_memory=cleared_conversation,
                 next_message_seq=original.context.next_message_seq,
                 persisted_memory_revision=original.context.persisted_memory_revision,
@@ -832,6 +896,8 @@ class SessionRuntime:
                         modified_directories=active.context.modified_directories,
                         verification=active.context.verification,
                         unknown_effects=active.context.unknown_effects,
+                        verification_obligation=active.memory.verification_obligation,
+                        pending_verification_paths=active.memory.pending_verification_paths,
                     )
                 with cleanup_scope(cleanup), task_observation_scope():
                     self._task_sealed_change_set = None
@@ -841,7 +907,8 @@ class SessionRuntime:
                         self._finalize_workspace_exception(active)
                         self._clear_workspace_change_notice()
                         raise
-                    return self._finalize_workspace_task(active, result)
+                    result = self._finalize_workspace_task(active, result)
+                    return self._synchronize_runtime_final_outcome(result)
             finally:
                 current = self._require_active_session()
                 if current.record.id != self._task_session_id:
@@ -1011,9 +1078,15 @@ class SessionRuntime:
         context = self.current.context
         if self.current.tools is not None:
             self.current.tools.context.verification_scope.revoke()
-        if context.verification_required or context.verification_evidence is not None or context.verification_failure is not None:
-            context = replace(context, verification_evidence=None, verification_required=True,
-                              verification="失败" if context.verification_failure is not None else "待验证")
+        if context.verification_evidence is not None or context.verification_required:
+            context = replace(
+                context,
+                verification_evidence=None,
+                verification_required=context.verification_required,
+                verification=(
+                    "失败" if context.verification_failure is not None else "待验证"
+                ),
+            )
         result = replace(result, ok=False, verification=context.verification,
                          summary="任务已取消" if result.ok else result.summary)
         verification = _normalized_verification(result.verification)
@@ -1023,6 +1096,40 @@ class SessionRuntime:
         self.current = replace(self.current, context=context, memory=memory)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
+        return result
+
+    def _synchronize_runtime_final_outcome(self, result: RunResult) -> RunResult:
+        """把 Agent 返回后的最终否决同步到历史、候选覆盖和安全摘要。"""
+
+        if result.ok or self.current is None:
+            return result
+        current = self.current
+        result = replace(
+            result,
+            verification_obligation=current.memory.verification_obligation,
+            pending_verification_paths=current.memory.pending_verification_paths,
+        )
+        context = current.context
+        context_manager = getattr(current.agent, "context_manager", None)
+        if isinstance(context_manager, ContextManager):
+            context = close_runtime_failure_context(context, context_manager)
+        verification = _normalized_verification(result.verification)
+        summary = _persisted_run_summary(result, verification)
+        memory = replace(
+            current.memory,
+            summary=summary,
+            last_task_summary=summary,
+            modified_files=tuple(result.modified_files),
+            verification=verification,
+            unknown_effects=result.unknown_effects,
+        )
+        updated = replace(current, context=context, memory=memory)
+        if updated == current:
+            return result
+        self.current = updated
+        self._cache_current()
+        self._memory_dirty = memory != self._persisted_memory
+        self._persist_current()
         return result
 
     def current_task_cancellation(self) -> CancellationToken | None:
@@ -1060,12 +1167,41 @@ class SessionRuntime:
                                  if not scope.retry(deadline)]
         return not self._pending_cleanup
 
-    def _observe_workspace_change(self, _preview: WorkspaceGatePreview) -> None:
+    def _observe_workspace_change(self, preview: WorkspaceGatePreview) -> None:
         """检测即撤销旧版本验证；用户拒绝也不能恢复旧通过状态。"""
 
         if self.current is None:
             return
         self._invalidate_current_after_workspace_finish_failure()
+        current = self.current
+        normalized_paths = tuple(
+            dict.fromkeys(
+                path.replace("\\", "/").rstrip("/")
+                for path in preview.changed_paths
+                if path.replace("\\", "/").rstrip("/")
+            )
+        )
+        if normalized_paths:
+            pending = tuple(
+                dict.fromkeys(
+                    (*current.memory.pending_verification_paths, *normalized_paths)
+                )
+            )
+            self.current = replace(
+                current,
+                memory=replace(
+                    current.memory,
+                    verification_obligation="pending",
+                    pending_verification_paths=pending,
+                ),
+                context=replace(
+                    current.context,
+                    verification_obligation="pending",
+                    pending_verification_paths=pending,
+                ),
+            )
+            self._cache_current()
+            self._memory_dirty = self.current.memory != self._persisted_memory
 
     @staticmethod
     def _safe_workspace_path(path: str) -> str:
@@ -1338,6 +1474,8 @@ class SessionRuntime:
                 modified_files=original.context.modified_files, verification="待验证",
                 unknown_effects=True,
                 modified_directories=original.context.modified_directories,
+                verification_obligation=original.memory.verification_obligation,
+                pending_verification_paths=original.memory.pending_verification_paths,
             )
         original.journal.begin_task(
             tuple(original.context.modified_files),
@@ -1346,9 +1484,16 @@ class SessionRuntime:
         original.journal.set_directory_baseline(
             tuple(original.context.modified_directories)
         )
+        # SessionContext 可能还带着上一个任务的临时 capability。新任务只继承
+        # 历史展示和独立 obligation，不继承本轮门禁或通过证据。
+        task_context = replace(
+            original.context,
+            verification_evidence=None,
+            verification_required=False,
+        )
         observation = current_task_observation()
         if observation is not None:
-            observation.seed(original.context, journal_revision=original.journal.active_revision)
+            observation.seed(task_context, journal_revision=original.journal.active_revision)
         final_capture_active = False
         try:
             if self._mcp_effectively_enabled(original.config):
@@ -1366,7 +1511,7 @@ class SessionRuntime:
                 async def operation(_active_tools: ToolRegistry):
                     return await task_agent.run_with_context_async(
                         task,
-                        original.context,
+                        task_context,
                         cancellation=self._task_cancellation,
                         event_sink=self._observer if callable(self._observer) else None,
                     )
@@ -1405,7 +1550,7 @@ class SessionRuntime:
                     and callable(self._observer)
                 ):
                     kwargs["event_sink"] = self._observer
-                turn = run_method(task, original.context, **kwargs)
+                turn = run_method(task, task_context, **kwargs)
             observed_context = turn.context
             if observation is not None:
                 observed_context, _ = observation.reconcile(observed_context)
@@ -1428,7 +1573,7 @@ class SessionRuntime:
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, CancellationError)):
                 if self._task_cancellation is not None:
                     self._task_cancellation.cancel()
-            interrupted_context = original.context
+            interrupted_context = task_context
             observation = current_task_observation()
             if observation is not None:
                 interrupted_context, _ = observation.reconcile(interrupted_context)
@@ -1447,9 +1592,26 @@ class SessionRuntime:
                     original.tools.context.verification_scope.revoke()
                 reconciled = replace(reconciled, verification_evidence=None, verification_required=True,
                                      verification="失败" if reconciled.verification_failure is not None else "待验证")
+            try:
+                exception_effects = original.journal.active_effects_since(-1)
+            except Exception:
+                exception_effects = FileEffects(EffectState.UNKNOWN)
+            obligation, pending_paths = _merge_verification_obligation(
+                original.memory,
+                exception_effects,
+                RunResult(False, "任务异常", 0),
+                trusted_pass=False,
+            )
+            reconciled = replace(
+                reconciled,
+                verification_obligation=obligation,
+                pending_verification_paths=pending_paths,
+            )
             memory = replace(
                 original.memory, modified_files=reconciled.modified_files,
                 verification=reconciled.verification, unknown_effects=reconciled.unknown_effects,
+                verification_obligation=obligation,
+                pending_verification_paths=pending_paths,
             )
             self.current = replace(original, context=reconciled, memory=memory)
             self._cache_current()
@@ -1481,16 +1643,39 @@ class SessionRuntime:
             if original.tools is not None:
                 original.tools.context.verification_scope.revoke()
             if reconciled.verification_evidence is not None or reconciled.verification_required:
-                reconciled = replace(reconciled, verification="待验证", verification_evidence=None,
-                                     verification_required=True)
-        required = (reconciled.verification_required or reconciled.verification_failure is not None
-                    or reconciled.verification_evidence is not None)
+                reconciled = replace(
+                    reconciled,
+                    verification="待验证",
+                    verification_evidence=None,
+                    verification_required=reconciled.verification_required,
+                )
+        required = reconciled.verification_required
         evidence = reconciled.verification_evidence
-        trusted_pass = (reconciled.verification_failure is None
-                        and reconciled.verification in {"通过", "passed"}
-                        and original.tools is not None
-                        and original.tools.context.verification_scope.owns(evidence)
-                        and evidence.is_valid_for(current_snapshot))
+        evidence_is_current = bool(
+            evidence is not None
+            and original.tools is not None
+            and original.tools.context.verification_scope.owns(evidence)
+            and evidence.is_valid_for(current_snapshot)
+        )
+        # 单条通过证据的 authority/快照有效性，与另一项检查是否仍失败是两件事。
+        # 未解决失败只会阻止“修改验证义务”被满足，不能把当前有效证据伪装成
+        # 过期或跨 Session 的能力，进而为纯审查任务凭空建立修改义务。
+        trusted_pass = bool(
+            evidence_is_current
+            and reconciled.verification_failure is None
+            and reconciled.verification in {"通过", "passed"}
+        )
+        if evidence is not None and not evidence_is_current:
+            # 稳定失败检查本身没有 evidence，不会进入这里；只有过期、
+            # 跨 Session 或最终扫描不完整的“通过能力”才建立保守义务。
+            required = True
+            reconciled = replace(
+                reconciled,
+                verification_evidence=None,
+                verification_required=True,
+                verification="待验证",
+            )
+            evidence = None
         if required and not trusted_pass:
             reconciled = replace(reconciled, verification_evidence=None, verification_required=True,
                                  verification="失败" if reconciled.verification_failure is not None else "待验证")
@@ -1501,6 +1686,10 @@ class SessionRuntime:
             if required:
                 reconciled = replace(reconciled, verification_evidence=None,
                                      verification="失败" if reconciled.verification_failure is not None else "待验证")
+        try:
+            task_effects = original.journal.active_effects_since(-1)
+        except Exception:
+            task_effects = FileEffects(EffectState.UNKNOWN)
         result = replace(
             turn.result, modified_files=reconciled.modified_files,
             modified_directories=reconciled.modified_directories,
@@ -1509,9 +1698,9 @@ class SessionRuntime:
                 current_cleanup() is not None and current_cleanup().failed),
             verification=reconciled.verification,
             unknown_effects=turn.result.unknown_effects or reconciled.unknown_effects,
+            current_verification_required=required,
             ok=(turn.result.ok and not cancelled and not reconciled.unknown_effects
-                and (not required or trusted_pass)
-                and not (reconciled.modified_files and reconciled.verification == "待验证")),
+                and (not required or trusted_pass)),
         )
         if result.unknown_effects:
             unknown_notice = "文件影响未确认；请检查实际文件并通过 /clear 明确确认"
@@ -1520,6 +1709,17 @@ class SessionRuntime:
             result = replace(result, summary=summary, ok=False)
         verification = _normalized_verification(result.verification)
         persisted_summary = _persisted_run_summary(result, verification)
+        obligation, pending_paths = _merge_verification_obligation(
+            original.memory,
+            task_effects,
+            result,
+            trusted_pass=trusted_pass,
+        )
+        result = replace(
+            result,
+            verification_obligation=obligation,
+            pending_verification_paths=pending_paths,
+        )
         memory = SessionMemory(
             summary=persisted_summary,
             requirements_summary=safe_requirement_summary(task),
@@ -1528,9 +1728,16 @@ class SessionRuntime:
             verification=verification,
             permission_level=original.memory.permission_level,
             unknown_effects=result.unknown_effects,
+            verification_obligation=obligation,
+            pending_verification_paths=pending_paths,
         )
         if reconciled.unknown_effects != result.unknown_effects:
             reconciled = replace(reconciled, unknown_effects=result.unknown_effects)
+        reconciled = replace(
+            reconciled,
+            verification_obligation=obligation,
+            pending_verification_paths=pending_paths,
+        )
         self.current = replace(original, memory=memory, context=reconciled)
         self._cache_current()
         self._memory_dirty = memory != self._persisted_memory
@@ -1571,10 +1778,7 @@ class SessionRuntime:
     def _invalidate_verification(active: ActiveSession, *, force: bool = False) -> ActiveSession:
         """切会话/撤销只撤销本地能力，不把恢复旧内容解释为恢复旧证明。"""
         context = active.context
-        required = (force or context.verification_required or bool(context.modified_files)
-                    or context.verification_evidence is not None
-                    or context.verification_failure is not None
-                    or _normalized_verification(context.verification) in {"passed", "failed", "待验证"})
+        required = force or context.verification_required or context.unknown_effects
         scope = getattr(getattr(active.tools, "context", None), "verification_scope", None)
         if isinstance(scope, VerificationScope):
             # 只轮换能力 authority，保留同一工作区验证 scope；旧 evidence
@@ -1582,10 +1786,37 @@ class SessionRuntime:
             scope.revoke()
         if not required:
             return active
-        return replace(active,
-                       context=replace(context, verification="待验证", verification_evidence=None,
-                                       verification_failure=None, verification_required=True),
-                       memory=replace(active.memory, verification="待验证"))
+        obligation = active.memory.verification_obligation
+        pending_paths = active.memory.pending_verification_paths
+        if force and obligation == "none":
+            known_paths = tuple(
+                dict.fromkeys(
+                    (*context.modified_files, *context.modified_directories)
+                )
+            )
+            if known_paths:
+                obligation = "pending"
+                pending_paths = known_paths
+            else:
+                obligation = "legacy_unknown"
+        return replace(
+            active,
+            context=replace(
+                context,
+                verification="待验证",
+                verification_evidence=None,
+                verification_failure=None,
+                verification_required=True,
+                verification_obligation=obligation,
+                pending_verification_paths=pending_paths,
+            ),
+            memory=replace(
+                active.memory,
+                verification="待验证",
+                verification_obligation=obligation,
+                pending_verification_paths=pending_paths,
+            ),
+        )
 
     @staticmethod
     def _mcp_effectively_enabled(config: AppConfig) -> bool:
@@ -2179,6 +2410,10 @@ class SessionRuntime:
             modified_directories=len(
                 self.current.context.modified_directories
             ),
+            verification_obligation=self.current.memory.verification_obligation,
+            pending_verification_paths=len(
+                self.current.memory.pending_verification_paths
+            ),
         )
 
     def render_memory(self) -> str:
@@ -2254,14 +2489,25 @@ class SessionRuntime:
         context: SessionContext,
         candidate: ConversationMemory,
     ) -> None:
-        """保存只能覆盖到 Agent 已确认成功结束的最新任务水位。"""
+        """保存只能覆盖到最新已结束任务，且不能保存未经编辑的初始空对象。"""
+
+        if (
+            candidate.revision == 0
+            and candidate.covered_through == 0
+            and candidate.goal is None
+            and not candidate.constraints
+            and not candidate.decisions
+            and not candidate.open_items
+            and not candidate.archived
+        ):
+            raise SessionRuntimeError("暂无可保存的会话记忆")
 
         target = context.latest_completed_task_seq
         if candidate.covered_through < target:
             raise SessionRuntimeError(
                 "会话记忆候选覆盖不足："
                 f"当前覆盖到消息 {candidate.covered_through}，"
-                f"最新已完成任务到消息 {target}；请先运行 /memory refresh"
+                f"最新已结束任务到消息 {target}；请先运行 /memory refresh"
             )
         if candidate.covered_through > target:
             raise SessionRuntimeError("会话记忆候选覆盖边界无效，请重新刷新")
@@ -2291,7 +2537,7 @@ class SessionRuntime:
         text = (
             f"保存位置：{self.store.database_path}\n"
             f"覆盖状态：完整；候选到消息 {candidate.covered_through}；"
-            f"最新已完成任务到消息 {context.latest_completed_task_seq}\n"
+            f"最新已结束任务到消息 {context.latest_completed_task_seq}\n"
             f"将保存字段：目标、约束、决策、待办、来源、scope、revision；"
             f"不保存源码正文或原始工具输出。\n{encoded}"
         )
@@ -2810,9 +3056,7 @@ class SessionRuntime:
         journal: ChangeJournal | None = None,
     ) -> ActiveSession:
         """构建完整候选对象，调用方在成功返回前不会修改 ``current``。"""
-        # SQLite 只保存展示字符串；加载时没有对应的本地文件版本证明。
-        if _normalized_verification(memory.verification) in {"passed", "failed"}:
-            memory = replace(memory, verification="待验证")
+        # SQLite 不恢复本地 capability；展示字符串只保留为历史检查事实。
         if self._active_session_factory is not None:
             candidate = self._active_session_factory(record, memory, self.options)
             active_journal = journal if journal is not None else candidate.journal
@@ -2836,7 +3080,21 @@ class SessionRuntime:
                     raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本")
             active = replace(
                 candidate,
-                context=replace(candidate.context, unknown_effects=memory.unknown_effects or candidate.context.unknown_effects),
+                memory=replace(
+                    candidate.memory,
+                    verification_obligation=memory.verification_obligation,
+                    pending_verification_paths=memory.pending_verification_paths,
+                ),
+                context=replace(
+                    candidate.context,
+                    unknown_effects=(
+                        memory.unknown_effects or candidate.context.unknown_effects
+                    ),
+                    verification_obligation=memory.verification_obligation,
+                    pending_verification_paths=memory.pending_verification_paths,
+                    verification_evidence=None,
+                    verification_required=False,
+                ),
                 tools=candidate.tools or (registries[0] if registries else None),
                 journal=active_journal,
             )
@@ -2877,6 +3135,8 @@ class SessionRuntime:
                 modified_files=memory.modified_files,
                 verification=memory.verification,
                 unknown_effects=memory.unknown_effects,
+                verification_obligation=memory.verification_obligation,
+                pending_verification_paths=memory.pending_verification_paths,
             ),
             loaded,
             agent,

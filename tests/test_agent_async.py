@@ -24,6 +24,7 @@ from tricoder.core.events import (
     UsageReported,
 )
 from tricoder.models import (
+    MemoryConfig,
     Message,
     ProviderResponse,
     SessionContext,
@@ -461,7 +462,10 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
                     ToolCall(f"command-{index}", "run_command", {"command": "python owned.py"}),
                     ToolCall(f"finish-{index}", "finish", {"summary": "done"}),
                 )) for index in (1, 2)])
-                agent = CodingAgent(provider, registry, plan_enabled=False, max_rounds=1)
+                agent = CodingAgent(
+                    provider, registry, plan_enabled=False, max_rounds=1,
+                    memory_config=MemoryConfig(compaction="off", persistence="off"),
+                )
                 async def execute(index):
                     if entry == "agent":
                         events = []
@@ -667,12 +671,14 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
             async_agent = CodingAgent(
                 HybridProvider([_finish_response()]),
                 AsyncRegistry(),  # type: ignore[arg-type]
+                memory_config=MemoryConfig(compaction="off", persistence="off"),
                 plan_enabled=False,
                 audit=AuditLogger(async_audit),
             )
             sync_agent = CodingAgent(
                 HybridProvider([_finish_response()]),
                 AsyncRegistry(),  # type: ignore[arg-type]
+                memory_config=MemoryConfig(compaction="off", persistence="off"),
                 plan_enabled=False,
                 audit=AuditLogger(sync_audit),
             )
@@ -694,7 +700,10 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
         ])
         registry = AsyncRegistry()
         observed: list[object] = []
-        agent = CodingAgent(provider, registry, plan_enabled=False)  # type: ignore[arg-type]
+        agent = CodingAgent(
+            provider, registry, plan_enabled=False,  # type: ignore[arg-type]
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
+        )
 
         turn = await agent.run_with_context_async("task", SessionContext(), event_sink=observed.append)
 
@@ -744,7 +753,11 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(turn.result.ok)
         self.assertEqual(["inspect"], registry.calls)
-        self.assertEqual(["assistant", "tool", "tool"], [message.role for message in turn.context.messages[-3:]])
+        self.assertEqual(
+            ["assistant", "tool", "tool", "user"],
+            [message.role for message in turn.context.messages[-4:]],
+        )
+        self.assertEqual("task_termination", turn.context.messages[-1].kind)
         self.assertIsInstance(observed[-1], RuntimeFailed)
 
     async def test_sync_entrypoint_rejects_nested_event_loop(self) -> None:

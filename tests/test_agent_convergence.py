@@ -389,7 +389,7 @@ class AgentConvergenceTests(unittest.TestCase):
         self.assertFalse(failed.result.ok)
         self.assertTrue(succeeded.result.ok, succeeded.result.summary)
         self.assertEqual(5, len(provider.histories))
-        self.assertEqual(0, failed.context.latest_completed_task_seq)
+        self.assertGreater(failed.context.latest_completed_task_seq, 0)
         self.assertGreater(succeeded.context.latest_completed_task_seq, 0)
         manager = ContextManager(ContextBudget(max_chars=100_000), NativeToolProtocol())
         plan = manager.plan_save_candidate(
@@ -429,7 +429,7 @@ class AgentConvergenceTests(unittest.TestCase):
         self.assertNotIn("arguments", progress[0])
         self.assertNotIn("output", progress[0])
 
-    def test_progress_stop_audit_failure_has_priority_and_no_marker(self) -> None:
+    def test_progress_stop_audit_failure_has_priority_and_records_incomplete(self) -> None:
         class FailingProgressAudit:
             def prepare(self) -> None:
                 return None
@@ -452,7 +452,7 @@ class AgentConvergenceTests(unittest.TestCase):
         self.assertFalse(turn.result.ok)
         self.assertEqual("无法写入审计日志，运行已安全停止", turn.result.summary)
         self.assertEqual(2, len(provider.histories))
-        self.assertFalse(
+        self.assertTrue(
             any(message.kind == "task_termination" for message in turn.context.messages)
         )
 
@@ -483,7 +483,7 @@ class AgentConvergenceTests(unittest.TestCase):
         self.assertFalse(turn.result.ok)
         self.assertEqual("任务已取消", turn.result.summary)
         self.assertEqual(4, len(provider.histories))
-        self.assertFalse(
+        self.assertTrue(
             any(message.kind == "task_termination" for message in turn.context.messages)
         )
 

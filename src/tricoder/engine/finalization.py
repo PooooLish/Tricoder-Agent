@@ -4,13 +4,79 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from tricoder.context.manager import ContextManager
+from tricoder.context.memory import (
+    TASK_INCOMPLETE_NOTICE,
+    TASK_TERMINATION_KIND,
+    assign_message_sequences,
+    is_trusted_task_termination,
+)
 from tricoder.core.cancellation import CancellationToken
 from tricoder.core.events import EventSink, RuntimeCompleted, RuntimeFailed
 from tricoder.engine.state import AgentRunState
 from tricoder.engine.telemetry import emit
-from tricoder.models import RunResult, SessionContext, SessionTurnResult
+from tricoder.models import Message, RunResult, SessionContext, SessionTurnResult
 from tricoder.task_cleanup import current_cleanup
 from tricoder.workspace.verification import VerificationScope
+
+
+def close_runtime_failure_context(
+    context: SessionContext,
+    context_manager: ContextManager,
+) -> SessionContext:
+    """把 Agent 返回后的宿主失败追加为单次、可验证的终止事实。
+
+    Runtime 的最终扫描、取消提交或清理门禁可能在 Agent 已完成自身收尾后
+    才否决结果。这里不伪造工具调用或业务完成，只闭合最后一个真实任务；
+    如果历史本身不完整，则保留旧完成水位，避免越过缺失的工具结果。
+    """
+
+    messages, next_message_seq = assign_message_sequences(
+        context.messages,
+        context.next_message_seq,
+    )
+    task_messages = [message for message in messages if message.kind == "task"]
+    if not task_messages:
+        return replace(
+            context,
+            messages=messages,
+            next_message_seq=next_message_seq,
+        )
+    current_task_id = task_messages[-1].task_id
+    if current_task_id is None:
+        return replace(
+            context,
+            messages=messages,
+            next_message_seq=next_message_seq,
+        )
+    if not any(
+        message.task_id == current_task_id
+        and is_trusted_task_termination(message)
+        for message in messages
+    ):
+        messages = (*messages, Message(
+            "user",
+            TASK_INCOMPLETE_NOTICE,
+            kind=TASK_TERMINATION_KIND,
+            task_id=current_task_id,
+        ))
+        messages, next_message_seq = assign_message_sequences(
+            messages,
+            next_message_seq,
+        )
+    boundary = context_manager.closed_task_boundary(
+        messages,
+        covered_through=context.latest_completed_task_seq,
+        current_task_id=current_task_id,
+    )
+    return replace(
+        context,
+        messages=messages,
+        next_message_seq=next_message_seq,
+        latest_completed_task_seq=(
+            context.latest_completed_task_seq if boundary is None else boundary
+        ),
+    )
 
 
 class TaskFinalizer:
@@ -25,6 +91,7 @@ class TaskFinalizer:
         observation: object | None,
         tool_context: object | None,
         tool_protocol: str,
+        context_manager: ContextManager,
         event_sink: EventSink | None,
     ) -> None:
         self.state = state
@@ -33,12 +100,44 @@ class TaskFinalizer:
         self.observation = observation
         self.tool_context = tool_context
         self.tool_protocol = tool_protocol
+        self.context_manager = context_manager
         self.event_sink = event_sink
 
     def publish_state(self) -> None:
         """发布已核验的文件与验证事实。"""
 
         self.state.publish(self.observation, self.tool_context)
+
+    def close_task(self, result: RunResult) -> bool:
+        """闭合失败事实，并只在连续历史完整时推进已结束任务水位。"""
+
+        state = self.state
+        # 专用终止标记通常在循环末尾追加，尚未获得 task_id；先统一编号，
+        # 否则会误判为缺失并重复追加通用标记。
+        state.normalize_history()
+        if not result.ok and not any(
+            message.task_id == state.current_task_id
+            and is_trusted_task_termination(message)
+            for message in state.messages
+        ):
+            state.messages.append(
+                Message(
+                    "user",
+                    TASK_INCOMPLETE_NOTICE,
+                    kind=TASK_TERMINATION_KIND,
+                    task_id=state.current_task_id,
+                )
+            )
+        normalized = state.normalize_history()
+        boundary = self.context_manager.closed_task_boundary(
+            normalized,
+            covered_through=state.latest_completed_task_seq,
+            current_task_id=state.current_task_id,
+        )
+        if boundary is None:
+            return False
+        state.latest_completed_task_seq = boundary
+        return True
 
     def finish(
         self,
@@ -65,8 +164,8 @@ class TaskFinalizer:
                     "失败" if state.failed_snapshot is not None else "待验证"
                 )
         self.publish_state()
+        current_complete = self.close_task(result)
         normalized_history = state.normalize_history()
-        current_complete = state.current_task_has_complete_round(self.tool_protocol)
         context = state.source_context
         if rollback_task and not current_complete and state.memory_compacted:
             current_index = next(
@@ -91,6 +190,9 @@ class TaskFinalizer:
                 verification=state.verification,
                 cleanup_failed=cleanup_bad,
                 task_validation=state.validation.report(),
+                current_verification_required=state.verification_required,
+                verification_obligation=state.verification_obligation,
+                pending_verification_paths=state.pending_verification_paths,
             ),
             SessionContext(
                 messages=(
@@ -106,6 +208,8 @@ class TaskFinalizer:
                 verification_evidence=state.evidence,
                 verification_failure=state.failed_snapshot,
                 verification_required=state.verification_required,
+                verification_obligation=state.verification_obligation,
+                pending_verification_paths=state.pending_verification_paths,
                 conversation_memory=state.conversation_memory,
                 review_memory_candidate=state.review_memory_candidate,
                 next_message_seq=(

@@ -23,10 +23,10 @@ COMMON_SYSTEM_PROMPT = """你是一个在本地代码工作区内协作的 Codin
 根据当前任务选择相关的 script、syntax、static 或 tests 检查；检查成功只证明该命令事实，不自动证明需求覆盖，不要为消除提示循环运行无关检查。
 创建目录请使用 create_directory；创建嵌套文件可显式设置 create_parents=true。不要用占位文件模拟空目录，也不要为 mkdir/pwd 反复试探 run_command。apply_patch 的父目录必须先创建。
 禁止 `python -c`、pip、管道和任意程序；INVALID_ARGUMENT / REPLAN 可改写，POLICY_DENIED / APPROVAL_DENIED 必须停止。
-当工作已完成或无法继续时，必须调用 finish 提交总结并结束本轮任务。
+当工作已完成或无法继续时，必须调用 finish 提交总结并结束本轮任务；已交付使用 outcome=completed，仍有未完成工作使用 outcome=incomplete。
 仅当缺少的用户信息会实质改变实现时调用 ask_user；回答只提供信息，不批准任何写入、命令、扩展或权限变更。
 不要仅以普通文本总结结束，也不要为满足工具调用要求重复读取文件或运行与当前任务无关的测试。
-finish 只请求结束，完成状态以本地验证结果为准。
+finish 的 outcome 是交付声明，不是测试通过证明；最终状态仍受本地安全约束。
 """
 
 NATIVE_TOOL_PROMPT = """使用 Provider 提供的原生工具调用完成任务。
@@ -51,7 +51,7 @@ LEGACY_JSON_PROMPT = """每轮只能返回一个 JSON 对象，不能使用 Mark
 - apply_patch: {"patch":"受限 unified diff；父目录须先存在"}
 - run_command: {"command":"测试或静态检查命令","cwd":"可选相对目录"}
 - git_diff: {}
-- finish: {"summary":"完成情况、验证结果和剩余风险"}
+- finish: {"summary":"完成情况、检查结果和剩余风险","outcome":"completed|incomplete（可选，默认 completed）"}
 """
 
 SYSTEM_PROMPT = COMMON_SYSTEM_PROMPT + NATIVE_TOOL_PROMPT

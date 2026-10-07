@@ -217,6 +217,10 @@ def run_eval_command(
             max_context_chars=case.max_context_chars,
             read_only=False,
             audit_dir=audit_path.parent,
+            # 无版本的 legacy Eval 必须保持旧基准条件；记忆对照仅由
+            # versioned experiment 的 condition 显式开启，避免全局默认值
+            # 改变历史分数或在小预算 fixture 中抢占业务请求。
+            memory=MemoryConfig(compaction="off", persistence="off"),
         )
         return _execute_case(
             case,

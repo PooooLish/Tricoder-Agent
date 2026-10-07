@@ -124,18 +124,35 @@ class MemoryCoordinator:
                     next_message_seq=next_message_seq,
                 )
             )
+        termination_extension = self.context_manager.extend_save_candidate_with_termination(
+            previous,
+            messages,
+            target=target,
+            summary_max_chars=self.memory_config.summary_max_chars,
+        )
+        if termination_extension is not None:
+            previous = termination_extension
+        if previous.covered_through == target:
+            return MemoryRefreshResult(
+                replace(
+                    context,
+                    messages=messages,
+                    next_message_seq=next_message_seq,
+                    review_memory_candidate=previous,
+                )
+            )
         plan = self.context_manager.plan_save_candidate(
             messages,
             covered_through=previous.covered_through,
         )
         if not plan.needs_summary or not plan.source_messages:
             raise MemorySummaryError(
-                "无法从当前历史恢复未覆盖的已完成任务",
+                "无法从当前历史恢复未覆盖的已结束任务",
                 code="coverage",
             )
         if plan.covered_through != target:
             raise MemorySummaryError(
-                "保存候选覆盖目标与已完成任务水位不一致",
+                "保存候选覆盖目标与已结束任务水位不一致",
                 code="coverage",
             )
         summarizer = self.memory_summarizer
@@ -404,14 +421,14 @@ class MemoryCoordinator:
         result = self._record(progress, replace(result, context=context))
         source_count = 0
         try:
-            previous = (
-                context.review_memory_candidate or context.conversation_memory
+            previous = context.review_memory_candidate or context.conversation_memory
+            source_count = sum(
+                1
+                for message in context.messages
+                if message.message_seq is not None
+                and previous.covered_through < message.message_seq
+                <= context.latest_completed_task_seq
             )
-            audit_plan = self.context_manager.plan_save_candidate(
-                context.messages,
-                covered_through=previous.covered_through,
-            )
-            source_count = len(audit_plan.source_messages)
             refreshed = await self.build_review_candidate(context, cancellation)
         except CancellationError:
             raise

@@ -482,7 +482,7 @@ def _parse_memory_config(
     project: dict[str, object],
     environment: Mapping[str, str],
 ) -> MemoryConfig:
-    """严格解析默认关闭的会话语义记忆配置。"""
+    """严格解析默认开启、仍须用户确认保存的会话语义记忆配置。"""
 
     table = _strict_table(
         project,
@@ -498,12 +498,13 @@ def _parse_memory_config(
             }
         ),
     )
+    defaults = MemoryConfig()
     values = {
         "compaction": environment.get(
-            "TRICODER_MEMORY_COMPACTION", table.get("compaction", "off")
+            "TRICODER_MEMORY_COMPACTION", table.get("compaction", defaults.compaction)
         ),
         "persistence": environment.get(
-            "TRICODER_MEMORY_PERSISTENCE", table.get("persistence", "off")
+            "TRICODER_MEMORY_PERSISTENCE", table.get("persistence", defaults.persistence)
         ),
         "trigger_ratio": environment.get(
             "TRICODER_MEMORY_TRIGGER_RATIO", table.get("trigger_ratio", 0.80)

@@ -262,17 +262,17 @@ class SessionIntegrationTests(unittest.TestCase):
 
             runtime.switch(first.id, confirm=lambda _workspace: True)
             self.assertEqual((), runtime.current.context.messages)
-            self.assertEqual("待验证", runtime.current.context.verification)
+            self.assertEqual("passed", runtime.current.context.verification)
             self.assertIsNone(runtime.current.context.verification_evidence)
-            self.assertTrue(runtime.current.context.verification_required)
+            self.assertFalse(runtime.current.context.verification_required)
             runtime.clear_current()
             self.assertEqual((), runtime.current.context.messages)
 
             runtime.switch(second.id, confirm=lambda _workspace: True)
             self.assertEqual((), runtime.current.context.messages)
-            self.assertEqual("待验证", runtime.current.context.verification)
+            self.assertEqual("passed", runtime.current.context.verification)
             self.assertIsNone(runtime.current.context.verification_evidence)
-            self.assertTrue(runtime.current.context.verification_required)
+            self.assertFalse(runtime.current.context.verification_required)
 
     def test_sqlite_persists_only_canonical_relative_paths_after_agent_writes(self) -> None:
         """防止 Agent 写入后将绝对路径或 dotdot 形式保存到 SQLite。"""

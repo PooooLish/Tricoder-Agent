@@ -1,5 +1,69 @@
 # Project: tricoder-cli
 
+## 2026-10-07 历史验证义务范围修复（修复完成，待复审）
+
+- 按 `docs/superpowers/plans/2026-10-07-verification-obligation-scope-fix.md` 完成 R0—R4。R0 使用真实 `SessionRuntime`、临时 SQLite、fake Provider 和关闭/重启后的实际 `_build_active` 恢复路径，先稳定复现 3 个 RED：历史失败、历史通过及真实修改待验证都会在恢复后把只读回顾误判为本轮未完成。
+- 根因是历史 `verification` 展示值、累计 `modified_files`、可用 evidence 和本轮 `verification_required` 共用同一状态。恢复入口把 passed/failed 降为待验证，Agent 初始化和 Runtime 收尾又据此建立本轮门禁；历史义务没有独立、可持久化的宿主来源。
+- 新增 `verification_obligation=none|pending|legacy_unknown` 与规范相对路径列表。新会话显式为 none；旧表幂等补列，有已知修改路径迁为 pending，来源不足的旧检查/UNKNOWN 迁为 legacy_unknown，干净未运行记录迁为 none。枚举、JSON、唯一相对路径与状态/路径一致性严格校验，相关字段在既有事务中一并写入；不恢复 evidence、审批或通过能力。
+- Agent 与 Runtime 现在只用本轮真实效果、当前 evidence 有效性及既有安全状态计算本轮门禁。文件、目录、命令副作用和净零写入仍建立义务；只读/no-op 不建立。历史 pending/legacy_unknown 不阻止回顾且不会被回顾清除；只有当前 Session authority、稳定最终快照和检查目标确实覆盖对应路径时才解除义务。UNKNOWN、取消、清理/审计失败、失效 evidence 和不完整扫描仍 fail-closed。
+- Console/TUI/`/status` 分别展示本轮交付、本轮检查事实和历史修改验证。结构化记忆保持低信任，不能建立或解除宿主义务；F1/F2/F3 的失败终止、覆盖水位、刷新/保存与旧预览边界继续通过。
+- 新鲜验证：义务专项 `Ran 12`，OK；计划相关聚焦组合 `Ran 341`，OK（2 skipped）；全部记忆 `Ran 87`，OK；Session store/Agent 邻接 `Ran 130`，OK。提交前最终完整项目 `Ran 1578 tests in 347.364s`，OK（13 skipped）；13 项均为既有平台/权限条件跳过。本轮证据见 `runtime/verification-obligation/verification.md`。
+- 未验证 Linux/macOS、Python 3.12、真实 Provider、真实用户数据库迁移和手工 Console/TUI；测试仅使用合成工作区、临时数据库和 fake Provider。未读取 `.env.local`、真实凭据或真实会话库，未安装依赖、提交或推送。范围未扩展到摘要输入超限、Plan/Replan 或沙箱。
+
+## 2026-10-07 连续任务迟到失败记忆补齐（修复完成，待复审）
+
+- 本轮仅处理第二次复审的 F3/P2，保留工作树中已经完成的 F1/F2、失败任务记忆、`finish.outcome` 和记忆默认开启等修改。修复前探针稳定复现：首任务被 Runtime 最终取消后，候选停在消息 3、结束水位为 4；不刷新直接完成下一任务后水位到 7，候选仍为 3，自动更新、显式 refresh 与保存形成相互阻塞。
+- 根因是 `ContextManager.extend_save_candidate_with_termination` 只检查最后任务，而 `MemoryCoordinator.prepare_review_candidate` 又在共享候选构建流程前用旧边界做严格审计。下一任务出现后，旧覆盖点落在前一任务内部，合法的宿主迟到终止事实无法补齐，后续完整任务也无法进入原有摘要流程。
+- 现在先定位旧覆盖边界所在任务；仅当旧边界确实存在、边界前缀及完整任务均闭合、工具调用/结果配对完整，且该任务未覆盖尾部全部是同一任务的宿主可信终止事实时，才确定性合并到该任务边界。后续任务继续走严格 `plan_save_candidate`、摘要、候选校验与取消检查；普通消息、来源异常和未配对 ToolCall 仍拒绝。自动候选和 `/memory refresh` 共用该流程，完整构建成功前不发布半成品。
+- 正式回归覆盖迟到取消、最终扫描否决与下一任务工作区确认、已有多任务坏状态刷新、旧预览失效、确认保存和重启恢复，以及普通尾部、未配对工具结果、摘要失败、校验失败、取消和重复刷新幂等。修复后不立即刷新与立即刷新的两组探针均达到最新水位 7，refresh/preview 均正常；第一次失败待办保留，第二次任务来源被覆盖，确定性补齐不增加摘要调用。
+- 新鲜验证：新增专项 `Ran 4`，OK；记忆/SessionRuntime/验证聚焦 `Ran 200`，OK（1 skipped）；Agent/结束协议/压缩/CLI 邻接 `Ran 216`，OK；最终工作树完整项目 `Ran 1564 tests in 233.865s`，OK（13 skipped）。最终 `compileall`、`git diff --check` 和探针复验见 `runtime/task-outcome-memory/f3-verification.md`。
+- 兼容与限制：未修改数据库 schema、Provider、保存确认或记忆默认配置；没有自动保存、重跑工具或直接推进覆盖水位。尚未验证 Linux/macOS、Python 3.12、真实 Provider、真实用户数据库和手工 Console/TUI。未读取 `.env.local`/真实凭据/真实会话库，未安装依赖、提交或推送。
+
+## 2026-10-07 F1/F2 第二次复审（剩余一项 P2）
+
+- 原 F1 检查顺序误建验证义务已修复；原 F2 的最终失败标记、旧候选/旧预览失效和立即 refresh/save 路径通过。新鲜聚焦 217 tests、51.089s、OK（1 skipped），git diff --check 通过；本轮未重跑全量。
+- 新发现 F3/P2：Runtime 晚到取消后候选覆盖 3、结束水位 4；不立即 refresh 而直接执行下一任务，水位到 7，候选仍为 3。随后 refresh 报候选无效，保存又要求先 refresh，无法正常补齐。对照组先 refresh 再执行下一任务则正常覆盖到 7。
+- 根因是 `ContextManager.extend_save_candidate_with_termination` 只允许末尾任务补齐；下一任务出现后旧候选边界落在前一个完整任务内部，自动候选审计与常规刷新都拒绝。下一动作：最小补齐旧覆盖边界所在任务的可信终止尾部，再按原严格规则处理后续任务；同时覆盖自动候选入口，保留工具配对、来源与保存审批限制。
+- 证据和实施建议：`runtime/task-outcome-memory/review2-findings.md`；新增离线探针 `review2-followup-repro.py` 及对应日志；原问题复验日志 `review2-repro.log`、聚焦日志 `review2-focused.log`。暂不整体验收，先将连续任务复现转为正式测试再修复。
+- 仅记录审查与诊断，未修改生产代码/正式测试；未访问真实数据库或凭据，未调用真实模型、安装依赖、提交或推送。
+
+## 2026-10-07 检查顺序与 Runtime 最终失败记忆补齐（修复完成，待复审）
+
+- 本轮范围严格限定为复审 F1/F2，保留当前工作树中的记忆默认开启、`finish.outcome`、失败任务记忆及其他既有修改；未从 HEAD 覆盖文件。
+- F1 根因是 Runtime 把“当前通过证据是否可用于整体通过”与“该证据自身的 authority/快照是否有效”合并判断。另一项检查仍失败时，有效 evidence 被误判为过期并凭空建立 `verification_required`。现在先独立核验 evidence 的 Session 所有权与当前快照，再仅由真实修改、继承义务、UNKNOWN、取消/清理或失效 evidence 决定修改验证门禁。无修改审查的失败→通过、通过→失败均可交付，真实失败记录与 `TaskValidationReport` 保留；真实修改后仍有失败时继续拒绝成功，后续任务不会继承虚构义务。
+- F2 根因是 Agent 已闭合历史并生成候选后，Runtime 的取消提交、清理门禁或最终工作区扫描仍能把结果改为失败，但旧历史、候选覆盖和保存预览没有同步。现在 Runtime 最终否决后只追加一次宿主签发的未完成事实，重新核对连续闭合边界并更新安全摘要；不伪造 `finish`、tool result、测试通过或业务完成，也不重复发送终态事件。旧候选对象保留但因覆盖不足不能保存，旧预览因消息序号变化失效。
+- `/memory refresh` 对“同一末尾任务、旧覆盖点之后仅新增可信终止事实”的精确形态做确定性本地合并，不调用摘要模型或业务工具。跨任务、普通消息、真正缺失 tool result 或其他不完整历史仍走原有严格拒绝；刷新后确认保存并重启只恢复低信任未完成待办，不恢复原始消息、权限、审批或验证能力。
+- 正式回归覆盖两种检查顺序、失败记录保留、真实修改门禁、下一任务隔离、最终扫描否决、取消/清理、单次终止标记、旧候选/旧预览失效、refresh 不重跑工具、确认保存与重启恢复，以及未配对工具调用拒绝。诊断脚本修复后显示三种无修改审查均 `ok=true`；最终扫描否决为 `ok=false`、终止标记 1、旧预览拒绝、refresh 额外摘要调用 0、刷新后候选含 pending 失败事实。
+- 新鲜验证：F1/F2 专项 `Ran 94`，OK（1 skipped）；全部记忆测试 `Ran 87`，OK；Agent 记忆边界/Context/Session 组合 `Ran 102`，OK；最终完整项目 `Ran 1560 tests in 432.002s`，OK（13 skipped）。最终 `compileall` 和 `git diff --check` 结果见 `runtime/task-outcome-memory/verification.md`。
+- 兼容与限制：未修改 SQLite schema、Provider 协议或记忆默认开关；旧候选需显式 refresh 后才能保存。宿主终止事实依赖进程内原始历史，重启前未确认保存的原始消息仍按既有设计不会持久化。未验证真实 Provider、真实用户数据库、Linux/macOS、Python 3.12 或手工 Console/TUI；未读取真实凭据/会话库、未安装依赖、提交或推送。
+
+## 2026-10-07 检查结果与失败记忆复审（暂不通过）
+
+- 当前工作树复审发现两项 P2：F1 `session/runtime.py:1498-1516` 把“先失败 A 再通过 B”的有效通过证据误判成无效能力，重新建立修改验证义务；同样检查交换顺序会改变审查任务结果。F2 Runtime 在 Agent 返回后将任务改判失败时，没有同步失败终止事实和候选覆盖；旧候选仍可保存，refresh 因覆盖相等而不更新。
+- 合成真实工具探针已复现：失败→finish 为 ok=true，失败→通过→finish 为 ok=false，反序又为 true，三者均未修改文件；独立的 Runtime 最终扫描前外部修改探针得到 ok=false，但终止事实=0、候选待办=0、refresh 新调用=0，保存预览仍被允许。
+- 新鲜聚焦回归 212 项、66.244 秒、OK（1 skipped）；没有重跑全量。已有通过测试缺少这些组合，不能据此判为验收通过。
+- 审查记录 `runtime/task-outcome-memory/review-findings.md`；复现 `runtime/task-outcome-memory/review-repro.py`，运行日志 `review-repro.log`，聚焦日志 `review-focused.log`。复现脚本 exit 0 仅表示诊断运行完成。
+- 下一动作：coding session 将 F1/F2 转为正式失败测试后最小修复并复审；保留已有正确行为和默认记忆设置。本轮只新增审查记录/诊断，未修改生产代码或正式测试，未访问真实会话库或模型服务。
+
+## 2026-10-07 检查结果与失败记忆最小修复（R0—R4 已实施）
+
+- 执行计划：`docs/superpowers/plans/2026-10-07-task-outcome-memory-minimal-fix.md`；证据：`runtime/task-outcome-memory/verification.md`。基线为 HEAD `cb617e4` 加现有“记忆默认开启”未提交修改；本轮保留这些修改，没有从 HEAD 覆盖文件。
+- R0 用临时真实 unittest 和 fake Provider 固定三项 RED：无修改审查的 exit=1 被误写成“文件修改后的验证失败”；失败任务不推进记忆覆盖且 refresh 不调用摘要器；revision=0/coverage=0 的初始空记忆可以预览保存。另补 native/legacy `finish.outcome` 缺失契约。
+- R1 为 `finish` 增加可选 `outcome=completed|incomplete`，省略兼容为 completed；它只表达交付声明。稳定失败检查继续保留真实 returncode、TaskValidationReport 和失败快照，但不再自动建立修改验证义务；真实修改、继承义务、过期/跨 Session 通过证据、最终扫描不完整、取消、清理和 UNKNOWN 仍 fail-closed。观察性失败显示“检查发现失败”，Console/TUI 继续独立显示交付、任务验证和“需求覆盖未自动确认”。
+- R2 在 TaskFinalizer 集中追加单次可信未完成事实，并由 ContextManager 检查从旧水位到当前任务的连续完整历史后推进覆盖。兼容字段 `latest_completed_task_seq` 保留名称，但语义改为“最新可纳入记忆的已结束任务”，不是成功凭据。正常 finish（含 incomplete/宿主否决）复用候选整理；异常停止不增加摘要请求，之后 `/memory refresh` 可消费失败来源。真正缺失 tool result 的历史仍拒绝推进；摘要模型返回空候选也会由宿主确定性保留 pending 失败事实。
+- R3 拒绝 revision=0、coverage=0 且无语义条目的初始空候选；revision 已推进的显式编辑/清理结果仍可保存。临时 SQLite 完成“异常失败→refresh→确认保存→重启”，只恢复低信任未完成待办，不恢复原始工具输出、验证证据、审批或文件状态。legacy Eval 明确保持 memory-off 旧基准；版本化 memory-on 实验仍走生产配置路径。
+- 新鲜验证：核心新增 `Ran 12`，OK；验证证据 `Ran 77`，OK（1 skipped）；Agent 同步/异步 `Ran 101`，OK；计划指定四组分别为 12/6/20/20 项全绿。最终完整项目 `Ran 1555 tests in 228.689s`，OK（13 skipped）；13 项为既有平台/权限条件跳过，本轮新增测试无跳过。compileall 与 `git diff --check` 的最终结果记录在证据文件。
+- 兼容与限制：没有数据库迁移，旧字段名继续存在；旧持久化状态没有足够来源类型时仍保守要求重新验证。模型可能错误选择 completed，本轮没有新增语义验收器；真实 Provider、真实用户数据库、Linux/macOS、Python 3.12 和手工 TUI 未验证。未读取 `.env.local`/真实会话库、未调用真实 Provider、未安装依赖、未提交或推送。
+
+## 2026-10-07 会话记忆与结构化压缩默认开启
+
+- 按用户要求将 `MemoryConfig` 默认值改为 `compaction="structured"`、`persistence="reviewed_summary"`；配置解析复用同一默认值，环境变量和项目配置的显式设置仍优先。完全关闭时需同时将两项设置为 `off`。
+- 补齐一次性 CLI `run` 向 Agent 传递 `config.memory`，避免默认值改变后显式关闭配置被忽略。交互式 SessionRuntime 原有配置传递保持不变。
+- 保留现有隐私与恢复边界：自动生成待审候选，`/memory save` 预览并确认后才持久化；不自动保存完整对话，不改变原有摘要校验、失败保留历史或审批机制。README 已同步说明默认值、额外摘要调用和重启恢复条件。
+- 回归测试新增默认配置、显式关闭与环境变量优先级断言；默认 Agent 候选测试确认保留近期历史且未自动持久化。原先只测试工具事件、旧预算路径或控制步骤的离线用例显式关闭记忆，保持原断言，避免消耗未提供的模拟摘要响应。
+- 验证：配置测试 42 项通过；CLI 配置传递修复后 35 项通过。最终完整离线回归 `Ran 1543 tests in 368.150s`，`OK (skipped=13)`，退出码 0；记录在 `runtime/memory-defaults-final.log`。`git diff --check` 通过，已自查生产改动和测试差异；13 项为既有平台/权限条件跳过。
+- 本轮已完成，下一动作是用户重启 TriCoder 使用新默认值；原先显式关闭的工作区仍需自行调整配置。未安装依赖、读取真实密钥/会话库、调用真实 Provider、提交或推送；未验证 Linux/macOS、Python 3.12 或真实模型摘要效果。
+
 ## 2026-10-07 第三批 C1/D 复审补齐（已实施，等待复审）
 
 - 范围严格限定为 `docs/superpowers/plans/2026-10-07-convergence-review-fixes.md` 的 F1/F2/F3。基线 HEAD 为 `43f721a`，保留开始时所有未提交和未跟踪修改；未从 HEAD 覆盖文件，未安装依赖、读取 `.env.local`/真实会话库、调用真实 Provider、提交或推送。

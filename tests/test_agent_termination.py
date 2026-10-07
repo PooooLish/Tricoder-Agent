@@ -128,8 +128,8 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         self.assertEqual(3, len(provider.histories))
         self.assertEqual(0, result.tool_calls)
 
-    def test_zero_tool_budget_stop_closes_history_without_advancing_success(self) -> None:
-        """零工具失败任务必须可总结，但绝不能取得成功任务水位。"""
+    def test_zero_tool_budget_stop_closes_history_and_advances_ended_boundary(self) -> None:
+        """零工具失败任务可总结；覆盖水位只表示历史已结束，不表示成功。"""
 
         provider = StrictQueueProvider(
             [
@@ -147,7 +147,7 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         ).run_with_context("零工具失败任务", SessionContext())
 
         self.assertFalse(turn.result.ok)
-        self.assertEqual(0, turn.context.latest_completed_task_seq)
+        self.assertGreater(turn.context.latest_completed_task_seq, 0)
         terminal = turn.context.messages[-1]
         self.assertEqual("user", terminal.role)
         self.assertEqual("task_termination", terminal.kind)
@@ -197,7 +197,7 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         succeeded = agent.run_with_context("继续并正常结束", failed.context)
 
         self.assertFalse(failed.result.ok)
-        self.assertEqual(0, failed.context.latest_completed_task_seq)
+        self.assertGreater(failed.context.latest_completed_task_seq, 0)
         self.assertTrue(succeeded.result.ok, succeeded.result.summary)
         self.assertEqual(1, len(summarizer.calls))
         self.assertTrue(
@@ -481,6 +481,7 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         result = CodingAgent(
             provider,
             self.tools,
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             max_rounds=4,
             plan_enabled=False,
             tool_protocol="legacy_json",
@@ -571,12 +572,12 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         self.assertEqual(3, len(provider.histories))
         self.assertEqual("任务已取消", observer.errors[-1])
         self.assertNotIn(TERMINATION_FAILURE, observer.errors)
-        self.assertFalse(
+        self.assertTrue(
             any(message.kind == "task_termination" for message in turn.context.messages)
         )
 
-    def test_terminal_audit_failure_does_not_publish_termination_marker(self) -> None:
-        """专项停止审计失败时必须保留 fail-closed 路径，不提交终止标记。"""
+    def test_terminal_audit_failure_records_incomplete_after_fail_closed_stop(self) -> None:
+        """审计失败仍 fail-closed，并以宿主事实闭合失败历史。"""
 
         class FailingAudit:
             def prepare(self) -> None:
@@ -607,7 +608,7 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
 
         self.assertFalse(turn.result.ok)
         self.assertEqual("无法写入审计日志，运行已安全停止", turn.result.summary)
-        self.assertFalse(
+        self.assertTrue(
             any(message.kind == "task_termination" for message in turn.context.messages)
         )
 
@@ -748,6 +749,7 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         result = CodingAgent(
             provider,
             self.tools,
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             max_rounds=2,
             plan_enabled=False,
         ).run("按协议结束")

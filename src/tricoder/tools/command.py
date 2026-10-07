@@ -22,7 +22,7 @@ from tricoder.policy import (
 from tricoder.process.control import ProcessExecutionUncertain, run_bounded_process
 from tricoder.process.env import filtered_subprocess_env
 
-from tricoder.tools.handlers import ToolHandler
+from tricoder.tools.handlers import InvalidToolArgument, ToolHandler
 
 
 _filtered_env = filtered_subprocess_env
@@ -563,9 +563,23 @@ class FinishTool(ToolHandler):
     name = "finish"
     description = (
         "结束本轮任务并提交文字总结；完成、无法继续或需要用户补充信息时必须调用。"
-        "本工具只请求结束，成功状态仍由本地验证结果决定。"
+        "outcome=completed 表示模型声明请求已交付，outcome=incomplete 表示仍未完成；"
+        "省略 outcome 兼容为 completed。本工具只请求结束，本地验证、检查事实和最终安全状态仍由宿主决定。"
     )
-    parameters = ToolHandler._schema({"summary": {"type": "string"}}, ["summary"])
+    parameters = ToolHandler._schema(
+        {
+            "summary": {"type": "string"},
+            "outcome": {
+                "type": "string",
+                "enum": ["completed", "incomplete"],
+            },
+        },
+        ["summary"],
+    )
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
-        return ToolResult(True, self._required_str(arguments, "summary"))
+        summary = self._required_str(arguments, "summary")
+        outcome = arguments.get("outcome", "completed")
+        if outcome not in {"completed", "incomplete"}:
+            raise InvalidToolArgument("outcome 只能是 completed 或 incomplete")
+        return ToolResult(True, summary)

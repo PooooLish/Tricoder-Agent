@@ -37,6 +37,7 @@ class ToolBatchOutcome:
     result: ToolResult | None = None
     feedback: tuple[str, ...] = ()
     progress: ProgressDecision | None = None
+    finish_outcome: str | None = None
 
 
 @dataclass(slots=True)
@@ -63,6 +64,8 @@ class AgentRunState:
     evidence: Any = None
     failed_snapshot: Any = None
     verification_required: bool = False
+    verification_obligation: str = "none"
+    pending_verification_paths: tuple[str, ...] = ()
     unknown_effects: bool = False
     tool_calls: int = 0
     cleanup_failed: bool = False
@@ -133,9 +136,14 @@ class AgentRunState:
             modified_files=list(context.modified_files),
             modified_directories=list(context.modified_directories),
             verification=context.verification,
-            evidence=context.verification_evidence,
+            # evidence/required 属于单任务 capability，不能从上一任务恢复。
+            evidence=None,
+            # 失败快照是历史检查事实，不是通过 capability；可用于说明同一版本
+            # 仍失败，但不能单独建立本轮 required。
             failed_snapshot=context.verification_failure,
-            verification_required=context.verification_required,
+            verification_required=False,
+            verification_obligation=context.verification_obligation,
+            pending_verification_paths=context.pending_verification_paths,
             unknown_effects=context.unknown_effects,
         )
 
@@ -171,6 +179,8 @@ class AgentRunState:
             verification_evidence=self.evidence,
             verification_failure=self.failed_snapshot,
             verification_required=self.verification_required,
+            verification_obligation=self.verification_obligation,
+            pending_verification_paths=self.pending_verification_paths,
             conversation_memory=self.conversation_memory,
             review_memory_candidate=self.review_memory_candidate,
             next_message_seq=self.next_message_seq,

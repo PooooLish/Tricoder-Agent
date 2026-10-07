@@ -19,7 +19,7 @@ from tricoder.core.events import (
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
-from tricoder.models import ProviderResponse, SessionContext, ToolCall
+from tricoder.models import MemoryConfig, ProviderResponse, SessionContext, ToolCall
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ProviderError
 from tricoder.tools import ToolContext
@@ -51,6 +51,7 @@ class AgentRefactorContractTests(unittest.TestCase):
         turn = CodingAgent(
             provider,
             self.registry,
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             plan_enabled=False,
             max_rounds=1,
         ).run_with_context("contract", SessionContext(), event_sink=events.append)
@@ -83,7 +84,7 @@ class AgentRefactorContractTests(unittest.TestCase):
             [type(event) for event in events],
         )
 
-    def test_provider_failure_before_complete_round_rolls_back_task(self) -> None:
+    def test_provider_failure_before_complete_round_records_closed_failure(self) -> None:
         provider = StructuredScriptedProvider([ProviderError("synthetic")])
         original = SessionContext()
 
@@ -96,7 +97,11 @@ class AgentRefactorContractTests(unittest.TestCase):
 
         self.assertFalse(turn.result.ok)
         self.assertEqual("模型请求失败，运行已安全停止", turn.result.summary)
-        self.assertEqual(original, turn.context)
+        self.assertEqual(
+            ["task", "task_termination"],
+            [message.kind for message in turn.context.messages],
+        )
+        self.assertGreater(turn.context.latest_completed_task_seq, 0)
         self.assertEqual([], self.registry.call_ids)
 
     def test_batch_failure_executes_only_root_and_pairs_skipped_remainder(self) -> None:

@@ -34,18 +34,11 @@ def apply_tool_transition(state: SessionContext, effects: FileEffects,
         if effects.state is EffectState.CONFIRMED:
             failure = None
     elif effects.directory_paths:
-        # 目录变化会使旧的工作区通过证据失效，但不能把失败当作已修复；
-        # 一个从干净状态开始的纯目录任务不需要伪造测试证据。
-        had_verification_authority = (
-            evidence is not None
-            or failure is not None
-            or state.verification_required
-            or state.verification in {"通过", "passed", "失败", "failed", "待验证"}
-        )
+        # 目录也是宿主确认的工作区变化：撤销旧通过并建立本轮验证义务。
+        # 失败快照仍按后续完整快照规则处理，不能在这里臆测已修复。
         evidence = None
-        required = required or had_verification_authority
-    if candidate is not None:
         required = True
+    if candidate is not None:
         if failure is not None and proves_new_file_version(failure, candidate.before):
             failure = None
         if stable_snapshots(candidate.before, candidate.after) and not candidate.passed:

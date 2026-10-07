@@ -399,8 +399,8 @@ class DirectoryToolContractTests(unittest.TestCase):
             task_changes_match_baselines(before, with_external, change_set)
         )
 
-    def test_fake_provider_can_finish_a_pure_directory_task_without_test_evidence(self) -> None:
-        """空目录任务可正常完成，但不得伪造测试通过或普通文件修改。"""
+    def test_pure_directory_task_without_test_evidence_keeps_verification_obligation(self) -> None:
+        """空目录也是真实工作区变化；不得伪造测试通过或直接交付。"""
         journal = ChangeJournal()
         journal.begin_task((), "未运行")
         self.registry.context.change_journal = journal
@@ -431,10 +431,11 @@ class DirectoryToolContractTests(unittest.TestCase):
 
         turn = agent.run_with_context("创建空目录 game", SessionContext())
 
-        self.assertTrue(turn.result.ok, turn.result.summary)
+        self.assertFalse(turn.result.ok)
+        self.assertTrue(turn.result.current_verification_required)
         self.assertEqual((), turn.result.modified_files)
         self.assertEqual(("game",), turn.result.modified_directories)
-        self.assertEqual("未运行", turn.result.verification)
+        self.assertEqual("待验证", turn.result.verification)
         self.assertIsNone(turn.context.verification_evidence)
 
 
@@ -776,6 +777,15 @@ class DirectoryEndToEndTests(unittest.TestCase):
                         ProviderResponse(
                             tool_calls=(
                                 ToolCall(
+                                    "verify-dir",
+                                    "run_command",
+                                    {"command": "python -m compileall -q ."},
+                                ),
+                            )
+                        ),
+                        ProviderResponse(
+                            tool_calls=(
+                                ToolCall(
                                     "finish",
                                     "finish",
                                     {"summary": "目录创建完成"},
@@ -814,7 +824,7 @@ class DirectoryEndToEndTests(unittest.TestCase):
                     CodingAgent(
                         provider,
                         registry,
-                        max_rounds=2,
+                        max_rounds=3,
                         plan_enabled=False,
                     ),
                     registry,
@@ -889,6 +899,15 @@ class DirectoryEndToEndTests(unittest.TestCase):
                         ProviderResponse(
                             tool_calls=(
                                 ToolCall(
+                                    "verify-dir",
+                                    "run_command",
+                                    {"command": "python -m compileall -q ."},
+                                ),
+                            )
+                        ),
+                        ProviderResponse(
+                            tool_calls=(
+                                ToolCall(
                                     "finish",
                                     "finish",
                                     {"summary": "目录创建完成"},
@@ -918,7 +937,7 @@ class DirectoryEndToEndTests(unittest.TestCase):
                     CodingAgent(
                         provider,
                         registry,
-                        max_rounds=2,
+                        max_rounds=3,
                         plan_enabled=False,
                     ),
                     registry,
@@ -1048,7 +1067,7 @@ class DirectoryProtocolFlowTests(unittest.IsolatedAsyncioTestCase):
                 ToolContext(
                     WorkspacePolicy(workspace),
                     CommandPolicy(workspace),
-                    RecordingApprover(True),
+                    RecordingApprover(True, True),
                     change_journal=journal,
                 )
             )
@@ -1061,13 +1080,22 @@ class DirectoryProtocolFlowTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     ProviderResponse(
                         tool_calls=(
+                            ToolCall(
+                                "verify-dir",
+                                "run_command",
+                                {"command": "python -m compileall -q ."},
+                            ),
+                        )
+                    ),
+                    ProviderResponse(
+                        tool_calls=(
                             ToolCall("finish", "finish", {"summary": "done"}),
                         )
                     ),
                 ]
             )
             agent = CodingAgent(
-                provider, registry, max_rounds=2, plan_enabled=False
+                provider, registry, max_rounds=3, plan_enabled=False
             )
 
             turn = await agent.run_with_context_async(
@@ -1087,7 +1115,7 @@ class DirectoryProtocolFlowTests(unittest.IsolatedAsyncioTestCase):
                 ToolContext(
                     WorkspacePolicy(workspace),
                     CommandPolicy(workspace),
-                    RecordingApprover(True),
+                    RecordingApprover(True, True),
                     change_journal=journal,
                 )
             )
@@ -1095,6 +1123,8 @@ class DirectoryProtocolFlowTests(unittest.IsolatedAsyncioTestCase):
                 [
                     '{"tool":"create_directory","arguments":{"path":"game"},'
                     '"reason":"创建任务目录"}',
+                    '{"tool":"run_command","arguments":{"command":'
+                    '"python -m compileall -q ."},"reason":"验证工作区"}',
                     '{"tool":"finish","arguments":{"summary":"done"},'
                     '"reason":"提交结果"}',
                 ]
@@ -1102,7 +1132,7 @@ class DirectoryProtocolFlowTests(unittest.IsolatedAsyncioTestCase):
             agent = CodingAgent(
                 provider,
                 registry,
-                max_rounds=2,
+                max_rounds=3,
                 plan_enabled=False,
                 tool_protocol="legacy_json",
             )

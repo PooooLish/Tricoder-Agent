@@ -536,7 +536,9 @@ class AgentEvidenceTests(WorkspaceCase):
 
         passed, failed = asyncio.run(run_both())
         self.assertTrue(passed.result.ok)
-        self.assertFalse(failed.result.ok)
+        self.assertTrue(failed.result.ok)
+        self.assertEqual("failed", failed.result.task_validation.status)
+        self.assertFalse(failed.context.verification_required)
         self.assertEqual(2, len(channels))
         self.assertTrue(all(channel is not None for channel in channels))
         self.assertIsNot(channels[0], channels[1])
@@ -553,7 +555,7 @@ class AgentEvidenceTests(WorkspaceCase):
                 # 每个场景独立 registry，前一 UNKNOWN 不得改变下一场景的输入。
                 self.tools = ToolRegistry(ToolContext(self.policy, CommandPolicy(self.root), lambda *_: True))
                 first = self.agent([bad, FINISH]).run_with_context("已失败", SessionContext())
-                self.assertFalse(first.result.ok)
+                self.assertTrue(first.result.ok)
                 failed = first.context.verification_failure
                 before = self.tools.context.verification_scope.capture(self.policy)
                 real_capture, real_open = api.VerificationScope.capture, api._open_binary
@@ -575,11 +577,11 @@ class AgentEvidenceTests(WorkspaceCase):
                         patch.object(api, "_open_binary", side_effect=deny_once):
                     second = self.agent(actions).run_with_context("瞬时不可读", first.context)
                 after = self.tools.context.verification_scope.capture(self.policy)
-                self.assertTrue(injected)
+                self.assertEqual(phase != "finish", injected)
                 self.assertTrue(api.stable_snapshots(before, after), "文件版本没有变化")
                 self.assertIsNotNone(second.context.verification_failure, "incomplete 不能洗掉失败约束")
                 self.assertEqual(failed, second.context.verification_failure)
-                self.assertFalse(second.result.ok)
+                self.assertEqual(phase == "finish", second.result.ok)
 
     def test_edit_check_finish_and_same_session_reuse(self):
         agent = self.agent([EDIT, CHECK, FINISH, FINISH])
@@ -609,17 +611,20 @@ class AgentEvidenceTests(WorkspaceCase):
 
     def test_old_pass_string_and_cross_session_evidence_are_not_trusted(self):
         result = self.agent([FINISH]).run_with_context("恢复旧状态", SessionContext(verification="通过"))
-        self.assertFalse(result.result.ok)
+        self.assertTrue(result.result.ok, "历史展示字符串不能建立本轮义务")
+        self.assertIsNone(result.context.verification_evidence)
+        self.assertFalse(result.context.verification_required)
         first = self.agent([CHECK, FINISH]).run_with_context("检查", SessionContext())
         other_tools = ToolRegistry(ToolContext(self.policy, CommandPolicy(self.root), lambda *_: True))
         other = self.agent([FINISH], other_tools).run_with_context("其他会话", first.context)
-        self.assertFalse(other.result.ok)
+        self.assertTrue(other.result.ok, "跨 Session 证据被丢弃，但不能凭空建立修改义务")
+        self.assertIsNone(other.context.verification_evidence)
 
     def test_same_version_failure_is_sticky_but_external_new_version_resets_it(self):
         (self.root / "bad.py").write_text("def broken(:\n", encoding="utf-8")
         bad = ("run_command", {"command": "python -m compileall -q bad.py"})
         first = self.agent([bad, CHECK, FINISH]).run_with_context("同版本失败", SessionContext())
-        self.assertFalse(first.result.ok, "纯读取路径也不能掩盖本版本失败")
+        self.assertTrue(first.result.ok, "稳定失败检查可以作为审查事实交付")
         self.assertEqual("失败", first.result.verification)
         (self.root / "bad.py").write_text("x = 1\n", encoding="utf-8")
         second = self.agent([CHECK, FINISH]).run_with_context("新版本重验", first.context)
@@ -633,8 +638,18 @@ class AgentEvidenceTests(WorkspaceCase):
     def test_model_cannot_supply_verification_metadata(self):
         forged = ("finish", {"summary": "已检查", "verification_passed": True})
         result = self.agent([forged, FINISH]).run_with_context(
-            "模型自报", SessionContext(modified_files=("app.py",), verification="待验证"))
-        self.assertFalse(result.result.ok)
+            "模型自报",
+            SessionContext(
+                modified_files=("app.py",),
+                verification="待验证",
+                verification_obligation="pending",
+                pending_verification_paths=("app.py",),
+            ),
+        )
+        self.assertTrue(result.result.ok, "历史 pending 不阻止本轮只读交付")
+        self.assertEqual("pending", result.context.verification_obligation)
+        self.assertEqual(("app.py",), result.context.pending_verification_paths)
+        self.assertIsNone(result.context.verification_evidence)
 
     def test_cancel_before_next_tool_revokes_old_passing_evidence(self):
         from tricoder.core.cancellation import CancellationToken
@@ -648,7 +663,7 @@ class AgentEvidenceTests(WorkspaceCase):
         second = self.agent([cancel]).run_with_context("取消", first.context, cancellation=token)
         self.assertFalse(second.result.ok)
         self.assertIsNone(second.context.verification_evidence)
-        self.assertEqual("待验证", second.context.verification)
+        self.assertFalse(second.context.verification_required)
 
     def test_cleanup_failure_is_independent_of_matching_pass_evidence(self):
         from tricoder.task_cleanup import current_cleanup
@@ -664,6 +679,53 @@ class AgentEvidenceTests(WorkspaceCase):
 
 
 class RuntimeEvidenceTests(WorkspaceCase):
+    def _assert_observational_failure_order_is_deliverable(self, actions, expected_codes):
+        (self.root / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+        runtime = self.runtime(actions)
+
+        result = runtime.run_task("只审查并报告所有检查结果，不修改文件")
+
+        self.assertTrue(result.ok, result.summary)
+        self.assertFalse(runtime.current.context.verification_required)
+        self.assertIsNotNone(runtime.current.context.verification_failure)
+        self.assertEqual(
+            expected_codes,
+            [record.returncode for record in result.task_validation.records],
+        )
+        self.assertEqual("failed", result.task_validation.status)
+
+    def test_observational_failure_then_pass_is_deliverable(self):
+        """无修改审查先失败后通过时，失败事实不建立修改义务。"""
+
+        bad = ("run_command", {"command": "python -m compileall -q bad.py"})
+        self._assert_observational_failure_order_is_deliverable(
+            [bad, CHECK, FINISH],
+            [1, 0],
+        )
+
+    def test_observational_pass_then_failure_is_deliverable(self):
+        """无修改审查先通过后失败时，同样可交付且保留失败。"""
+
+        bad = ("run_command", {"command": "python -m compileall -q bad.py"})
+        self._assert_observational_failure_order_is_deliverable(
+            [CHECK, bad, FINISH],
+            [0, 1],
+        )
+
+    def test_real_modification_with_unresolved_failure_remains_blocked_after_pass(self):
+        """有效 pass 不得清除真实修改对应的未解决失败或验证义务。"""
+
+        (self.root / "bad.py").write_text("def broken(:\n", encoding="utf-8")
+        bad = ("run_command", {"command": "python -m compileall -q bad.py"})
+        runtime = self.runtime([EDIT, bad, CHECK, FINISH])
+
+        result = runtime.run_task("修改 app.py，并报告全部检查结果")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(runtime.current.context.verification_required)
+        self.assertIsNotNone(runtime.current.context.verification_failure)
+        self.assertIn(1, [record.returncode for record in result.task_validation.records])
+
     def test_fix6_capture_cancellation_survives_secondary_persist_system_exit(self):
         from tricoder.core.cancellation import CancellationError
         from tricoder.models import RunResult, SessionTurnResult
@@ -676,6 +738,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
         class Custom:
             def run_with_context(self, task, context):
+                runtime.current.tools.execute(*CHECK)
                 return SessionTurnResult(RunResult(True, "完成", 1), context)
 
         runtime.current = replace(runtime.current, agent=Custom())
@@ -890,6 +953,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
                 class Custom:
                     def run_with_context(self, task, context):
+                        runtime.current.tools.execute(*CHECK)
                         return SessionTurnResult(RunResult(True, "完成", 1), context)
 
                 def boundary(*args):
@@ -1000,7 +1064,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
                             if failed:
                                 result = runtime.current.tools.execute("run_command", {"command": "python -m compileall -q bad.py"})
                                 failures.append(result.verification_evidence.after)
-                                runtime.current.tools.execute(*CHECK)
+                            runtime.current.tools.execute(*CHECK)
                             final_capture = True
                             return SessionTurnResult(RunResult(True, "完成", 1), context)
 
@@ -1102,14 +1166,15 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
                 class Custom:
                     def run_with_context(self, task, context):
+                        runtime.current.tools.execute(*CHECK)
                         return SessionTurnResult(RunResult(True, "完成", 1), context)
 
                 runtime.current = replace(runtime.current, agent=Custom())
                 result = runtime.run_task("旧 context 不等于当前文件证据")
-                self.assertFalse(result.ok)
-                self.assertIsNone(runtime.current.context.verification_evidence)
-                self.assertTrue(runtime.current.context.verification_required)
-                self.assertEqual("待验证", result.verification)
+                self.assertTrue(result.ok, "本轮新检查可以验证当前版本")
+                self.assertIsNotNone(runtime.current.context.verification_evidence)
+                self.assertIsNot(old, runtime.current.context.verification_evidence)
+                self.assertFalse(runtime.current.context.verification_required)
 
     def test_i2_runtime_scan_incomplete_or_exception_fails_closed(self):
         from tricoder.models import RunResult, SessionTurnResult
@@ -1121,6 +1186,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
                 class Custom:
                     def run_with_context(self, task, context):
+                        runtime.current.tools.execute(*CHECK)
                         return SessionTurnResult(RunResult(True, "完成", 1), context)
 
                 runtime.current = replace(runtime.current, agent=Custom())
@@ -1134,6 +1200,8 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 self.assertIsNone(runtime.current.context.verification_evidence)
                 self.assertTrue(runtime.current.context.verification_required)
                 self.assertEqual("待验证", result.verification)
+                runtime.clear_current(confirmed=True)
+                runtime.close()
 
     def test_final_cancel_revokes_existing_pass_but_keeps_failure_and_reason(self):
         from tricoder.models import RunResult, SessionTurnResult
@@ -1159,7 +1227,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 self.assertFalse(result.ok)
                 self.assertIsNone(runtime.current.context.verification_evidence)
                 self.assertFalse(runtime.current.tools.context.verification_scope.owns(old))
-                self.assertTrue(runtime.current.context.verification_required)
+                self.assertFalse(runtime.current.context.verification_required)
                 if failed:
                     self.assertEqual(failures[0], runtime.current.context.verification_failure)
                     self.assertEqual("原取消原因", result.summary)
@@ -1183,6 +1251,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 class Custom:
                     def run_with_context(self, task, context):
                         tokens.append(runtime.current_task_cancellation())
+                        runtime.current.tools.execute(*CHECK)
                         return SessionTurnResult(RunResult(True, "完成", 1), context)
 
                 runtime.current = replace(runtime.current, agent=Custom())
@@ -1211,6 +1280,7 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
         class Custom:
             def run_with_context(self, task, context):
+                runtime.current.tools.execute(*CHECK)
                 return SessionTurnResult(RunResult(True, "完成", 1), context)
 
         def paused_capture(scope, policy):
@@ -1406,10 +1476,13 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertIsNotNone(failures[0])
         self.assertEqual(failures[0], runtime.current.context.verification_failure)
         self.assertIsNone(runtime.current.context.verification_evidence)
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
         runtime.current = replace(runtime.current, agent=normal_agent)
-        self.assertFalse(runtime.run_task("普通 Agent 不能直接 finish").ok)
-        self.assertFalse(runtime.run_task("普通 Agent 无关成功也不能覆盖").ok)
+        self.assertTrue(runtime.run_task("普通 Agent 可以报告既有失败").ok)
+        preserved = runtime.current.context.verification_failure
+        self.assertTrue(runtime.run_task("无修改审查可继续报告旧失败").ok)
+        self.assertEqual(preserved, runtime.current.context.verification_failure)
+        self.assertFalse(runtime.current.context.verification_required)
 
     def test_f2_output_cancellation_preserves_registry_failure_before_local_publish(self):
         from tricoder.core.cancellation import CancellationError
@@ -1435,8 +1508,13 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 self.assertIsNotNone(failures[0])
                 self.assertEqual(failures[0], runtime.current.context.verification_failure)
                 self.assertIsNone(runtime.current.context.verification_evidence)
-                self.assertFalse(runtime.run_task("无检查完成").ok)
-                self.assertFalse(runtime.run_task("同版本无关成功").ok)
+                first_followup = runtime.run_task("无修改义务的失败可被报告")
+                self.assertTrue(first_followup.ok)
+                preserved = runtime.current.context.verification_failure
+                followup = runtime.run_task("无修改审查可继续报告旧失败")
+                self.assertTrue(followup.ok)
+                self.assertEqual(preserved, runtime.current.context.verification_failure)
+                self.assertFalse(runtime.current.context.verification_required)
 
     def test_m1_unconsumed_net_zero_commit_invalidates_pass_without_undo_entry(self):
         back = ("edit_file", {"path": "app.py", "old_text": "x = 2", "new_text": "x = 1"})
@@ -1461,7 +1539,9 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertIsNone(runtime.current.context.verification_failure)
         self.assertEqual("待验证", runtime.current.context.verification)
         self.assertIsNone(runtime.current.journal.latest())
-        self.assertFalse(runtime.run_task("净零不等于没有发生新版本").ok)
+        self.assertTrue(runtime.run_task("只读回顾净零写入事实").ok)
+        self.assertEqual("pending", runtime.current.memory.verification_obligation)
+        self.assertEqual(("app.py",), runtime.current.memory.pending_verification_paths)
 
     def test_async_external_cancellation_keeps_unknown_without_a_result(self):
         from tricoder.core.cancellation import CancellationError
@@ -1592,7 +1672,8 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 self.assertIsNotNone(failures[0])
                 self.assertTrue(self.api().stable_snapshots(failures[0], runtime.current.tools.context.verification_scope.capture(self.policy)))
                 self.assertEqual(failures[0], runtime.current.context.verification_failure)
-                self.assertFalse(runtime.run_task("同版本无关成功不能覆盖失败").ok)
+                self.assertTrue(runtime.run_task("同版本无修改回顾可以报告失败").ok)
+                self.assertEqual("pending", runtime.current.memory.verification_obligation)
 
     def test_n2_builtin_failure_survives_output_processing_exception(self):
         (self.root / "bad.py").write_text("def broken(:\n", encoding="utf-8")
@@ -1613,8 +1694,11 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertEqual([(False, False, EffectState.NONE)], facts)
         self.assertIsNotNone(runtime.current.context.verification_failure)
         self.assertIsNone(runtime.current.context.verification_evidence)
-        self.assertFalse(runtime.run_task("没有重验").ok)
-        self.assertFalse(runtime.run_task("同版本无关成功").ok)
+        self.assertTrue(runtime.run_task("没有修改义务时可报告失败").ok)
+        preserved = runtime.current.context.verification_failure
+        self.assertTrue(runtime.run_task("无修改审查可继续报告旧失败").ok)
+        self.assertEqual(preserved, runtime.current.context.verification_failure)
+        self.assertFalse(runtime.current.context.verification_required)
 
     def test_n3_external_baseexception_after_dispatch_persists_unknown(self):
         for error_type in (KeyboardInterrupt, SystemExit):
@@ -1663,7 +1747,8 @@ class RuntimeEvidenceTests(WorkspaceCase):
                         runtime.run_task("检查通知时终止")
                 self.assertIs(marker, raised.exception)
                 self.assertIsNone(runtime.current.context.verification_evidence)
-                self.assertFalse(runtime.run_task("终止任务不能保留通过").ok)
+                self.assertTrue(runtime.run_task("终止后的只读回顾不复用旧通过").ok)
+                self.assertIsNone(runtime.current.context.verification_evidence)
 
     def test_later_unconsumed_write_still_invalidates_already_published_pass(self):
         runtime = self.runtime([CHECK, EDIT, FINISH])
@@ -1684,7 +1769,9 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertEqual(("app.py",), runtime.current.context.modified_files)
         self.assertIsNone(runtime.current.context.verification_evidence)
         self.assertEqual("待验证", runtime.current.context.verification)
-        self.assertFalse(runtime.run_task("修改后未经验证不能完成").ok)
+        self.assertTrue(runtime.run_task("只读回顾未经验证的修改").ok)
+        self.assertEqual("pending", runtime.current.memory.verification_obligation)
+        self.assertEqual(("app.py",), runtime.current.memory.pending_verification_paths)
 
     def test_failed_verification_survives_audit_exception_without_persisting_evidence(self):
         from tricoder.audit import AuditLogger
@@ -1710,7 +1797,9 @@ class RuntimeEvidenceTests(WorkspaceCase):
         failed = runtime.current.context.verification_failure
         self.assertIsNotNone(failed)
         self.assertIsNone(runtime.current.context.verification_evidence)
-        self.assertFalse(runtime.run_task("同版本无关成功").ok)
+        self.assertTrue(runtime.run_task("审计异常后的无修改审查可报告失败").ok)
+        self.assertEqual(failed, runtime.current.context.verification_failure)
+        self.assertFalse(runtime.current.context.verification_required)
         for secret in (failed.digest, failed.scope_id):
             self.assertNotIn(secret.encode(), runtime.store.database_path.read_bytes())
             self.assertNotIn(secret, repr(runtime.current.memory))
@@ -1787,8 +1876,11 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertIsNotNone(runtime.current.context.verification_failure)
         self.assertIsNone(runtime.current.context.verification_evidence, "不能恢复旧通过对象")
         self.assertEqual("失败", runtime.current.context.verification)
-        self.assertFalse(runtime.run_task("不重验直接完成").ok)
-        self.assertFalse(runtime.run_task("同版本无关成功").ok)
+        self.assertTrue(runtime.run_task("不重验也可交付失败报告").ok)
+        preserved = runtime.current.context.verification_failure
+        self.assertTrue(runtime.run_task("无修改审查可继续报告旧失败").ok)
+        self.assertEqual(preserved, runtime.current.context.verification_failure)
+        self.assertFalse(runtime.current.context.verification_required)
         self.assertEqual("失败", runtime.current.context.verification)
 
     def test_r3_registered_external_unknown_survives_notification_exception_and_restart(self):
@@ -1881,15 +1973,15 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertNotIn(evidence.after.digest.encode(), db)
         self.assertNotIn(evidence.after.scope_id.encode(), db)
 
-    def test_restart_downgrades_pass_display_and_cannot_reuse_evidence(self):
+    def test_restart_preserves_historical_pass_but_cannot_reuse_evidence(self):
         runtime = self.runtime([EDIT, CHECK, FINISH])
         self.assertTrue(runtime.run_task("检查").ok)
         runtime.close()
         restarted = self.runtime([FINISH])
-        self.assertEqual("待验证", restarted.current.memory.verification)
-        self.assertEqual("待验证", restarted.current.context.verification)
+        self.assertEqual("passed", restarted.current.memory.verification)
+        self.assertEqual("passed", restarted.current.context.verification)
         self.assertIsNone(restarted.current.context.verification_evidence)
-        self.assertFalse(restarted.run_task("重启完成").ok)
+        self.assertTrue(restarted.run_task("重启后只读回顾").ok)
 
     def test_switching_away_and_back_invalidates_cached_evidence(self):
         runtime = self.runtime([CHECK, FINISH, FINISH])
@@ -1898,9 +1990,9 @@ class RuntimeEvidenceTests(WorkspaceCase):
         runtime.create("second")
         runtime.switch(first_id, confirm=lambda _: True)
         self.assertIsNone(runtime.current.context.verification_evidence)
-        # 新装配的假 Provider 原本会重新 CHECK；本用例只测试旧通过不能替代检查。
+        # 新装配只保留历史展示，旧通过 capability 不会恢复或建立本轮义务。
         runtime.current = replace(runtime.current, agent=self.agent([FINISH], runtime.current.tools))
-        self.assertFalse(runtime.run_task("切回").ok)
+        self.assertTrue(runtime.run_task("切回后只读回顾").ok)
 
     def test_undo_new_version_cannot_restore_old_pass_or_evidence(self):
         runtime = self.runtime([CHECK, FINISH, EDIT, CHECK, FINISH, FINISH])
@@ -1911,7 +2003,8 @@ class RuntimeEvidenceTests(WorkspaceCase):
         self.assertEqual("x = 1\n", (self.root / "app.py").read_text(encoding="utf-8"))
         self.assertEqual("待验证", runtime.current.context.verification)
         self.assertIsNone(runtime.current.context.verification_evidence)
-        self.assertFalse(runtime.run_task("撤销后完成").ok)
+        self.assertTrue(runtime.run_task("撤销后只读回顾").ok)
+        self.assertEqual("pending", runtime.current.memory.verification_obligation)
 
 
 if __name__ == "__main__":

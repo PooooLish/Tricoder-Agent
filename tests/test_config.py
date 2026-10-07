@@ -18,6 +18,39 @@ from tricoder.models import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_memory_defaults_enable_structured_and_reviewed_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                provider="openai", workspace=Path(directory),
+                environ={"OPENAI_API_KEY": "test-key"},
+            )
+        self.assertEqual("structured", config.memory.compaction)
+        self.assertEqual("reviewed_summary", config.memory.persistence)
+
+        defaults = MemoryConfig()
+        self.assertEqual(("structured", "reviewed_summary"),
+                         (defaults.compaction, defaults.persistence))
+
+    def test_explicit_memory_off_and_environment_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".tricoder.toml").write_text(
+                '[memory]\ncompaction = "off"\npersistence = "off"\n',
+                encoding="utf-8",
+            )
+            config = load_config(provider="openai", workspace=workspace,
+                                 environ={"OPENAI_API_KEY": "test-key"})
+            self.assertEqual(("off", "off"),
+                             (config.memory.compaction, config.memory.persistence))
+            override = load_config(
+                provider="openai", workspace=workspace,
+                environ={"OPENAI_API_KEY": "test-key",
+                         "TRICODER_MEMORY_COMPACTION": "structured",
+                         "TRICODER_MEMORY_PERSISTENCE": "reviewed_summary"},
+            )
+            self.assertEqual(("structured", "reviewed_summary"),
+                             (override.memory.compaction, override.memory.persistence))
+
     def test_all_extension_families_are_disabled_by_default(self) -> None:
         """删除安全默认值会让仅升级 TriCoder 的用户意外启动项目扩展。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -55,7 +88,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(3.5, config.memory.summary_timeout_seconds)
 
         invalid_documents = (
-            '[memory]\npersistence = "reviewed_summary"\n',
+            '[memory]\ncompaction = "off"\npersistence = "reviewed_summary"\n',
             '[memory]\ncompaction = "structured"\ntarget_ratio = 0.9\ntrigger_ratio = 0.8\n',
             '[memory]\ncompaction = "structured"\nallow_unreviewed = true\n',
         )

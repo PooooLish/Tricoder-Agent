@@ -394,6 +394,7 @@ def _run_one_shot_entry(
             audit=audit,
             observer=ui,
             tool_protocol=config.tool_protocol,
+            memory_config=config.memory,
         )
         try:
             result = _run_once_with_config(

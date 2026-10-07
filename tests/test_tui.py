@@ -110,6 +110,29 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("需求覆盖未自动确认", rendered)
         self.assertIn("仅显示最近 32 条检查记录", rendered)
 
+    async def test_result_log_separates_current_gate_from_historical_obligation(self) -> None:
+        app = TricoderApp(lambda *_: None)
+        lines: list[str] = []
+
+        with mock.patch.object(
+            app,
+            "log_line_safe",
+            side_effect=lambda value: lines.append(str(value)),
+        ), mock.patch.object(app, "refresh_sidebar"):
+            app._log_result(
+                RunResult(
+                    True,
+                    "只读回顾已完成",
+                    1,
+                    current_verification_required=False,
+                    verification_obligation="legacy_unknown",
+                )
+            )
+
+        rendered = "\n".join(lines)
+        self.assertIn("本轮验证义务：本轮未产生修改验证义务", rendered)
+        self.assertIn("历史修改验证：来源待确认", rendered)
+
     async def test_undo_prepare_gate_runs_in_background_worker(self) -> None:
         """撤销扫描/工作区确认不能在 Textual UI 线程同步执行。"""
 

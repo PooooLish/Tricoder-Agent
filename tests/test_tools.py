@@ -655,7 +655,16 @@ class ToolTests(unittest.TestCase):
                 ["command"],
             ),
             "git_diff": ({}, []),
-            "finish": ({"summary": {"type": "string"}}, ["summary"]),
+            "finish": (
+                {
+                    "summary": {"type": "string"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["completed", "incomplete"],
+                    },
+                },
+                ["summary"],
+            ),
         }
 
         for definition in self.registry.definitions:

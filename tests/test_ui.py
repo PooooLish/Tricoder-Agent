@@ -64,6 +64,26 @@ class TerminalUITests(unittest.TestCase):
         self.assertGreaterEqual(text.count("文件状态检查"), 2)
         self.assertGreaterEqual(text.count("非业务验收"), 2)
 
+    def test_result_distinguishes_current_gate_from_historical_obligation(self) -> None:
+        ui, console = recording_ui()
+        result = RunResult(
+            True,
+            "只读回顾已完成",
+            1,
+            verification="failed",
+            current_verification_required=False,
+            verification_obligation="pending",
+            pending_verification_paths=("src/app.py",),
+        )
+
+        ui.show_run_result(result)
+
+        text = console.export_text()
+        self.assertIn("本轮验证义务", text)
+        self.assertIn("本轮未产生修改验证义务", text)
+        self.assertIn("历史修改验证", text)
+        self.assertIn("尚未确认（1 项）", text)
+
     def test_task_validation_is_separate_and_never_claims_requirement_coverage(self) -> None:
         ui, console = recording_ui()
         report = TaskValidationReport(

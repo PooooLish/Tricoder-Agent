@@ -910,8 +910,8 @@ class SyntheticCommandEndToEndTests(unittest.TestCase):
         )
         self.assertIn("Ran 1 test", request_text)
 
-    def test_real_failed_test_and_version_only_cannot_be_hidden_by_finish(self) -> None:
-        """真实失败与仅查询版本都不能被模型的完成文案提升为成功。"""
+    def test_explicit_incomplete_and_version_only_modification_stay_failed(self) -> None:
+        """模型显式未完成与修改后仅查版本都不能被完成文案提升。"""
 
         (self.workspace / "calculator.py").write_text(
             "def add(a: int, b: int) -> int:\n    return a + b + 1\n",
@@ -924,7 +924,11 @@ class SyntheticCommandEndToEndTests(unittest.TestCase):
                     "run_command",
                     {"command": "python3 -m unittest -v test_calculator"},
                 ),
-                ("finish", "finish", {"summary": "claim success"}),
+                (
+                    "finish",
+                    "finish",
+                    {"summary": "仍未修复", "outcome": "incomplete"},
+                ),
             )
         )
         failed = CodingAgent(

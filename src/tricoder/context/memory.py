@@ -53,6 +53,9 @@ REPAIR_OSCILLATION_NOTICE = (
     "本轮已停止：同一失败检查对应的代码状态出现 A→B→A→B→A 来回抵消；"
     "任务未完成，未自动撤销已提交修改。"
 )
+TASK_INCOMPLETE_NOTICE = (
+    "本轮已停止：宿主确认任务未成功结束；真实检查结果和已提交修改均已保留。"
+)
 
 _TASK_TERMINATION_FACTS = {
     TASK_TERMINATION_NOTICE: TASK_TERMINATION_MEMORY_TEXT,
@@ -65,6 +68,7 @@ _TASK_TERMINATION_FACTS = {
     REPEATED_FAILURE_NOTICE: "任务因相同状态下重复失败累计 3 次而停止，失败仍未解决。",
     REPEATED_OBSERVATION_NOTICE: "任务因工作区无变化时重复读取同一结果 4 次而停止，结果仍需确认。",
     REPAIR_OSCILLATION_NOTICE: "任务因失败检查期间代码状态来回抵消而停止，失败仍未解决。",
+    TASK_INCOMPLETE_NOTICE: "任务未成功结束，真实检查结果和已提交修改仍需后续处理。",
 }
 
 _ITEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

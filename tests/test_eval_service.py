@@ -22,6 +22,7 @@ from tricoder.core.events import (
 )
 from tricoder.models import (
     AppConfig,
+    MemoryConfig,
     ProviderConfig,
     ProviderResponse,
     RunResult,
@@ -286,7 +287,12 @@ class EvalServiceTests(unittest.TestCase):
         )
 
         run_dirs = list((self.root / "runtime" / "evals").iterdir())
-        self.assertEqual(0, exit_code)
+        payload = json.loads((run_dirs[0] / "result.json").read_text("utf-8"))
+        self.assertEqual(
+            0,
+            exit_code,
+            output.getvalue() + "\n" + json.dumps(payload, ensure_ascii=False),
+        )
         self.assertEqual(1, len(provider_configs))
         self.assertEqual("openai", provider_configs[0][0].name)
         self.assertEqual("eval-model", provider_configs[0][0].model)
@@ -295,7 +301,6 @@ class EvalServiceTests(unittest.TestCase):
             (run_dirs[0] / "workspaces" / "case-one").exists()
         )
         self.assertTrue((run_dirs[0] / "workspaces" / "case-two").is_dir())
-        payload = json.loads((run_dirs[0] / "result.json").read_text("utf-8"))
         self.assertEqual("passed", payload["cases"][0]["status"])
         self.assertEqual("case-two", payload["cases"][0]["case_id"])
         self.assertIn(str(run_dirs[0] / "report.md"), output.getvalue())
@@ -348,7 +353,7 @@ class EvalServiceTests(unittest.TestCase):
             # 摘要的原验证目标，预算需覆盖扩充后的固定前缀，而不是误测第三次压缩。
             # ask_user 的完整定义使固定工具前缀增加约 401 字符；按 0.80
             # trigger_ratio 保留原测试的有效余量，避免误测额外 compaction。
-            'max_rounds = 4\nmax_context_chars = 5700\n'
+            'max_rounds = 4\nmax_context_chars = 6500\n'
             'category = "memory"\nsplit = "dev"\nexecution_kind = "quality"\n'
             'scorers = ["hidden_verifier"]\nfaults = ["none"]\n'
             'dimensions = ["artifact_correct", "agent_completed"]\n\n'
@@ -624,6 +629,7 @@ class EvalServiceTests(unittest.TestCase):
             ),
             audit_dir=self.root / "audit",
             plan_enabled=False,
+            memory=MemoryConfig(compaction="off", persistence="off"),
         )
         builds = 0
 

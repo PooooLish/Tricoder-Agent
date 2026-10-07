@@ -526,8 +526,8 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
             self.assertTrue(all(resource.process.poll() is not None for resource in resources))
 
-    def test_i05_external_test_change_requires_new_version_evidence(self) -> None:
-        """本地检查通过后外改测试文件，旧证据必须拒绝，重验只签发新版本。"""
+    def test_i05_external_test_change_preserves_obligation_until_new_evidence(self) -> None:
+        """外改会撤销旧证据；只读回顾可交付，但历史义务须等待新证据。"""
         with tempfile.TemporaryDirectory() as raw, ExitStack() as resources:
             base = Path(raw).resolve()
             root = base / "workspace"
@@ -565,9 +565,11 @@ class ReliabilityIntegrationTests(unittest.TestCase):
 
             test_file.write_text("assert 1 + 1 == 2\n", encoding="utf-8")
             stale = runtime.run_task("文件已外改但仅请求完成")
-            self.assertFalse(stale.ok)
+            self.assertTrue(stale.ok)
             self.assertEqual("待验证", stale.verification)
             self.assertIsNone(runtime.current.context.verification_evidence)
+            self.assertEqual("pending", runtime.current.memory.verification_obligation)
+            self.assertIn("test_app.py", runtime.current.memory.pending_verification_paths)
             current_snapshot = registry.context.verification_scope.capture(
                 registry.context.workspace_policy
             )
@@ -580,6 +582,8 @@ class ReliabilityIntegrationTests(unittest.TestCase):
             self.assertTrue(registry.context.verification_scope.owns(new_evidence))
             self.assertNotEqual(old_evidence.after.digest, new_evidence.after.digest)
             self.assertEqual(old_evidence.after.scope_id, new_evidence.after.scope_id)
+            self.assertEqual("none", runtime.current.memory.verification_obligation)
+            self.assertEqual((), runtime.current.memory.pending_verification_paths)
             self.assertEqual(
                 ["check-v1", "finish-v1", "stale-finish", "check-v2", "finish-v2"],
                 registry.call_ids,
@@ -611,7 +615,8 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     evidence = runtime.current.context.verification_evidence
                     self.assertTrue(registry.context.verification_scope.owns(evidence))
                     self.assertTrue(runtime.run_task("同 Session 后续轮复核").ok)
-                    self.assertIs(evidence, runtime.current.context.verification_evidence)
+                    self.assertIsNone(runtime.current.context.verification_evidence)
+                    self.assertEqual("none", runtime.current.memory.verification_obligation)
 
                 elif scenario == "separate-session":
                     provider = StructuredScriptedProvider(
@@ -637,7 +642,8 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     runtime.switch(first_id, confirm=lambda _workspace: True)
                     self.assertIsNone(runtime.current.context.verification_evidence)
                     self.assertIsNot(first_evidence, runtime.current.context.verification_evidence)
-                    self.assertFalse(runtime.run_task("切回后不得复用旧能力").ok)
+                    self.assertTrue(runtime.run_task("切回后只读复核").ok)
+                    self.assertEqual("none", runtime.current.memory.verification_obligation)
 
                 elif scenario == "restart":
                     provider = StructuredScriptedProvider(
@@ -662,8 +668,9 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     )
                     resources.callback(restarted.close)
                     self.assertIsNone(restarted.current.context.verification_evidence)
-                    self.assertEqual("待验证", restarted.current.context.verification)
-                    self.assertFalse(restarted.run_task("重启后不得仅 finish").ok)
+                    self.assertEqual("passed", restarted.current.context.verification)
+                    self.assertTrue(restarted.run_task("重启后只读复核").ok)
+                    self.assertEqual("none", restarted.current.memory.verification_obligation)
                     self.assertIsNot(old, restarted.current.context.verification_evidence)
 
                 else:
@@ -690,7 +697,11 @@ class ReliabilityIntegrationTests(unittest.TestCase):
                     self.assertEqual("x = 1\n", (root / "app.py").read_text(encoding="utf-8"))
                     self.assertIsNone(runtime.current.context.verification_evidence)
                     self.assertEqual("待验证", runtime.current.context.verification)
-                    self.assertFalse(runtime.run_task("撤销后仅 finish").ok)
+                    self.assertEqual("pending", runtime.current.memory.verification_obligation)
+                    self.assertIn("app.py", runtime.current.memory.pending_verification_paths)
+                    self.assertTrue(runtime.run_task("撤销后只读复核").ok)
+                    self.assertEqual("pending", runtime.current.memory.verification_obligation)
+                    self.assertIn("app.py", runtime.current.memory.pending_verification_paths)
                     self.assertIsNot(old, runtime.current.context.verification_evidence)
 
     def test_i07_native_and_legacy_protocols_pair_or_reject_every_call(self) -> None:

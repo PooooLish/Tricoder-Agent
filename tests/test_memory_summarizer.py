@@ -60,7 +60,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
         provider = StreamProvider((ProviderCompleted("stop"),))
         summarizer = MemorySummarizer(
             provider,
-            MemoryConfig(compaction="structured"),
+            MemoryConfig(compaction="structured", persistence="off"),
         )
         small = source_messages()
         oversized = (
@@ -92,7 +92,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
                 ProviderCompleted("stop"),
             )
         )
-        summarizer = MemorySummarizer(provider, MemoryConfig(compaction="structured"))
+        summarizer = MemorySummarizer(provider, MemoryConfig(compaction="structured", persistence="off"))
 
         result = await summarizer.summarize(
             ConversationMemory(),
@@ -136,7 +136,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
         )
         summarizer = MemorySummarizer(
             provider,
-            MemoryConfig(compaction="structured"),
+            MemoryConfig(compaction="structured", persistence="off"),
         )
 
         result = await summarizer.summarize(
@@ -159,7 +159,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
 
         summarizer = MemorySummarizer(
             StreamProvider((TextDelta("private malformed output"), ProviderCompleted("stop"))),
-            MemoryConfig(compaction="structured"),
+            MemoryConfig(compaction="structured", persistence="off"),
         )
 
         with self.assertRaises(MemorySummaryError) as caught:
@@ -183,7 +183,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(events=events):
                 summarizer = MemorySummarizer(
                     StreamProvider(events),
-                    MemoryConfig(compaction="structured"),
+                    MemoryConfig(compaction="structured", persistence="off"),
                 )
                 with self.assertRaises(MemorySummaryError):
                     await summarizer.summarize(
@@ -209,7 +209,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
         token.cancel()
         cancelled = MemorySummarizer(
             StreamProvider((ProviderCompleted("stop"),)),
-            MemoryConfig(compaction="structured"),
+            MemoryConfig(compaction="structured", persistence="off"),
         )
         with self.assertRaises(CancellationError):
             await cancelled.summarize(ConversationMemory(), source_messages(), token)
@@ -217,7 +217,7 @@ class MemorySummarizerTests(unittest.IsolatedAsyncioTestCase):
         no_usage_candidate = ConversationMemory(covered_through=2)
         no_usage = MemorySummarizer(
             StreamProvider((TextDelta(memory_to_json(no_usage_candidate)), ProviderCompleted("stop"))),
-            MemoryConfig(compaction="structured"),
+            MemoryConfig(compaction="structured", persistence="off"),
         )
         result = await no_usage.summarize(
             ConversationMemory(), source_messages(), CancellationToken()
@@ -366,7 +366,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=budget,
-            memory_config=MemoryConfig(compaction="structured"),
+            memory_config=MemoryConfig(compaction="structured", persistence="off"),
             memory_summarizer=summarizer,
         )
 
@@ -389,7 +389,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=budget,
-            memory_config=MemoryConfig(compaction="structured"),
+            memory_config=MemoryConfig(compaction="structured", persistence="off"),
             memory_summarizer=summarizer,
         )
 
@@ -406,13 +406,15 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=max(1, int(budget * 0.75)),
-            memory_config=MemoryConfig(compaction="structured"),
+            memory_config=MemoryConfig(compaction="structured", persistence="off"),
             memory_summarizer=RecordingSummarizer(fail=True),
         )
         failed = hard_agent.run_with_context("继续", context)
         self.assertFalse(failed.result.ok)
         self.assertEqual(0, hard_provider.calls)
-        self.assertEqual(context.messages, failed.context.messages)
+        self.assertEqual(context.messages, failed.context.messages[:-2])
+        self.assertEqual("task", failed.context.messages[-2].kind)
+        self.assertEqual("task_termination", failed.context.messages[-1].kind)
 
     def test_business_failure_after_successful_compaction_does_not_restore_covered_history(self) -> None:
         context, budget = self._context_and_budget()
@@ -421,19 +423,20 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=budget,
-            memory_config=MemoryConfig(compaction="structured"),
+            memory_config=MemoryConfig(compaction="structured", persistence="off"),
             memory_summarizer=RecordingSummarizer(),
         ).run_with_context("继续", context)
 
         self.assertFalse(turn.result.ok)
         self.assertEqual(1, turn.context.conversation_memory.revision)
         self.assertFalse(any(message.message_seq == 1 for message in turn.context.messages))
-        self.assertFalse(
+        self.assertTrue(
             any(
                 message.kind == "task" and message.content == "用户任务：继续"
                 for message in turn.context.messages
             )
         )
+        self.assertEqual("task_termination", turn.context.messages[-1].kind)
 
     def test_off_mode_does_not_call_summarizer(self) -> None:
         context, budget = self._context_and_budget()
@@ -444,7 +447,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=budget,
-            memory_config=MemoryConfig(),
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             memory_summarizer=summarizer,
         ).run_with_context("继续", context)
 
@@ -452,7 +455,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
         self.assertEqual([], summarizer.calls)
         self.assertEqual(1, provider.calls)
 
-    def test_reviewed_mode_builds_independent_candidate_and_keeps_runtime_history(self) -> None:
+    def test_default_mode_builds_candidate_without_persisting_and_keeps_history(self) -> None:
         context, _budget = self._context_and_budget()
         summarizer = RecordingSummarizer()
         provider = FinishProvider()
@@ -461,10 +464,6 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=100_000,
-            memory_config=MemoryConfig(
-                compaction="structured",
-                persistence="reviewed_summary",
-            ),
             memory_summarizer=summarizer,
         ).run_with_context("继续", context)
 
@@ -572,7 +571,7 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
             FinishTools(),
             plan_enabled=False,
             max_context_chars=100_000,
-            memory_config=MemoryConfig(compaction="structured"),
+            memory_config=MemoryConfig(compaction="structured", persistence="off"),
             memory_summarizer=summarizer,
         ).run_with_context("新任务", context)
 

@@ -171,7 +171,7 @@ class EvalScenarioTests(unittest.TestCase):
             _RecordingFinishProvider(),
             _FinishTools(),
             plan_enabled=False,
-            memory_config=MemoryConfig(),
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             memory_summarizer=off_summarizer,
         )
         off = run_agent_turns(off_agent, ("先保持红色", "现在改为蓝色"))

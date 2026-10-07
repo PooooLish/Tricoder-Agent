@@ -17,6 +17,7 @@ from tricoder.agent import (
 )
 from tricoder.audit import AuditLogger
 from tricoder.models import (
+    MemoryConfig,
     Message,
     ProviderResponse,
     RunResult,
@@ -389,6 +390,7 @@ class NativeToolCallingTests(unittest.TestCase):
         agent = CodingAgent(
             provider,
             self.tools,
+            memory_config=MemoryConfig(compaction="off", persistence="off"),
             max_rounds=2,
             max_context_chars=2_000,
             plan_enabled=False,
@@ -723,7 +725,10 @@ class NativeToolCallingTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(1, len(failing.histories))
-        self.assertEqual((), failed.context.messages)
+        self.assertEqual(
+            ["task", "task_termination"],
+            [message.kind for message in failed.context.messages],
+        )
 
     def test_provider_error_private_text_stays_out_of_public_agent_outputs(
         self,
@@ -765,7 +770,7 @@ class NativeToolCallingTests(unittest.TestCase):
     def test_native_correction_audit_failure_does_not_commit_orphan_feedback(
         self,
     ) -> None:
-        """纠错审计失败必须回滚尚未形成完整工具回合的当前任务。"""
+        """纠错审计失败不保留孤立反馈，但以宿主终止事实闭合历史。"""
         cases = {
             "plain_text": ProviderResponse(content="普通文本"),
             "multiple_calls": ProviderResponse(
@@ -788,7 +793,12 @@ class NativeToolCallingTests(unittest.TestCase):
                 ).run_with_context("触发纠错审计失败", SessionContext())
 
                 self.assertFalse(failed.result.ok)
-                self.assertEqual((), failed.context.messages)
+                self.assertNotIn(
+                    "protocol_feedback",
+                    [message.kind for message in failed.context.messages],
+                )
+                self.assertEqual("task", failed.context.messages[0].kind)
+                self.assertEqual("task_termination", failed.context.messages[-1].kind)
 
     def test_unknown_tool_returns_complete_assistant_tool_pair(self) -> None:
         """未知名称也必须用相同调用 ID 返回工具错误，不能破坏消息协议。"""
@@ -1217,6 +1227,7 @@ class LegacyCodingAgent(CodingAgent):
     """让既有测试显式锁定旧版 JSON 协议。"""
 
     def __init__(self, provider: object, tools: ToolRegistry, **kwargs: object) -> None:
+        kwargs.setdefault("memory_config", MemoryConfig(compaction="off", persistence="off"))
         super().__init__(
             provider,  # type: ignore[arg-type]
             tools,
@@ -1252,7 +1263,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(
-            ["task", "generic", "tool_result"],
+            ["task", "generic", "tool_result", "task_termination"],
             [message.kind for message in failed.context.messages],
         )
         resumed_provider = ScriptedProvider([action("finish", {"summary": "继续完成"})])
@@ -1273,7 +1284,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(
-            ["task", "generic", "tool_result"],
+            ["task", "generic", "tool_result", "task_termination"],
             [message.kind for message in failed.context.messages],
         )
 
@@ -1331,7 +1342,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(failed.result.ok)
         self.assertEqual(2, len(provider.histories))
         self.assertEqual(
-            ["task", "generic", "tool_result"],
+            ["task", "generic", "tool_result", "task_termination"],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
@@ -1366,7 +1377,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(failed.result.ok)
         self.assertEqual(2, len(provider.histories))
         self.assertEqual(
-            ["task", "generic", "tool_result", "tool_result"],
+            ["task", "generic", "tool_result", "tool_result", "task_termination"],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
@@ -1478,7 +1489,14 @@ class AgentTests(unittest.TestCase):
             [message.kind for message in second_request[-3:]],
         )
         self.assertEqual(
-            ["task", "generic", "tool_result", "generic", "tool_result"],
+            [
+                "task",
+                "generic",
+                "tool_result",
+                "generic",
+                "tool_result",
+                "task_termination",
+            ],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
@@ -1630,12 +1648,19 @@ class AgentTests(unittest.TestCase):
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False)
 
         previous = agent.run_with_context(
-            "旧会话", SessionContext(modified_files=("sample.py",), verification="待验证")
+            "旧会话",
+            SessionContext(
+                modified_files=("sample.py",),
+                verification="待验证",
+                verification_obligation="pending",
+                pending_verification_paths=("sample.py",),
+            ),
         )
         independent = agent.run_with_context("独立任务", SessionContext())
         compatible = agent.run("分析项目")
 
-        self.assertFalse(previous.result.ok)
+        self.assertTrue(previous.result.ok)
+        self.assertEqual("pending", previous.context.verification_obligation)
         self.assertEqual((), independent.context.modified_files)
         self.assertEqual("未运行", independent.context.verification)
         self.assertTrue(independent.result.ok)

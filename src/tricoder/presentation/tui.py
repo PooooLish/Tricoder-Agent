@@ -562,6 +562,20 @@ class TricoderApp(App[None]):
         content.append("\n")
         content.append(_p(status.verification))
         content.append("\n\n")
+        content.append("历史修改验证", style="bold")
+        content.append("\n")
+        verification_obligation = getattr(status, "verification_obligation", "none")
+        pending_verification_paths = getattr(status, "pending_verification_paths", 0)
+        content.append(
+            _p(
+                f"尚未确认（{pending_verification_paths} 项）"
+                if verification_obligation == "pending"
+                else "来源待确认"
+                if verification_obligation == "legacy_unknown"
+                else "无"
+            )
+        )
+        content.append("\n\n")
         content.append("修改文件", style="bold")
         content.append("\n")
         content.append(_p(status.modified_files))
@@ -671,6 +685,26 @@ class TricoderApp(App[None]):
         lines = [
             status_text,
             Text.assemble(("", "dim"), _p(result.summary)),
+            Text(
+                "本轮验证义务："
+                + (
+                    "待验证（本轮修改）"
+                    if result.current_verification_required
+                    else "本轮未产生修改验证义务"
+                ),
+                style="dim",
+            ),
+            Text(
+                "历史修改验证："
+                + (
+                    f"尚未确认（{len(result.pending_verification_paths)} 项）"
+                    if result.verification_obligation == "pending"
+                    else "来源待确认"
+                    if result.verification_obligation == "legacy_unknown"
+                    else "无"
+                ),
+                style="dim",
+            ),
             Text(
                 f"任务验证 {_validation_status(result.task_validation.status)}"
                 " · 需求覆盖未自动确认",
@@ -1024,6 +1058,8 @@ class TricoderApp(App[None]):
         if self.runtime is None:
             return
         status = self.runtime.status()
+        verification_obligation = getattr(status, "verification_obligation", "none")
+        pending_verification_paths = getattr(status, "pending_verification_paths", 0)
         current = self.runtime.current
         if current is not None and current.memory.unknown_effects:
             self.log_line("文件影响未确认；请检查实际文件并通过 /clear 明确确认")
@@ -1062,6 +1098,19 @@ class TricoderApp(App[None]):
                 ("上次文件状态检查（非业务验收）", "cyan"),
                 " ",
                 _p(status.verification),
+            )
+        )
+        self.log_line(
+            Text.assemble(
+                ("历史修改验证", "cyan"),
+                " ",
+                _p(
+                    f"尚未确认（{pending_verification_paths} 项）"
+                    if verification_obligation == "pending"
+                    else "来源待确认"
+                    if verification_obligation == "legacy_unknown"
+                    else "无"
+                ),
             )
         )
         self.log_line(

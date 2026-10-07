@@ -140,6 +140,7 @@ class AgentRunner:
             observation=observation,
             tool_context=tool_context,
             tool_protocol=self.tool_protocol,
+            context_manager=self.context_manager,
             event_sink=event_sink,
         )
         finalizer.publish_state()
@@ -519,9 +520,11 @@ class AgentRunner:
                 )
             if outcome.stop is ToolBatchStop.FINISH:
                 assert outcome.result is not None
+                assert outcome.finish_outcome in {"completed", "incomplete"}
                 return await self._finish_success(
                     state,
                     outcome.result.output,
+                    outcome.finish_outcome,
                     round_number,
                     scope,
                     policy,
@@ -543,13 +546,10 @@ class AgentRunner:
         scope: object | None,
         policy: object | None,
     ) -> None:
-        state.verification_required = (
-            state.verification_required
-            or bool(state.modified_files)
-            or state.evidence is not None
-            or state.failed_snapshot is not None
-            or state.verification
-            in {"通过", "passed", "失败", "failed", "待验证"}
+        # required 只描述当前任务。累计修改、历史检查字符串及 Session pending
+        # 由宿主另行保存，不能在新任务开始时重新变成本轮门禁。
+        state.verification_required = bool(
+            state.verification_required or state.unknown_effects
         )
         if isinstance(scope, VerificationScope):
             scope.begin_task(state.current_task_id)
@@ -557,8 +557,16 @@ class AgentRunner:
                 scope.audit_files = (self.audit.path.absolute(),)
             if state.evidence is not None or state.failed_snapshot is not None:
                 current = await run_in_cleanup_thread(scope.capture, policy)
-                if not scope.owns(state.evidence) or not state.evidence.is_valid_for(current):
+                if not current.complete:
                     state.evidence = None
+                    state.verification_required = True
+                    state.verification = "待验证"
+                elif state.evidence is not None and (
+                    not scope.owns(state.evidence)
+                    or not state.evidence.is_valid_for(current)
+                ):
+                    state.evidence = None
+                    state.verification_required = True
                     state.verification = "待验证"
                 if state.failed_snapshot is not None:
                     if proves_new_file_version(state.failed_snapshot, current):
@@ -624,6 +632,7 @@ class AgentRunner:
         self,
         state: AgentRunState,
         summary: str,
+        finish_outcome: str,
         round_number: int,
         scope: object | None,
         policy: object | None,
@@ -655,9 +664,17 @@ class AgentRunner:
                     state.verification = (
                         "失败" if state.failed_snapshot is not None else "待验证"
                     )
+        validation_report = state.validation.report()
+        if validation_report.status == "stale":
+            state.evidence = None
+            state.verification_required = True
+            state.verification = "待验证"
         completed = (
+            finish_outcome == "completed"
+            and
             not cancellation.is_cancelled
             and not state.cleanup_failed
+            and validation_report.status != "stale"
             and (
                 not state.verification_required
                 or (valid and state.failed_snapshot is None)
@@ -669,25 +686,21 @@ class AgentRunner:
             )
         elif state.verification_required and state.verification == "失败":
             summary = f"{summary}；文件修改后的验证失败"
-        if completed:
-            completed_history = state.normalize_history()
-            completed_sequences = [
-                message.message_seq
-                for message in completed_history
-                if message.task_id == state.current_task_id
-                and message.message_seq is not None
-            ]
-            if not completed_sequences:
-                return finalizer.finish(
-                    self._result(
-                        state,
-                        False,
-                        "无法确定已完成任务的记忆覆盖边界",
-                        round_number,
-                    )
-                )
-            state.latest_completed_task_seq = max(completed_sequences)
-        if completed and self.memory_config.persistence == "reviewed_summary":
+        elif validation_report.status == "stale":
+            summary = f"{summary}；检查后工作区状态已变化，旧记录已过期"
+        elif validation_report.status == "failed":
+            summary = f"{summary}；检查发现失败，见检查记录"
+        provisional = self._result(state, completed, summary, round_number)
+        history_closed = finalizer.close_task(provisional)
+        if not history_closed:
+            completed = False
+            summary = f"{summary}；任务历史未完整闭合，未推进记忆覆盖位置"
+            # 最终失败状态只会补一条可信终止事实；真正未配对的工具调用
+            # 仍无法通过 ContextManager 的完整任务检查。
+            history_closed = finalizer.close_task(
+                self._result(state, False, summary, round_number)
+            )
+        if history_closed and self.memory_config.persistence == "reviewed_summary":
             request = self._memory_step_input(state, ())
             progress = MemoryStepProgress()
             try:

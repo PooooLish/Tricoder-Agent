@@ -345,7 +345,7 @@ class ContextManager:
         *,
         covered_through: int,
     ) -> SaveCandidatePlan:
-        """选择保存边界之后的全部已完成任务，不改变近期内存历史。"""
+        """选择保存边界之后的全部已结束任务，不改变近期内存历史。"""
 
         if type(covered_through) is not int or covered_through < 0:
             raise ValueError("covered_through 必须是非负整数")
@@ -354,7 +354,7 @@ class ContextManager:
             index for index, message in enumerate(copied) if message.kind == "task"
         ]
         if not task_indexes:
-            return SaveCandidatePlan((), covered_through, False, "没有已完成任务")
+            return SaveCandidatePlan((), covered_through, False, "没有已结束任务")
         if any(
             message.role != "system" and message.kind != "memory_edit"
             for message in copied[: task_indexes[0]]
@@ -393,12 +393,174 @@ class ContextManager:
             selected_sequences.extend(sequences)
 
         if not selected:
-            return SaveCandidatePlan((), covered_through, False, "没有新的已完成任务")
+            return SaveCandidatePlan((), covered_through, False, "没有新的已结束任务")
         return SaveCandidatePlan(
             tuple(selected),
             max(selected_sequences),
             True,
         )
+
+    def extend_save_candidate_with_termination(
+        self,
+        previous: ConversationMemory,
+        messages: Sequence[Message],
+        *,
+        target: int,
+        summary_max_chars: int = 6_000,
+    ) -> ConversationMemory | None:
+        """只用覆盖边界所属任务新增的可信终止尾部扩展保存候选。
+
+        该路径用于 Runtime 在 Agent 返回后作出的最终否决。它不调用摘要模型，
+        也不放宽普通任务边界：只修复旧候选已经完整覆盖的任务前缀，且同一
+        任务剩余部分全部是宿主可信终止事实。后续任务仍由严格保存计划处理。
+        """
+
+        if previous.covered_through >= target:
+            return None
+        copied = tuple(messages)
+        task_indexes = [
+            index for index, message in enumerate(copied) if message.kind == "task"
+        ]
+        if not task_indexes:
+            return None
+        containing: tuple[Message, ...] | None = None
+        for position, start in enumerate(task_indexes):
+            end = (
+                task_indexes[position + 1]
+                if position + 1 < len(task_indexes)
+                else len(copied)
+            )
+            checked = tuple(
+                message
+                for message in copied[start:end]
+                if message.role != "system" and message.kind != "memory_edit"
+            )
+            sequences = tuple(
+                message.message_seq
+                for message in checked
+                if message.message_seq is not None
+            )
+            if not sequences or any(type(sequence) is not int for sequence in sequences):
+                return None
+            if max(sequences) <= previous.covered_through:
+                if not self._is_closed_task_block(list(checked)):
+                    return None
+                continue
+            if min(sequences) <= previous.covered_through < max(sequences):
+                containing = checked
+            break
+        if containing is None:
+            return None
+        current_task_id = containing[0].task_id
+        prefix = tuple(
+            message
+            for message in containing
+            if message.message_seq is not None
+            and message.message_seq <= previous.covered_through
+        )
+        extension = tuple(
+            message
+            for message in containing
+            if message.message_seq is not None
+            and message.message_seq > previous.covered_through
+        )
+        boundary = max(
+            message.message_seq or 0
+            for message in containing
+        )
+        if (
+            current_task_id is None
+            or boundary > target
+            or previous.covered_through not in {
+                message.message_seq for message in containing
+            }
+            or not self._is_closed_task_block(list(prefix))
+            or not self._is_closed_task_block(list(containing))
+            or not extension
+            or any(not is_trusted_task_termination(message) for message in extension)
+            or any(message.task_id != current_task_id for message in extension)
+        ):
+            return None
+        candidate = ConversationMemory(
+            revision=previous.revision,
+            generation=previous.generation,
+            covered_through=boundary,
+        )
+        candidate = with_task_termination_facts(candidate, extension)
+        allowed_sources = {
+            source_id_for_sequence(message.message_seq)
+            for message in extension
+            if message.message_seq is not None
+        }
+        return merge_review_candidate(
+            previous,
+            candidate,
+            allowed_source_ids=allowed_sources,
+            max_chars=summary_max_chars,
+        )
+
+    def closed_task_boundary(
+        self,
+        messages: Sequence[Message],
+        *,
+        covered_through: int,
+        current_task_id: str,
+    ) -> int | None:
+        """返回连续闭合到当前任务的覆盖位置，任何历史缺口都拒绝推进。"""
+
+        if type(covered_through) is not int or covered_through < 0:
+            raise ValueError("covered_through 必须是非负整数")
+        copied = tuple(messages)
+        task_indexes = [
+            index for index, message in enumerate(copied) if message.kind == "task"
+        ]
+        if not task_indexes:
+            return None
+        if any(
+            message.role != "system" and message.kind != "memory_edit"
+            for message in copied[: task_indexes[0]]
+        ):
+            return None
+        boundary = covered_through
+        for position, start in enumerate(task_indexes):
+            end = (
+                task_indexes[position + 1]
+                if position + 1 < len(task_indexes)
+                else len(copied)
+            )
+            checked = [
+                message
+                for message in copied[start:end]
+                if message.role != "system" and message.kind != "memory_edit"
+            ]
+            if not self._is_closed_task_block(checked):
+                return None
+            sequences = [
+                message.message_seq
+                for message in checked
+                if message.message_seq is not None
+            ]
+            if not sequences or any(type(sequence) is not int for sequence in sequences):
+                return None
+            block_min = min(sequences)
+            block_max = max(sequences)
+            if block_max <= boundary:
+                continue
+            if block_min <= boundary:
+                # 正常 finish 已闭合后，摘要取消/审计失败会在同一当前任务
+                # 追加可信终止事实。只允许这个当前且最后的任务延长边界；
+                # 旧任务内部的覆盖缺口仍严格拒绝。
+                if (
+                    checked[0].task_id != current_task_id
+                    or position != len(task_indexes) - 1
+                    or boundary not in sequences
+                ):
+                    return None
+            boundary = block_max
+        last_task = copied[task_indexes[-1]]
+        if last_task.task_id != current_task_id:
+            return None
+        return boundary
 
     def merge_save_candidate(
         self,

@@ -103,6 +103,29 @@ def _require_text(row: sqlite3.Row, column: str) -> str:
     return value
 
 
+def _validate_obligation_paths(value: object) -> tuple[str, ...]:
+    """只接受唯一、规范的工作区相对 POSIX 路径。"""
+
+    if not isinstance(value, list):
+        raise SessionError("会话验证义务路径必须是列表")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item or "\\" in item:
+            raise SessionError("会话验证义务路径损坏")
+        parts = item.split("/")
+        if (
+            item.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+            or ":" in parts[0]
+            or item in seen
+        ):
+            raise SessionError("会话验证义务路径必须是唯一的工作区相对路径")
+        seen.add(item)
+        normalized.append(item)
+    return tuple(normalized)
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -171,13 +194,16 @@ class SessionStore:
                         verification TEXT NOT NULL DEFAULT '未运行',
                         permission TEXT NOT NULL DEFAULT 'strict',
                         unknown_effects INTEGER NOT NULL DEFAULT 0,
+                        verification_obligation TEXT NOT NULL DEFAULT 'none',
+                        pending_verification_paths_json TEXT NOT NULL DEFAULT '[]',
                         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                     )
                     """
                 )
                 self._ensure_unknown_effects_column(connection)
                 self._ensure_permission_column(connection)
-        except (OSError, sqlite3.Error) as error:
+                self._ensure_verification_obligation_columns(connection)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
             raise SessionError("会话数据库初始化失败") from error
 
     @staticmethod
@@ -199,6 +225,71 @@ class SessionStore:
             connection.execute(
                 "ALTER TABLE session_memory "
                 "ADD COLUMN permission TEXT NOT NULL DEFAULT 'strict'"
+            )
+
+    @staticmethod
+    def _ensure_verification_obligation_columns(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """追加宿主义务列，并只在首次补列时保守迁移旧记录。"""
+
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(session_memory)")
+        }
+        obligation_added = "verification_obligation" not in columns
+        paths_added = "pending_verification_paths_json" not in columns
+        if obligation_added:
+            connection.execute(
+                "ALTER TABLE session_memory ADD COLUMN verification_obligation "
+                "TEXT NOT NULL DEFAULT 'legacy_unknown'"
+            )
+        if paths_added:
+            connection.execute(
+                "ALTER TABLE session_memory ADD COLUMN pending_verification_paths_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if not obligation_added and not paths_added:
+            return
+        rows = connection.execute(
+            """
+            SELECT session_id, modified_files_json, verification, unknown_effects,
+                   verification_obligation, pending_verification_paths_json
+            FROM session_memory
+            """
+        ).fetchall()
+        for row in rows:
+            files = json.loads(row[1])
+            if not isinstance(files, list) or not all(
+                isinstance(item, str) for item in files
+            ):
+                raise ValueError("旧会话修改路径损坏")
+            obligation = row[4]
+            pending_paths = json.loads(row[5])
+            if obligation_added:
+                normalized = str(row[2]).strip().lower()
+                unknown = row[3]
+                if files:
+                    obligation = "pending"
+                    pending_paths = files
+                elif normalized in {"未运行", "not-run", "not run"} and unknown == 0:
+                    obligation = "none"
+                    pending_paths = []
+                else:
+                    obligation = "legacy_unknown"
+                    pending_paths = []
+            elif paths_added and obligation == "pending":
+                pending_paths = files
+            connection.execute(
+                """
+                UPDATE session_memory
+                SET verification_obligation = ?, pending_verification_paths_json = ?
+                WHERE session_id = ?
+                """,
+                (
+                    obligation,
+                    json.dumps(pending_paths, ensure_ascii=False),
+                    row[0],
+                ),
             )
 
     def create(self, name: str, workspace: Path, provider: str, model: str) -> SessionRecord:
@@ -269,7 +360,15 @@ class SessionStore:
                         record.updated_at,
                     ),
                 )
-                connection.execute("INSERT INTO session_memory (session_id) VALUES (?)", (record.id,))
+                connection.execute(
+                    """
+                    INSERT INTO session_memory (
+                        session_id, verification_obligation,
+                        pending_verification_paths_json
+                    ) VALUES (?, 'none', '[]')
+                    """,
+                    (record.id,),
+                )
         except sqlite3.Error as error:
             raise SessionError("会话创建失败") from error
         return SessionRecord(
@@ -356,7 +455,8 @@ class SessionStore:
         row = self._fetchone(
             """
             SELECT summary, requirements_summary, last_task_summary,
-                   modified_files_json, verification, permission, unknown_effects
+                   modified_files_json, verification, permission, unknown_effects,
+                   verification_obligation, pending_verification_paths_json
             FROM session_memory WHERE session_id = ?
             """,
             (session_id,),
@@ -372,6 +472,18 @@ class SessionStore:
         unknown = row["unknown_effects"]
         if type(unknown) is not int or unknown not in (0, 1):
             raise SessionError("会话未确认状态损坏")
+        obligation = row["verification_obligation"]
+        if obligation not in {"none", "pending", "legacy_unknown"}:
+            raise SessionError("会话验证义务状态损坏")
+        try:
+            pending_paths = json.loads(
+                _require_text(row, "pending_verification_paths_json")
+            )
+        except (TypeError, ValueError) as error:
+            raise SessionError("会话验证义务路径损坏") from error
+        pending_paths = _validate_obligation_paths(pending_paths)
+        if (obligation == "pending") != bool(pending_paths):
+            raise SessionError("会话验证义务与路径不一致")
         return SessionMemory(
             summary=_require_text(row, "summary"),
             requirements_summary=_require_text(row, "requirements_summary"),
@@ -380,6 +492,8 @@ class SessionStore:
             verification=_require_text(row, "verification"),
             permission_level=_require_text(row, "permission"),
             unknown_effects=bool(unknown),
+            verification_obligation=obligation,
+            pending_verification_paths=pending_paths,
         )
 
     def save_memory(self, session_id: str, memory: SessionMemory) -> None:
@@ -388,7 +502,17 @@ class SessionStore:
             raise SessionError("修改文件列表必须只包含文本路径")
         if type(memory.unknown_effects) not in (bool, int) or memory.unknown_effects not in (0, 1):
             raise SessionError("会话未确认状态必须为 0 或 1")
+        if memory.verification_obligation not in {
+            "none", "pending", "legacy_unknown"
+        }:
+            raise SessionError("会话验证义务状态无效")
+        pending_paths = _validate_obligation_paths(
+            list(memory.pending_verification_paths)
+        )
+        if (memory.verification_obligation == "pending") != bool(pending_paths):
+            raise SessionError("会话验证义务与路径不一致")
         files_json = json.dumps(list(memory.modified_files), ensure_ascii=False)
+        pending_paths_json = json.dumps(list(pending_paths), ensure_ascii=False)
         updated_at = self._clock()
         try:
             with self._transaction() as connection:
@@ -396,7 +520,8 @@ class SessionStore:
                     """
                     UPDATE session_memory
                     SET summary = ?, requirements_summary = ?, last_task_summary = ?,
-                        modified_files_json = ?, verification = ?, permission = ?, unknown_effects = ?
+                        modified_files_json = ?, verification = ?, permission = ?, unknown_effects = ?,
+                        verification_obligation = ?, pending_verification_paths_json = ?
                     WHERE session_id = ?
                     """,
                     (
@@ -407,6 +532,8 @@ class SessionStore:
                         memory.verification,
                         memory.permission_level,
                         int(memory.unknown_effects),
+                        memory.verification_obligation,
+                        pending_paths_json,
                         session_id,
                     ),
                 )
