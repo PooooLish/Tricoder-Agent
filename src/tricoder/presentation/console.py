@@ -15,6 +15,12 @@ from rich.table import Table
 from rich.text import Text
 
 from tricoder.presentation.commands import list_commands
+from tricoder.presentation.clarification_wait import read_console_clarification
+from tricoder.core.cancellation import CancellationToken
+from tricoder.core.clarification import (
+    ClarificationRequest,
+    ClarificationResult,
+)
 from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import AppConfig, RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 from tricoder.workspace.gate import WorkspaceGatePreview
@@ -71,6 +77,40 @@ def _format_token_usage(usage: TokenUsage) -> str:
     )
 
 
+def _validation_status(status: str) -> str:
+    return {
+        "unverified": "未运行检查",
+        "observed": "已记录检查事实",
+        "failed": "存在未解决失败",
+        "stale": "检查后代码已变化",
+    }.get(status, status)
+
+
+def _validation_records(result: RunResult) -> str:
+    """以有界文本展示宿主记录，不把它包装成业务验收结论。"""
+
+    lines: list[str] = []
+    for record in result.task_validation.records:
+        exit_code = "未知" if record.returncode is None else str(record.returncode)
+        targets = "、".join(record.targets) if record.targets else "未识别"
+        output = record.output_summary.replace("\r", "").strip()
+        if len(output) > 300:
+            output = output[:300] + "…"
+        if record.output_truncated:
+            output = f"{output}\n[输出已截断]".strip()
+        if record.spill_reference:
+            output = (
+                f"{output}\n完整输出引用：{record.spill_reference}"
+            ).strip()
+        lines.append(
+            f"[{record.kind}] {' '.join(record.argv)} · cwd={record.cwd} · "
+            f"exit={exit_code} · 目标={targets}"
+        )
+        if output:
+            lines.append(f"输出摘要：{output}")
+    return "\n".join(lines) if lines else "无"
+
+
 def _safe_base_url(value: str) -> str:
     """仅保留诊断所需的协议、主机、端口和路径。"""
 
@@ -95,9 +135,13 @@ class TerminalUI:
         *,
         console: Console,
         input_fn: Callable[[str], str] = input,
+        clarification_reader: Callable[
+            [ClarificationRequest, CancellationToken, float], ClarificationResult
+        ] | None = None,
     ) -> None:
         self.console = console
         self.input_fn = input_fn
+        self._clarification_reader = clarification_reader
         self._status: Status | None = None
         self._stream_active = False
 
@@ -387,6 +431,14 @@ class TerminalUI:
         table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
+        table.add_row("任务验证", _validation_status(result.task_validation.status))
+        table.add_row("检查记录", Text(_validation_records(result)))
+        table.add_row("需求覆盖", "未自动确认")
+        if len(result.task_validation.limitations) > 1:
+            table.add_row(
+                "验证限制",
+                Text("；".join(result.task_validation.limitations[1:])),
+            )
         if result.usage is not None:
             table.add_row("累计用量", Text(_format_token_usage(result.usage)))
         color = "green" if result.ok else "red"
@@ -413,6 +465,14 @@ class TerminalUI:
         table.add_row("新增目录", str(len(result.modified_directories)))
         table.add_row("文件状态检查", Text(result.verification))
         table.add_row("检查边界", "受覆盖文件，非业务验收")
+        table.add_row("任务验证", _validation_status(result.task_validation.status))
+        table.add_row("检查记录", Text(_validation_records(result)))
+        table.add_row("需求覆盖", "未自动确认")
+        if len(result.task_validation.limitations) > 1:
+            table.add_row(
+                "验证限制",
+                Text("；".join(result.task_validation.limitations[1:])),
+            )
         table.add_row("模型轮数", str(result.rounds))
         if result.usage is not None:
             table.add_row("累计用量", Text(_format_token_usage(result.usage)))
@@ -454,6 +514,41 @@ class TerminalUI:
         if not allowed:
             self.console.print("[yellow]已拒绝该操作。[/yellow]")
         return allowed
+
+    def ask_user(
+        self,
+        request: ClarificationRequest,
+        cancellation: CancellationToken,
+        timeout: float,
+    ) -> ClarificationResult:
+        """显示需求问题并走独立文本通道；回答绝不复用审批布尔值。"""
+
+        self._stop_status()
+        lines = [request.question]
+        if request.options:
+            lines.extend(
+                f"{index}. {option}"
+                for index, option in enumerate(request.options, start=1)
+            )
+        lines.append("可输入选项内容，也可直接输入自由文本。")
+        lines.append("等待期间当前任务仍持有 Session 与工作区锁。")
+        self.console.print(
+            Panel(
+                Text("\n".join(lines)),
+                title="[bold cyan]需要用户补充信息[/bold cyan]",
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
+        if self._clarification_reader is not None:
+            try:
+                return self._clarification_reader(request, cancellation, timeout)
+            except Exception:
+                return ClarificationResult.unavailable("host_failed")
+        # 自定义 input_fn 没有可取消读取契约，不能用后台 input 线程伪造超时。
+        if self.input_fn is not input:
+            return ClarificationResult.unavailable("noninteractive")
+        return read_console_clarification(cancellation, timeout)
 
     def on_round_start(self, round_number: int, max_rounds: int) -> None:
         self._stop_status()

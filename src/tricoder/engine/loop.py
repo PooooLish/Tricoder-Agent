@@ -16,10 +16,20 @@ from tricoder.context.coordinator import (
 )
 from tricoder.context.manager import ContextManager
 from tricoder.context.memory import (
+    CLARIFICATION_CANCELLED_NOTICE,
+    CLARIFICATION_LIMIT_NOTICE,
+    CLARIFICATION_SCAN_FAILED_NOTICE,
+    CLARIFICATION_TIMEOUT_NOTICE,
+    CLARIFICATION_UNAVAILABLE_NOTICE,
+    CLARIFICATION_WORKSPACE_CHANGED_NOTICE,
     ConversationMemory,
+    REPAIR_OSCILLATION_NOTICE,
+    REPEATED_FAILURE_NOTICE,
+    REPEATED_OBSERVATION_NOTICE,
     TASK_TERMINATION_KIND,
     TASK_TERMINATION_NOTICE,
 )
+from tricoder.core.clarification import ClarificationStatus
 from tricoder.context.summarizer import MemorySummaryError
 from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.core.events import (
@@ -29,6 +39,7 @@ from tricoder.core.events import (
     RuntimeFailed,
 )
 from tricoder.engine.finalization import TaskFinalizer
+from tricoder.engine.progress import ProgressReason
 from tricoder.engine.provider_request import PlanningPhase, ProviderResponseCollector
 from tricoder.engine.state import AgentRunState, ToolBatchStop
 from tricoder.engine.telemetry import (
@@ -432,6 +443,10 @@ class AgentRunner:
             outcome = await batch.execute(resolved, round_number)
             if outcome.stop is ToolBatchStop.AUDIT_FAILED:
                 return finalizer.finish(self._audit_failure(state, round_number))
+            for feedback in outcome.feedback:
+                state.messages.append(
+                    self._feedback_message(feedback, "protocol_feedback")
+                )
             if outcome.stop is ToolBatchStop.UNKNOWN_EFFECTS:
                 return finalizer.finish(
                     self._result(
@@ -442,8 +457,55 @@ class AgentRunner:
                     )
                 )
             if outcome.stop is ToolBatchStop.CANCELLED:
+                if outcome.result is not None and outcome.result.clarification is not None:
+                    state.messages.append(
+                        self._feedback_message(
+                            CLARIFICATION_CANCELLED_NOTICE,
+                            TASK_TERMINATION_KIND,
+                        )
+                    )
                 return finalizer.finish(
                     self._result(state, False, "任务已取消", round_number)
+                )
+            if outcome.stop is ToolBatchStop.CLARIFIED:
+                # 回答已经作为真实工具结果进入历史；下一轮必须重新请求模型。
+                continue
+            if outcome.stop is ToolBatchStop.NEEDS_INPUT:
+                assert outcome.result is not None
+                state.messages.append(
+                    self._feedback_message(
+                        self._clarification_termination_notice(outcome.result),
+                        TASK_TERMINATION_KIND,
+                    )
+                )
+                return finalizer.finish(
+                    self._result(
+                        state,
+                        False,
+                        outcome.result.output,
+                        round_number,
+                    )
+                )
+            if outcome.stop is ToolBatchStop.PROGRESS_STOP:
+                if cancellation.is_cancelled:
+                    return finalizer.finish(
+                        self._result(state, False, "任务已取消", round_number)
+                    )
+                if outcome.progress is None or outcome.progress.reason is None:
+                    return finalizer.finish(
+                        self._result(
+                            state,
+                            False,
+                            "进展守卫状态无效，任务已安全停止",
+                            round_number,
+                        )
+                    )
+                notice, summary = self._progress_termination(outcome.progress.reason)
+                state.messages.append(
+                    self._feedback_message(notice, TASK_TERMINATION_KIND)
+                )
+                return finalizer.finish(
+                    self._result(state, False, summary, round_number)
                 )
             if outcome.stop is ToolBatchStop.FATAL:
                 assert outcome.result is not None
@@ -490,7 +552,7 @@ class AgentRunner:
             in {"通过", "passed", "失败", "failed", "待验证"}
         )
         if isinstance(scope, VerificationScope):
-            scope.begin_task()
+            scope.begin_task(state.current_task_id)
             if isinstance(self.audit, AuditLogger):
                 scope.audit_files = (self.audit.path.absolute(),)
             if state.evidence is not None or state.failed_snapshot is not None:
@@ -570,19 +632,29 @@ class AgentRunner:
         finalizer: TaskFinalizer,
     ) -> SessionTurnResult:
         valid = False
-        if state.verification_required and isinstance(scope, VerificationScope):
+        needs_final_snapshot = (
+            state.verification_required or state.validation.has_workspace_checks
+        )
+        if needs_final_snapshot and isinstance(scope, VerificationScope):
             current = await run_in_cleanup_thread(scope.capture, policy)
-            valid = scope.owns(state.evidence) and state.evidence.is_valid_for(current)
-            if state.failed_snapshot is not None and proves_new_file_version(
-                state.failed_snapshot,
-                current,
-            ):
-                state.failed_snapshot = None
-            if not valid:
-                state.evidence = None
-                state.verification = (
-                    "失败" if state.failed_snapshot is not None else "待验证"
+            state.validation.reconcile_snapshot(
+                current.digest if current.complete else None
+            )
+            if state.verification_required:
+                valid = (
+                    scope.owns(state.evidence)
+                    and state.evidence.is_valid_for(current)
                 )
+                if state.failed_snapshot is not None and proves_new_file_version(
+                    state.failed_snapshot,
+                    current,
+                ):
+                    state.failed_snapshot = None
+                if not valid:
+                    state.evidence = None
+                    state.verification = (
+                        "失败" if state.failed_snapshot is not None else "待验证"
+                    )
         completed = (
             not cancellation.is_cancelled
             and not state.cleanup_failed
@@ -703,6 +775,40 @@ class AgentRunner:
         from tricoder.models import Message
 
         return Message("user", content, kind=kind)
+
+    @staticmethod
+    def _clarification_termination_notice(result: ToolResult) -> str:
+        clarification = result.clarification
+        if clarification is None:
+            return CLARIFICATION_UNAVAILABLE_NOTICE
+        if clarification.status is ClarificationStatus.TIMED_OUT:
+            return CLARIFICATION_TIMEOUT_NOTICE
+        if clarification.reason == "question_limit":
+            return CLARIFICATION_LIMIT_NOTICE
+        if clarification.reason == "workspace_changed":
+            return CLARIFICATION_WORKSPACE_CHANGED_NOTICE
+        if clarification.reason == "workspace_scan_failed":
+            return CLARIFICATION_SCAN_FAILED_NOTICE
+        return CLARIFICATION_UNAVAILABLE_NOTICE
+
+    @staticmethod
+    def _progress_termination(reason: ProgressReason) -> tuple[str, str]:
+        if reason is ProgressReason.REPEATED_FAILURE:
+            return (
+                REPEATED_FAILURE_NOTICE,
+                "相同工作区状态下的重复失败已累计 3 次，任务已停止；"
+                "失败证据和已提交修改均已保留",
+            )
+        if reason is ProgressReason.REPEATED_OBSERVATION:
+            return (
+                REPEATED_OBSERVATION_NOTICE,
+                "工作区无变化时同一读取已累计 4 次，任务因重复读取而停止",
+            )
+        return (
+            REPAIR_OSCILLATION_NOTICE,
+            "同一失败检查期间代码状态来回抵消，任务已停止；"
+            "未自动撤销已提交修改",
+        )
 
     @staticmethod
     def _result(

@@ -10,6 +10,7 @@ from types import MethodType
 
 from tricoder.changes import FileChange, FileIdentity, FileSnapshot, TaskChangeSet
 from tricoder.audit import AuditLogger
+from tricoder.core.validation import CommandCheckRecord, TaskValidationReport
 from tricoder.models import (
     AppConfig,
     Message,
@@ -139,6 +140,48 @@ class WorkspaceConsistencyTests(unittest.TestCase):
             runtime.run_task("next")
         self.assertEqual(("external.py",), previews[-1].changed_paths)
         self.assertEqual(2, len(agent.calls))
+
+    def test_unattributed_end_change_marks_command_checks_stale(self) -> None:
+        """Agent 返回后的外部写入不能留下 observed 的旧快照记录。"""
+
+        runtime = self.runtime(_InspectingAgent())
+        runtime.run_task("baseline")
+        report = TaskValidationReport(
+            records=(
+                CommandCheckRecord(
+                    task_id="task",
+                    check_id="check",
+                    argv=("python", "-m", "unittest", "test_code.py"),
+                    cwd=".",
+                    kind="tests",
+                    returncode=0,
+                    output_summary="OK",
+                    execution_complete=True,
+                    workspace_stable=True,
+                    targets=("test_code.py",),
+                    snapshot_id="snapshot-before-external-write",
+                ),
+            ),
+            status="observed",
+        )
+
+        def controlled(_runtime: SessionRuntime, _task: str) -> RunResult:
+            (self.workspace / "external.py").write_text(
+                "unknown = True\n",
+                encoding="utf-8",
+            )
+            return RunResult(True, "synthetic", 1, task_validation=report)
+
+        runtime._run_task_locked = MethodType(controlled, runtime)  # type: ignore[method-assign]
+
+        result = runtime.run_task("external-after-check")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("stale", result.task_validation.status)
+        self.assertIn(
+            "工作区收尾状态与命令检查快照不一致",
+            result.task_validation.limitations,
+        )
 
     def test_external_overwrite_of_journal_path_is_not_absorbed(self) -> None:
         """路径相同不等于版本归属；工具 after 之后的外部覆盖必须保持待确认。"""

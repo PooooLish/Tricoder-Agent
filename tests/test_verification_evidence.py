@@ -129,6 +129,25 @@ class SnapshotTests(WorkspaceCase):
         finally:
             path.chmod(stat.S_IREAD | stat.S_IWRITE)
 
+    def test_content_digest_ignores_identity_but_not_file_bytes(self):
+        """进展指纹允许识别原子写回的同内容，验证 digest 仍保留身份边界。"""
+
+        path = self.root / "app.py"
+        before = self.capture()
+        replacement = self.root / "replacement"
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+        same_content = self.capture()
+
+        self.assertTrue(before.complete)
+        self.assertTrue(same_content.complete)
+        self.assertNotEqual(before.digest, same_content.digest)
+        self.assertEqual(before.content_digest, same_content.content_digest)
+
+        path.write_bytes(b"x = 2\n")
+        changed_content = self.capture()
+        self.assertNotEqual(same_content.content_digest, changed_content.content_digest)
+
     def test_only_fixed_cache_directories_are_excluded(self):
         before = self.capture()
         for directory in (".git", ".venv", "__pycache__", ".pytest_cache"):
@@ -393,10 +412,13 @@ class CommandEvidenceTests(WorkspaceCase):
         self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
         self.assertFalse(result.verification_evidence.passed)
 
-    def test_script_is_unknown_and_cannot_create_evidence(self):
+    def test_stable_script_has_observed_none_without_verification_evidence(self):
         result = self.tools.execute("run_command", {"command": "python app.py"})
-        self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
+        self.assertEqual(EffectState.NONE, result.file_effects.state)
         self.assertIsNone(getattr(result, "verification_evidence", None))
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNotNone(result.command_check)
+        self.assertEqual("script", result.command_check.kind)
 
     def test_sensitive_coverage_cannot_mint_passing_evidence(self):
         (self.root / ".env.local").write_text("synthetic", encoding="utf-8")

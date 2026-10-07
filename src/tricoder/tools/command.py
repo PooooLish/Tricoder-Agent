@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,134 @@ from tricoder.tools.handlers import ToolHandler
 
 
 _filtered_env = filtered_subprocess_env
+_CHECK_OUTPUT_CHARS = 2_000
+_ZERO_TESTS_PATTERN = re.compile(r"\bRan\s+0\s+tests?\b", re.IGNORECASE)
+
+
+def _public_argv(args: list[str]) -> tuple[str, ...]:
+    """隐藏解释器绝对路径，但保留实际、规范化的其余参数。"""
+
+    executable = Path(args[0]).name.lower().removesuffix(".exe")
+    if CommandPolicy._is_python_executable(args[0]):
+        executable = "python"
+    return (executable, *args[1:])
+
+
+def _test_target(token: str) -> str:
+    """把 unittest 的简单模块目标显示为可理解的相对文件名。"""
+
+    if token.endswith(".py") or "/" in token or "\\" in token:
+        return token.replace("\\", "/")
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", token):
+        return token.replace(".", "/") + ".py"
+    return token
+
+
+def _check_kind_and_targets(
+    args: list[str], *, information_command: bool
+) -> tuple[str, tuple[str, ...]]:
+    """只按策略已验证的 argv 分类，不从 stdout 或模型说明推断。"""
+
+    if information_command:
+        return "information", ()
+    if not CommandPolicy._is_python_executable(args[0]):
+        return "other", ()
+    if len(args) >= 2 and args[1].endswith(".py"):
+        return "script", (args[1].replace("\\", "/"),)
+    if len(args) < 3 or args[1] != "-m":
+        return "other", ()
+
+    module = args[2].lower()
+    tokens = args[3:]
+    if module == "unittest":
+        targets: list[str] = []
+        discover = bool(tokens and tokens[0].lower() == "discover")
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            name, separator, value = token.partition("=")
+            if name in CommandPolicy._UNITTEST_VALUE_OPTIONS:
+                if not separator and index + 1 < len(tokens):
+                    value = tokens[index + 1]
+                    index += 1
+                if name in {"-s", "--start-directory"} and value:
+                    targets.append(value.replace("\\", "/"))
+                index += 1
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            if token != "discover":
+                targets.append(_test_target(token))
+            index += 1
+        if discover and not targets:
+            targets.append(".")
+        return "tests", tuple(dict.fromkeys(targets))
+    if module == "pytest":
+        value_options = {
+            "--capture", "--maxfail", "-k", "-m", "--tb", "-r",
+            "--durations", "--durations-min", "--ignore", "--deselect",
+            "--ignore-glob", "--import-mode",
+        }
+        targets = _positional_targets(tokens, value_options=value_options)
+        return "tests", tuple(dict.fromkeys(targets or ["."]))
+    if module == "compileall":
+        targets = _positional_targets(
+            tokens,
+            value_options={"-j", "-x", "-r", "--invalidation-mode"},
+        )
+        return "syntax", tuple(dict.fromkeys(targets))
+    if module in {"ruff", "mypy"}:
+        if module == "ruff" and tokens and tokens[0].lower() == "check":
+            tokens = tokens[1:]
+        value_options = (
+            {
+                "--select", "--ignore", "--extend-select", "--extend-ignore",
+                "--per-file-ignores", "--output-format", "--target-version",
+                "--line-length",
+            }
+            if module == "ruff"
+            else {"--exclude", "--follow-imports", "--python-version", "--platform"}
+        )
+        targets = _positional_targets(tokens, value_options=value_options)
+        return "static", tuple(dict.fromkeys(targets or ["."]))
+    return "other", ()
+
+
+def _positional_targets(
+    tokens: list[str],
+    *,
+    value_options: set[str],
+) -> list[str]:
+    """按工具选项语法提取位置目标，绝不把选项值描述成已检查路径。"""
+
+    targets: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name, separator, _value = token.partition("=")
+        if name in value_options:
+            index += 1 if separator else 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        targets.append(token.replace("\\", "/"))
+        index += 1
+    return targets
+
+
+def _command_output_summary(
+    stdout: str,
+    stderr: str,
+) -> tuple[str, bool, tuple[str, ...]]:
+    """形成有界诊断摘要；输出文本没有签发验证结论的权限。"""
+
+    output = f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    truncated = len(output) > _CHECK_OUTPUT_CHARS
+    summary = output[:_CHECK_OUTPUT_CHARS]
+    diagnostics = ("zero_tests_reported",) if _ZERO_TESTS_PATTERN.search(output) else ()
+    return summary, truncated, diagnostics
 
 
 def _git_toplevel(workspace: Path, command_policy: CommandPolicy) -> Path | None:
@@ -66,6 +195,7 @@ class RunCommandTool(ToolHandler):
     description = (
         "经审批后在工作区内运行白名单命令；Python 别名统一使用会话解释器，"
         "标准测试形式为 `python -m unittest discover -v`，版本查询仅用于诊断。"
+        "请按当前任务选择相关检查；不要为了结束任务重复执行无关测试。"
     )
     parameters = ToolHandler._schema(
         {"command": {"type": "string"}, "cwd": {"type": "string"}},
@@ -149,7 +279,71 @@ class RunCommandTool(ToolHandler):
         if cancellation is not None:
             cancellation.raise_if_cancelled()
         scope = self.context.verification_scope
-        before = scope.capture(self.context.workspace_policy) if _is_verification_command(args) else None
+        verification_command = _is_verification_command(args)
+        public_argv = _public_argv(args)
+        relative_cwd = cwd.relative_to(
+            self.context.workspace_policy.workspace
+        ).as_posix()
+        relative_cwd = relative_cwd if relative_cwd != "." else "."
+        check_kind, check_targets = _check_kind_and_targets(
+            args,
+            information_command=information_command,
+        )
+
+        def command_check(
+            *,
+            returncode: int | None,
+            stdout: str = "",
+            stderr: str = "",
+            after_snapshot=None,
+            limitations: tuple[str, ...] = (),
+            force_truncated: bool = False,
+            execution_complete: bool = False,
+            workspace_stable: bool = False,
+        ):
+            summary, truncated, diagnostics = _command_output_summary(stdout, stderr)
+            return scope.issue_command_check(
+                argv=public_argv,
+                cwd=relative_cwd,
+                kind=check_kind,
+                returncode=returncode,
+                output_summary=summary,
+                execution_complete=execution_complete,
+                workspace_stable=workspace_stable,
+                targets=check_targets,
+                snapshot_id=(
+                    after_snapshot.digest
+                    if after_snapshot is not None and after_snapshot.complete
+                    else None
+                ),
+                limitations=limitations,
+                diagnostics=diagnostics,
+                output_truncated=truncated or force_truncated,
+            )
+        # 文件状态观察与验证证据签发是两条独立边界：普通脚本也必须通过
+        # 前后快照证明受覆盖工作区稳定，但只有认可检查命令可签发证据。
+        try:
+            before = (
+                scope.capture(self.context.workspace_policy)
+                if not information_command
+                else None
+            )
+        except OSError:
+            return tool_failure(
+                ErrorCode.RESULT_UNCERTAIN,
+                "命令执行前文件状态观察失败，未启动命令",
+                file_effects=FileEffects(EffectState.UNKNOWN),
+            )
+        if (
+            before is not None
+            and not verification_command
+            and not before.complete
+        ):
+            return tool_failure(
+                ErrorCode.RESULT_UNCERTAIN,
+                "命令执行前文件状态观察不完整，未启动命令",
+                file_effects=FileEffects(EffectState.UNKNOWN),
+            )
         # 先记本地“可能已启动”，异常/取消不能沿旧证据恢复；仅稳定清理后的快照收窄。
         previous_unknown = scope.unknown_effects
         scope.unknown_effects = True
@@ -165,15 +359,43 @@ class RunCommandTool(ToolHandler):
         except CancellationError:
             raise
         except ProcessExecutionUncertain as exc:
-            return tool_failure(ErrorCode.CLEANUP_FAILED if exc.cleanup_failed else ErrorCode.RESULT_UNCERTAIN,
-                                "命令执行结果或进程树清理无法确认")
+            return tool_failure(
+                (
+                    ErrorCode.CLEANUP_FAILED
+                    if exc.cleanup_failed
+                    else ErrorCode.RESULT_UNCERTAIN
+                ),
+                "命令执行结果或进程树清理无法确认",
+                command_check=command_check(
+                    returncode=None,
+                    limitations=("命令执行结果或清理状态无法确认",),
+                ),
+            )
         except OSError:
             scope.unknown_effects = previous_unknown
             return tool_failure(ErrorCode.EXECUTION_FAILED, "命令进程无法安全启动")
         if completed.cleanup_failed:
-            return tool_failure(ErrorCode.CLEANUP_FAILED, "命令进程树清理失败，结果不可信")
+            return tool_failure(
+                ErrorCode.CLEANUP_FAILED,
+                "命令进程树清理失败，结果不可信",
+                command_check=command_check(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    limitations=("进程树清理失败",),
+                ),
+            )
         if completed.timed_out:
-            return tool_failure(ErrorCode.TIMEOUT, f"命令执行超过 {self.context.timeout:g} 秒")
+            return tool_failure(
+                ErrorCode.TIMEOUT,
+                f"命令执行超过 {self.context.timeout:g} 秒",
+                command_check=command_check(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    limitations=("命令超时，结果不完整",),
+                ),
+            )
         if completed.output_exceeded:
             captured = self._bounded(
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
@@ -182,29 +404,88 @@ class RunCommandTool(ToolHandler):
                 ErrorCode.OUTPUT_LIMIT,
                 f"命令输出超过 {self.context.max_output_chars} 字符，已终止进程树\n"
                 f"{captured}",
+                command_check=command_check(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    limitations=("命令输出超过限制，结果不完整",),
+                    force_truncated=True,
+                ),
             )
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-        after = scope.capture(self.context.workspace_policy) if before is not None else None
+        try:
+            after = (
+                scope.capture(self.context.workspace_policy)
+                if before is not None
+                else None
+            )
+        except OSError:
+            return tool_failure(
+                ErrorCode.RESULT_UNCERTAIN,
+                "命令已执行，但文件状态观察失败，影响无法确认",
+                file_effects=FileEffects(EffectState.UNKNOWN),
+                command_check=command_check(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    limitations=("执行后文件状态观察失败",),
+                ),
+            )
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        if (
+            after is not None
+            and not verification_command
+            and not after.complete
+        ):
+            return tool_failure(
+                ErrorCode.RESULT_UNCERTAIN,
+                "命令已执行，但文件状态观察不完整，影响无法确认",
+                file_effects=FileEffects(EffectState.UNKNOWN),
+                command_check=command_check(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    after_snapshot=after,
+                    limitations=("执行后文件状态观察不完整", *after.limitations),
+                ),
+            )
         stable = before is not None and after is not None and stable_snapshots(before, after)
         succeeded = completed.returncode == 0
         information_stable = information_command and succeeded
         if stable or information_stable:
             scope.unknown_effects = previous_unknown
-        evidence = (scope.issue(before, after, completed.returncode == 0)
-                    if before is not None and after is not None else None)
+        evidence = (
+            scope.issue(before, after, completed.returncode == 0)
+            if verification_command and before is not None and after is not None
+            else None
+        )
         output = (
             f"退出码：{completed.returncode}\n"
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
+        check_limitations: tuple[str, ...]
+        if information_command:
+            check_limitations = ("版本查询不检查工作区文件状态",)
+        elif before is None or after is None:
+            check_limitations = ("缺少完整的工作区状态观察",)
+        elif not before.complete or not after.complete:
+            check_limitations = (
+                "工作区状态观察不完整",
+                *before.limitations,
+                *after.limitations,
+            )
+        elif not stable:
+            check_limitations = ("命令执行后工作区状态发生变化",)
+        else:
+            check_limitations = ()
         return ToolResult(
             succeeded,
             self._bounded(output),
             verification_passed=(
-                succeeded if _is_verification_command(args) else None
+                succeeded if verification_command else None
             ),
             error=None if succeeded else ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN),
             file_effects=FileEffects(
@@ -213,6 +494,15 @@ class RunCommandTool(ToolHandler):
                 else EffectState.UNKNOWN
             ),
             verification_evidence=evidence,
+            command_check=command_check(
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                after_snapshot=after,
+                limitations=check_limitations,
+                execution_complete=True,
+                workspace_stable=stable,
+            ),
         )
 
 

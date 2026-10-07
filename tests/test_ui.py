@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from rich.console import Console
 
 from tricoder.core.events import TextDelta
+from tricoder.core.validation import CommandCheckRecord, TaskValidationReport
 from tricoder.models import AppConfig, ProviderConfig, RunResult, TokenUsage, ToolAction, ToolResult
 from tricoder.models import SessionRecord
 from tricoder.presentation.console import TerminalUI
@@ -62,6 +63,36 @@ class TerminalUITests(unittest.TestCase):
         text = console.export_text()
         self.assertGreaterEqual(text.count("文件状态检查"), 2)
         self.assertGreaterEqual(text.count("非业务验收"), 2)
+
+    def test_task_validation_is_separate_and_never_claims_requirement_coverage(self) -> None:
+        ui, console = recording_ui()
+        report = TaskValidationReport(
+            records=(
+                CommandCheckRecord(
+                    task_id="task",
+                    check_id="check",
+                    argv=("python", "hello.py"),
+                    cwd=".",
+                    kind="script",
+                    returncode=0,
+                    output_summary="stdout:\nHello\nstderr:\n",
+                    execution_complete=True,
+                    workspace_stable=True,
+                    targets=("hello.py",),
+                    snapshot_id="snapshot-a",
+                ),
+            ),
+            status="observed",
+        )
+
+        ui.show_run_result(RunResult(True, "完成", 1, task_validation=report))
+
+        text = console.export_text()
+        self.assertIn("任务验证", text)
+        self.assertIn("hello.py", text)
+        self.assertIn("Hello", text)
+        self.assertIn("需求覆盖", text)
+        self.assertIn("未自动确认", text)
 
     def test_streaming_text_is_rendered_literally(self) -> None:
         """Provider 增量不得被 Rich 当成 markup，也不能在 chunk 间插入换行。"""

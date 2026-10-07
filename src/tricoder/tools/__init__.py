@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 import secrets
 import threading
@@ -11,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from tricoder.core.cancellation import CancellationError, CancellationToken, cancellation_scope
+from tricoder.core.clarification import Clarifier
 from tricoder.task_cleanup import TaskCleanup, current_cleanup, task_cleanup_scope
 from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.extensions.models import ToolOrigin
@@ -36,6 +38,7 @@ from tricoder.tools.binding import (
     _stat_identity,
 )
 from tricoder.tools.command import FinishTool, GitDiffTool, RunCommandTool
+from tricoder.tools.clarification import AskUserTool
 from tricoder.tools.directory import CreateDirectoryTool
 from tricoder.tools.filesystem import ListFilesTool, ReadFileTool
 from tricoder.tools.gitignore import _GitIgnoreMatcher
@@ -49,6 +52,7 @@ _HANDLER_CLASSES = (
     ReadFileTool,
     SearchTextTool,
     GlobFilesTool,
+    AskUserTool,
     EditFileTool,
     CreateDirectoryTool,
     CreateFileTool,
@@ -73,11 +77,15 @@ _READ_TOOL_RESULT_DEFINITION = ToolDefinition(
 )
 
 _TOOL_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_COMMAND_DURATION_PATTERN = re.compile(
+    r"(?i)\b(?:in\s+)?\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|s)\b"
+)
 _BUILTIN_RISKS = {
     "list_files": "read",
     "read_file": "read",
     "search_text": "read",
     "glob_files": "read",
+    "ask_user": "read",
     "edit_file": "write",
     "create_directory": "write",
     "create_file": "write",
@@ -129,6 +137,9 @@ class ToolContext:
     # 大型结果只写入 Session 绑定的 TriCoder 运行目录，不写目标源码目录。
     spill_store: ToolResultSpillStore | None = None
     verification_scope: VerificationScope = field(default_factory=VerificationScope)
+    # 需求回答与审批是两条独立通道；None 表示当前宿主不可交互。
+    clarifier: Clarifier | None = None
+    clarification_timeout: float = 300.0
 
 
 class ToolRegistry:
@@ -308,6 +319,8 @@ class ToolRegistry:
             try:
                 if name == "run_command" and isinstance(handler, RunCommandTool):
                     result = handler.run_with_cancellation(arguments, cancellation)
+                elif name == "ask_user" and isinstance(handler, AskUserTool):
+                    result = handler.run_with_cancellation(arguments, cancellation)
                 elif origin.kind == "mcp":
                     mcp_handler_class = _mcp_handler_class()
                     if type(handler) is mcp_handler_class:
@@ -418,11 +431,17 @@ class ToolRegistry:
             return replace(result, file_effects=external_effects, relative_path=None, modified_paths=(),
                            audit_paths=(), change_chars=0, verification_passed=None,
                            verification_evidence=None,
-                           spill_reference=None, spill_bytes=0, spill_sha256=None)
+                           command_check=None,
+                           clarification=None,
+                           spill_reference=None, spill_bytes=0, spill_sha256=None,
+                           progress_output_digest=None)
         if name == "run_command" and type(handler) is RunCommandTool:
             evidence = result.verification_evidence
             if not self.context.verification_scope.owns(evidence):
                 result = replace(result, verification_evidence=None)
+            check = result.command_check
+            if not self.context.verification_scope.owns_check(check):
+                result = replace(result, command_check=None)
             # 内置命令处理器只有在固定信息查询成功且清理已确认时，才会在
             # 没有验证证据的情况下明确返回 NONE。即使作用域此前已有 UNKNOWN，
             # 也不能把旧状态重新发布为“本次命令的副作用”，否则会覆盖失败证据。
@@ -443,6 +462,7 @@ class ToolRegistry:
             )
             return replace(result, file_effects=effects)
         result = replace(result, verification_evidence=None, verification_passed=None)
+        result = replace(result, command_check=None)
         effects = operation.active_effects() if operation is not None else None
         if effects is None:
             legacy = tuple(dict.fromkeys(
@@ -536,6 +556,10 @@ class ToolRegistry:
     ) -> ToolResult:
         """统一装配 patch 审计元数据与 output/spill 预算。"""
 
+        result = replace(
+            result,
+            progress_output_digest=self._progress_output_digest(name, result),
+        )
         result = self._apply_output_budget(result, call_id)
         if name != "apply_patch" or self.context.read_only:
             return result
@@ -546,6 +570,15 @@ class ToolRegistry:
             change_chars=change_chars,
         )
 
+    @staticmethod
+    def _progress_output_digest(name: str, result: ToolResult) -> str:
+        """在展示预算处理前摘要完整正文；只规范化宿主命令的耗时噪声。"""
+
+        output = result.output
+        if name == "run_command" and result.command_check is not None:
+            output = _COMMAND_DURATION_PATTERN.sub("<duration>", output)
+        return hashlib.sha256(output.encode("utf-8")).hexdigest()
+
     def _validate_execution_result(self, result: object, name: str, handler: ToolHandler) -> ToolResult:
         """在归一化前拒绝不符合公开 ToolResult 契约的处理器返回值。"""
 
@@ -554,6 +587,18 @@ class ToolRegistry:
             raise _InvalidToolResultError("工具处理器返回了无效结果")
         if result.ok and result.error is not None:
             raise _InvalidToolResultError("成功结果不能携带错误")
+        from tricoder.core.clarification import ClarificationResult
+
+        trusted_clarification = (
+            name == "ask_user"
+            and self._builtin_handlers.get(name) is handler
+            and type(handler) is AskUserTool
+        )
+        if result.clarification is not None and (
+            not trusted_clarification
+            or type(result.clarification) is not ClarificationResult
+        ):
+            raise _InvalidToolResultError("澄清结果结构或来源无效")
         if self._builtin_handlers.get(name) is handler:
             if not result.ok and result.error is None:
                 result = replace(result, error=ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN))
@@ -665,6 +710,15 @@ class ToolRegistry:
             spill_reference=record.reference,
             spill_bytes=record.byte_count,
             spill_sha256=record.sha256,
+            command_check=(
+                replace(
+                    result.command_check,
+                    spill_reference=record.reference,
+                    output_truncated=True,
+                )
+                if result.command_check is not None
+                else None
+            ),
         )
 
     def _truncate_inline_result(self, result: ToolResult) -> ToolResult:
@@ -673,7 +727,15 @@ class ToolRegistry:
         limit = max(0, self.context.max_output_chars)
         marker = "\n...（输出已截断，完整结果未暂存）"
         prefix_chars = max(0, limit - len(marker))
-        return replace(result, output=(result.output[:prefix_chars] + marker)[:limit])
+        return replace(
+            result,
+            output=(result.output[:prefix_chars] + marker)[:limit],
+            command_check=(
+                replace(result.command_check, output_truncated=True)
+                if result.command_check is not None
+                else None
+            ),
+        )
 
     def preview_undo(self, change_set: TaskChangeSet) -> UndoPreview:
         """首次全量核验后预览反向差异，不落盘。"""

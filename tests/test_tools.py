@@ -569,6 +569,7 @@ class ToolTests(unittest.TestCase):
                 "read_file",
                 "search_text",
                 "glob_files",
+                "ask_user",
                 "edit_file",
                 "create_directory",
                 "create_file",
@@ -603,6 +604,26 @@ class ToolTests(unittest.TestCase):
                     "pattern": {"type": "string"},
                 },
                 ["pattern"],
+            ),
+            "ask_user": (
+                {
+                    "question": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 120,
+                        },
+                        "minItems": 2,
+                        "maxItems": 4,
+                    },
+                },
+                ["question"],
             ),
             "edit_file": (
                 {

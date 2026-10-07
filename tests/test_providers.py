@@ -884,6 +884,7 @@ class ProviderTests(unittest.TestCase):
                 "search_text.path",
                 "search_text.use_regex",
                 "glob_files.path",
+                "ask_user.options",
                 "run_command.cwd",
                 "create_directory.parents",
                 "create_directory.exist_ok",

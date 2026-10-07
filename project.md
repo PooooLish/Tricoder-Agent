@@ -1,5 +1,75 @@
 # Project: tricoder-cli
 
+## 2026-10-07 第三批 C1/D 复审补齐（已实施，等待复审）
+
+- 范围严格限定为 `docs/superpowers/plans/2026-10-07-convergence-review-fixes.md` 的 F1/F2/F3。基线 HEAD 为 `43f721a`，保留开始时所有未提交和未跟踪修改；未从 HEAD 覆盖文件，未安装依赖、读取 `.env.local`/真实会话库、调用真实 Provider、提交或推送。
+- R0 先运行 `runtime/task-quality-round1/review-c1-repro.py`：F1 的 `call-2` 有两条结果且任务块未闭合；F2 四次相同 spill 读取后仍消费第 5 个响应并成功；F3 A→B→A 后首次回读在第 6 次请求误停。三个场景均转为正式测试并分别出现预期 RED，不是 fixture 或导入失败。
+- F1 根因是失败批次已补 skipped 后，进展扫描取消分支再次无条件回填。现在该分支复用 `remaining_filled`：已有结果不重复发布，未填批次只补一次；skipped 审计失败仍优先安全停止，`NativeCancellationError.cleanup_failed`、事件/审计单次性、历史闭合和后续保存候选均有回归。
+- F2 为 `ToolResult` 追加默认 `None` 的 `progress_output_digest`。`ToolRegistry` 在截断/spill 前对完整正文生成宿主摘要并覆盖扩展自报值；Runner 只比较内容身份及错误/返回码，不比较随机引用、展示包装或原始 spill 元数据。文件正文中的时间字符串保持原义，宿主命令检查仍可规范化耗时噪声；`spill_sha256` 继续用于原有完整性审计。
+- F3 增加独立读取阶段通知。只有成功、非中断且由内置变更账本/宿主观察确认为 `CONFIRMED` 的实际文件或目录变化才调用 `note_workspace_change()`；A→B→A 的两次真实写入均推进阶段。no-op `create_directory(exist_ok=true)`、UNKNOWN、取消和扩展自报路径不能重启读取；失败计数、A/B 振荡证据、32 条窗口和新任务隔离保持不变。
+- 修复后诊断脚本实际输出：F1 每个 call ID 恰好一条结果且 `task_block_closed=true`；F2 在第 4 次读取停止且只消费 4 次 Provider；F3 消费到第 7 次 finish，按真实“修改后未验证”事实结束，不再因重复读取提前停止。exit 0 仍只表示脚本运行完成，正式测试才是验收主证据。
+- 聚焦回归覆盖 ProgressGuard、真实工具批次、结束协议、批次失败、spill、扩展结果、审计、记忆压缩/保存和 SessionRuntime：`Ran 355 tests in 25.667s`，OK。最终完整项目：`Ran 1541 tests in 328.642s`，OK（13 skipped）。compileall、CLI `--help`、19 项 Agent/module 导入边界与 `git diff --check` 均 exit 0。
+- 证据记录：`runtime/task-quality-round1/convergence-review-fixes.md`。现停在待复审交付点，不自行写成“复审通过”。未验证 Linux/macOS、Python 3.12、真实 Provider 与手工 Console/TUI；13 项跳过为既有平台/权限条件，本轮新增测试没有跳过。
+
+## 2026-10-07 第三批复审补齐执行文档交接（待实施）
+
+- 补齐计划：`docs/superpowers/plans/2026-10-07-convergence-review-fixes.md`，范围仅 F1/F2/F3，按 R0 复现、R1 单次回填、R2 稳定结果摘要、R3 读取阶段、R4 整体验收推进。
+- 核心约束：F1 保留审计/取消与历史配对；F2 不让暂存引用进入进展判定、不削弱原始内容完整性检查；F3 仅重启读取区间，保留失败和振荡记录，no-op 不算进展。
+- 第 10 节提供可直接交给 coding session 的提示词；诊断脚本仍为 `runtime/task-quality-round1/review-c1-repro.py`，必须转为正式失败断言再修复。
+- 本轮只写文档和交接，未修改功能代码、未重新运行功能回归。下一动作：coding session 按补齐计划实施，交付后再复审，不把计划完成等同于缺陷关闭。
+
+## 2026-10-07 第三批 C1/D 复审（未通过，3 项 P2 待补齐）
+
+- 本轮审查最新工作树，保留三批既有改动；未修改生产源码或正式测试。使用 verification-before-completion 和 systematic-debugging 流程重新验证，不将此前交接中的全量结果视为本轮通过证据。
+- 新鲜聚焦回归：`test_progress_guard.py`、`test_agent_convergence.py`、`test_agent_termination.py`、`test_memory_compaction.py`、`test_memory_save_coverage.py`、`test_session_runtime.py`、`test_audit.py`、`test_clarification.py` 合并运行，`Ran 144 tests in 15.360s`，OK。本轮未重跑全量；下列新增探针均稳定复现缺陷。
+- **F1 / P2：进展扫描取消会重复回填 skipped。** `engine/tool_batch.py:284-296` 未检查 `remaining_filled`。同批第一个 read_file 参数错误时，后续 call-2 已被回填一次；随后进展扫描抛 CancellationError，取消分支又回填一次。真实 Agent 结果为 call-1 一条、call-2 两条 tool result，ContextManager 判定该任务块未闭合，影响后续压缩/保存。修复应保持回填单次、审计优先级与统一收尾，补可恢复失败＋多调用批次＋扫描取消的组合回归。
+- **F2 / P2：spill 包装使相同结果绕过重复检测。** `engine/tool_batch.py:519-538` 对展示用 result.output 计算指纹，其中包含每次不同的暂存 reference；原始内容相同仍产生不同指纹。真实 ToolRegistry＋SpillStore＋Agent 连续读取同一大文件四次没有停止，继续发起第五次请求并 finish 成功。应从宿主原始语义结果生成稳定摘要，排除暂存引用等展示元数据；保留内容变化的可区分性，并防止原始 spill_sha256 抵消耗时归一化。
+- **F3 / P2：读取预算未在真实写入后开启新阶段。** `engine/progress.py:175-186` 对全部窗口中相同 digest 的读取累计，只有 user answer epoch，没有变更阶段；成功写入也不进入 `_observe_progress`。真实 Agent 读取 A 三次、编辑 A→B→A 后首次回读，立即按累计四次停止。这违反计划中“实际内容变化开启新的只读计数区间”；应在确认的真实内容变化后更新读取阶段，同时保留重复失败和振荡证据，不让净零/no-op 或任意工具成功随意清空预算。
+- 可复现脚本：`runtime/task-quality-round1/review-c1-repro.py`；从项目根执行 `.venv/Scripts/python.exe -B runtime/task-quality-round1/review-c1-repro.py`。只使用合成临时工作区和 fake Provider；F1 输出 `task_block_closed=false`，F2 输出 `ok=true, provider_calls=5`，F3 输出重复读取停止。脚本 exit 0 仅表示诊断运行完成，不代表验收通过。
+- 下一动作：由 coding session 先将 F1/F2/F3 转成正式失败测试，再最小修复并复审；本轮三项关闭前不宣称第三批验收通过。未读取真实凭据或会话库，未调用真实 Provider，未安装依赖、提交或推送。
+
+## 2026-10-07 失败收敛第三批 C1/D（已实施，等待审查）
+
+- 先复核第二批 B1/B2：回答、超时、取消、迟到答案、无交互宿主、同批 skipped、回答不审批、等待期间外部修改、锁持有、历史闭合和记忆兼容新鲜组合 `Ran 236`，OK。最终 B/C/D 聚焦再跑 `Ran 200`，OK，没有绕过第一、第二批边界继续实施。
+- 新增单任务 `engine.progress.ProgressGuard`，最多保留最近 32 条宿主指纹。相同状态的同一失败第 2 次提醒、第 3 次停止；相同无变化读取第 2 次提醒、第 4 次停止；同一失败检查出现完整内容状态 A→B→A→B→A 时停止。普通读取、无关成功和回答不删除失败记录；回答只重启读取区间，新任务重新创建 guard。
+- 工具批次只在 effects 发布、真实结果配对和工具审计成功后观察。参数使用实际命令记录或工作区规范路径；结果对常见耗时文本及其规范化长度做摘要。只有 scope 签发的 information 命令可作为读取；不同读工具交替、路径别名和版本查询不能重置预算。不完整快照不证明状态相同。
+- 新停止保留取消、审计失败、UNKNOWN、清理失败、原生无工具预算和 max_rounds 的既有优先级。同批剩余工具只补 skipped；停止走统一 finalizer，保留修改、真实失败、验证、usage 和账本，不自动撤销或伪造 finish/测试通过。固定终止事实支持后续压缩与保存，三类失败形成 pending 待办且不推进成功水位；真正未配对 ToolCall 仍拒绝。
+- D 联调覆盖 ask_user→回答→重新请求→重新审批→创建→相关检查→finish，等待取消/外部修改、重复失败/读取/振荡、锁释放、新任务计数隔离和停止后记忆。自审另复现并修复：进展快照取消会越过统一收尾、原始输出长度使耗时字段仍旁路摘要、information 查询未计入重复读取。
+- 新鲜验证（Windows / Python 3.11.6）：C1/快照/审计 `Ran 43`，OK（1 skipped）；最终 Agent/Runtime/验证/记忆/安全邻接 `Ran 414 tests in 92.488s`，OK（2 skipped）；B/C/D 聚焦 `Ran 200`，OK；完整项目 `Ran 1527 tests in 222.983s`，OK（13 skipped）。compileall 与 `git diff --check` 退出 0。证据见 `runtime/task-quality-round1/third-batch-verification.md`。
+- 未调用真实 Provider，未读取 `.env.local`、真实密钥或用户会话数据库，未安装依赖、提交或推送。剩余限制：这是 32 条窗口的启发式保护；内容摘要为识别原子同内容写回而忽略身份/权限，严格验证仍使用原 digest；耗时规范化不能覆盖所有非确定性输出。Linux/macOS、Python 3.12、真实 Provider、手工 Console/TUI 尚未验证。
+
+## 2026-10-06 需求澄清第二批 B1/B2（已实施，等待审查）
+
+- 前置复核没有发现阻塞项：第一批普通脚本副作用观察、扫描 fail-closed、任务验证 authority/时效、无关检查不能清除失败，以及结束协议 P2 的失败历史/结构化记忆兼容组合共 `Ran 175`，OK（2 skipped）。没有绕过这些检查进入 B 阶段。
+- 新增宿主无关的 `ClarificationRequest/ClarificationResult` 和内置只读 `ask_user`。宿主签发 request ID；问题、2—4 个可选建议和自由文本回答均有长度上限。回答只形成真实 tool result，不携带 permission、approval 或 verification authority；同批剩余调用只补 `skipped`，下一轮 Provider 必须基于回答重新决策。单任务最多 2 次有效提问，超限保守停止。
+- 等待是进程内一次性状态，默认 300 秒，复用调用方取消令牌并保持 Session、任务和工作区锁。等待前后使用现有工作区验证范围重新扫描；扫描失败或外部变化时不采用答案，后续任务继续经过既有完整工作区门禁。取消、超时、无宿主、界面关闭和提问上限各有固定未完成终止事实；真实 ToolCall 先配对，失败不推进成功任务水位，记忆候选保留对应 pending 事实。
+- Console 仅在真实终端使用可取消轮询读取，非交互和不具备取消契约的自定义阻塞输入明确 unavailable，不创建遗留 `input()` 线程。TUI 使用独立模态框、倒计时、Enter/Esc 和首次终态生效的线程安全等待；取消/退出关闭等待，迟到答案无效。两参数旧 TUI runtime factory 保持兼容但不提供澄清宿主。
+- TDD 先复现并修复了回答后同批写入抢跑、取消/迟到答案、外部编辑、锁持有、历史/记忆阻塞、非交互输入及旧 TUI 退出宿主兼容问题；自审又补充同步 `ToolRegistry.execute` 必须沿用调用方取消令牌的回归。聚焦组合 `Ran 235`，OK；澄清专项最后代码 `Ran 18`，OK；工具/导入边界 `Ran 146`，OK。
+- 首次全量 `Ran 1504`，出现 3 个失败，未记作通过：新增可选 Schema 未进入 Provider 契约期望；工具固定前缀增加 401 字符使 Eval fixture 多触发一次 compaction；命令闭环在全量压力下返回一次 UNKNOWN。前两项按根因修复后目标测试通过；命令闭环独立连续 8 次通过且第二次全量未复现。最终完整回归 `Ran 1504 tests in 226.888s`，OK（13 skipped）；compileall、19 项导入边界及 `git diff --check` 均通过。
+- 本批没有实施 C1/D，不支持跨进程或跨重启恢复等待，也没有把有限快照观察表述为 OS 沙箱。未调用真实 Provider、未读取 `.env.local`/真实会话库、未安装依赖、提交或推送；手工 Console/TUI、Linux/macOS 和 Python 3.12 尚未验证。首次全量的命令 UNKNOWN 未能稳定复现，虽然后续 8 次专项和一次全量均通过，仍作为低概率 Windows/负载风险保留记录。
+
+## 2026-10-06 任务验证第一批 S0/A1/A2（已实施，等待审查）
+
+- 执行文档：`docs/superpowers/plans/2026-10-06-task-verification-clarification-convergence.md`；证据位于 `runtime/task-quality-round1/verification.md`。实施基线 HEAD 为 `43f721a`，保留了开始时未提交的计划与本文件交接内容，没有从 HEAD 覆盖工作树。
+- S0 新鲜复核结束协议 P2：零工具和完整工具回合后的第三次 native 无工具响应均闭合失败历史；真实未配对 ToolCall 继续被拒绝；失败待办不会被空摘要删除，失败不推进成功水位。S0 指定组合 `Ran 109`，OK。
+- A1 将“普通允许命令的副作用观察”与“认可验证命令的证据签发”拆开。非信息命令在审批后执行前、正常清理后捕获受覆盖快照；稳定普通脚本返回本次 effects NONE，但 `verification_passed`/旧证据保持空。前扫描失败或不完整不启动普通命令，后扫描失败、不完整或变化继续 UNKNOWN；原有 UNKNOWN、取消、超时、输出超限和清理失败不被清除。稳定非零退出保持 `execution_failed / replan`，没有放宽命令策略或审批。
+- A2 新增 `core.validation.CommandCheckRecord/TaskValidationReport` 与 `engine.validation.TaskValidationTracker`。记录由本地 scope 签发并绑定历史 task ID、每任务轮换的独立 check authority 和完整快照，包含规范化 argv、实际 cwd、kind、returncode、目标、有界输出、spill 引用、执行完整性、工作区稳定性与限制；扩展自报字段会被剥离。任务最多保留 32 条记录，失败按 argv＋cwd 严格替代，且只有宿主确认完整、稳定的成功检查才能清除；淘汰记录不清除未解决失败。
+- 写入后的 stale 按检查签名维护，信息查询和无关稳定命令不能复活编辑前证据；SessionRuntime 收尾扫描失败或发现未归属变化时同步标记已有任务检查 stale。目标提取按 unittest/pytest/ruff/mypy 语法排除过滤值和排除项，不再把 `tests` 误写成 `tests.py`。
+- Console/TUI 分开呈现文件状态检查与任务验证，均显示记录限制/容量截断，并始终显示“需求覆盖未自动确认”。无关测试、`OK`/`Ran 0 tests` 文本、模型总结、旧摘要和正常 finish 都不能签发业务覆盖；普通无检查任务保持 unverified。D1 Hello、D2 写文件脚本、D3 无关测试均由 fake Provider＋临时工作区覆盖。
+- 独立只读复审先后发现并复现：信息查询复活 stale、不可信退出码清除失败、命令目标误报、task 标签复用、TUI 限制缺失、一次性 CLI 收尾未同步失效、内部完整记录越过 32 条。各项均先补失败回归再最小修复；最终复审未发现 Critical/Important。
+- 新鲜验证（Windows / Python 3.11.6）：审查补齐后的 Agent/命令/证据/工作区组合 `Ran 223`，OK（2 skipped）；最终全项目 `Ran 1476 tests in 313.928s`，OK（13 skipped）。compileall、CLI `--help`、23 项导入边界与 `git diff --check` 均 exit 0。首次全量曾暴露 2 条依赖旧“普通脚本必为 UNKNOWN”语义的断言，按 A1 计划改为稳定非零退出可重规划后修正；没有把首次失败记作通过。
+- 未调用真实 Provider，未读取 `.env.local`、真实密钥或用户会话数据库，未安装依赖、提交或推送。剩余限制：快照是有限覆盖观察而非 OS 沙箱；任务验证只报告事实，不自动推断需求覆盖；记录只随当次 `RunResult` 存在，不跨 Session 持久化。Linux/macOS、Python 3.12、真实 Provider 和手工 TUI 尚未验证。当前停在第一批审查点，B1/B2/C1 未实施。
+
+## 2026-10-06 下一阶段执行方案交接（文档完成，代码待实施）
+
+- 执行方案：`docs/superpowers/plans/2026-10-06-task-verification-clarification-convergence.md`。包含当前代码依据、模块职责、接口约定、S0/A1/A2/B1/B2/C1/D 阶段、验收场景，以及三批 coding agent 提示词。
+- 第一批 S0/A1/A2：复核已记录完成的结束协议 P2；拆开命令副作用观察与测试证据签发，解决普通脚本正常退出仍因缺少快照而 UNKNOWN；增加保守的任务验证事实与展示。编写时实际 HEAD 为 `43f721a`，实施仍以最新工作树为准。
+- 第二批 B1/B2：独立 ask_user，第一版进程内等待、默认 300 秒超时、可取消，保持 Session/工作区锁；回答不审批，恢复前检查外部编辑，同批后续动作跳过。暂不实现跨重启等待或释放锁后的恢复。
+- 第三批 C1/D：有界重复检测及端到端验收。相同失败第 3 次、无变化重复读取第 4 次、A→B→A→B→A 振荡分别停止；保持已有协议预算、安全优先级、已提交变更和失败记忆。
+- 任务计划设计与维护继续留在后续阶段。本轮仅创建执行文档和更新交接，没有修改功能代码；没有重新运行功能测试，也没有将历史 P2 测试结果作为本轮复审通过证据。
+- 下一动作：用户将执行文档第 13 节第一批提示词交给 coding agent，先完成 S0/A1/A2，交付审查后继续 B/C。各阶段证据放 `runtime/task-quality-round1/`。
+- 文档检查：258 行计划的代码围栏、阶段标记、引用的既有源码与测试路径、交接链接检查通过；相关 `git diff --check` 退出 0。仅验证文档结构，不代表上述功能已实现。
+
 ## 2026-10-06 后续开发目标与阶段划分（用户已确认，待设计实施）
 
 - 下一阶段聚焦三项：**任务验证、需求澄清与等待、失败收敛**。这是优先级与范围记录，不代表功能已实现，也不自动启动代码修改。

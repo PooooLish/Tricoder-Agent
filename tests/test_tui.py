@@ -13,6 +13,7 @@ from textual.widgets import Collapsible, Input, Static
 from tricoder.agent import PLANNING_PROMPT
 from tricoder.core.events import TextDelta
 from tricoder.core.cancellation import CancellationToken
+from tricoder.core.validation import CommandCheckRecord, TaskValidationReport
 from tricoder.changes import UndoExecution, UndoPreview
 from tricoder.models import (
     AppConfig,
@@ -21,6 +22,7 @@ from tricoder.models import (
     SessionContext,
     SessionRecord,
     ToolCall,
+    RunResult,
 )
 from tricoder.providers import ProviderError
 from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
@@ -67,6 +69,47 @@ def _provider_factory(responses: list[ProviderResponse]):
 
 
 class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_result_log_separates_task_checks_from_requirement_coverage(self) -> None:
+        app = TricoderApp(lambda *_: None)
+        report = TaskValidationReport(
+            records=(
+                CommandCheckRecord(
+                    task_id="task",
+                    check_id="check",
+                    argv=("python", "hello.py"),
+                    cwd=".",
+                    kind="script",
+                    returncode=0,
+                    output_summary="Hello",
+                    execution_complete=True,
+                    workspace_stable=True,
+                    targets=("hello.py",),
+                    snapshot_id="snapshot-a",
+                ),
+            ),
+            status="observed",
+            limitations=(
+                "需求覆盖未自动确认",
+                "仅显示最近 32 条检查记录",
+            ),
+            recent_only=True,
+        )
+        lines: list[str] = []
+
+        with mock.patch.object(
+            app,
+            "log_line_safe",
+            side_effect=lambda value: lines.append(str(value)),
+        ), mock.patch.object(app, "refresh_sidebar"):
+            app._log_result(RunResult(True, "完成", 1, task_validation=report))
+
+        rendered = "\n".join(lines)
+        self.assertIn("任务验证", rendered)
+        self.assertIn("hello.py", rendered)
+        self.assertIn("Hello", rendered)
+        self.assertIn("需求覆盖未自动确认", rendered)
+        self.assertIn("仅显示最近 32 条检查记录", rendered)
+
     async def test_undo_prepare_gate_runs_in_background_worker(self) -> None:
         """撤销扫描/工作区确认不能在 Textual UI 线程同步执行。"""
 

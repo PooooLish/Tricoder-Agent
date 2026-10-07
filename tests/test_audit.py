@@ -11,13 +11,19 @@ class AuditTests(unittest.TestCase):
     def test_redact_preserves_only_known_reason_codes(self) -> None:
         """固定原因码可检索，自由文本 reason 仍不得进入审计。"""
 
-        safe = redact({"reason": "native_missing_tool_call"})
+        safe_codes = (
+            "native_missing_tool_call",
+            "repeated_failure",
+            "repeated_observation",
+            "repair_oscillation",
+        )
         private = redact({"reason": "PRIVATE-REASON-SENTINEL"})
         structured = redact(
             {"reason": {"message": "PRIVATE-NESTED-SENTINEL", "code": 7}}
         )
 
-        self.assertEqual("native_missing_tool_call", safe["reason"])
+        for code in safe_codes:
+            self.assertEqual(code, redact({"reason": code})["reason"])
         self.assertNotIn("reason", private)
         self.assertEqual(len("PRIVATE-REASON-SENTINEL"), private["reason_chars"])
         self.assertEqual(

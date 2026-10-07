@@ -29,6 +29,7 @@ from tricoder.changes import (
     render_change_set_diff,
 )
 from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.core.clarification import Clarifier
 from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
 from tricoder.context.spill import SpillError, ToolResultSpillStore
@@ -349,6 +350,7 @@ class SessionRuntime:
         agent_factory: Callable[..., ContextAgent] = CodingAgent,
         audit_factory: Callable[[Path], AuditLogger] = AuditLogger,
         approver: Callable[[str, str], bool] | None = None,
+        clarifier: Clarifier | None = None,
         observer: AgentObserver | None = None,
         mcp_manager_factory: Callable[..., object] | None = None,
         initial_session_id: str | None = None,
@@ -368,6 +370,7 @@ class SessionRuntime:
         self._agent_factory = agent_factory
         self._audit_factory = audit_factory
         self._approver = approver or (lambda _action, _detail: False)
+        self._clarifier = clarifier
         self._observer = observer
         self._mcp_manager_factory = mcp_manager_factory
         self._workspace_confirmer = workspace_confirmer
@@ -1134,7 +1137,7 @@ class SessionRuntime:
             self._invalidate_current_after_workspace_finish_failure()
             self._clear_workspace_change_notice()
             return replace(
-                result,
+                self._with_stale_task_validation(result),
                 ok=False,
                 summary=f"{result.summary}；工作区收尾扫描失败，当前代码状态待重新确认",
                 verification="待验证",
@@ -1144,7 +1147,7 @@ class SessionRuntime:
             self._invalidate_current_after_workspace_finish_failure()
             self._clear_workspace_change_notice()
             return replace(
-                result,
+                self._with_stale_task_validation(result),
                 ok=False,
                 summary=f"{result.summary}；工作区收尾缺少起始基线",
                 verification="待验证",
@@ -1163,7 +1166,7 @@ class SessionRuntime:
             self._invalidate_current_after_workspace_finish_failure()
             self._clear_workspace_change_notice()
             return replace(
-                result,
+                self._with_stale_task_validation(result),
                 ok=False,
                 summary=f"{result.summary}；工作区根身份或快照范围在收尾时变化",
                 verification="待验证",
@@ -1199,10 +1202,30 @@ class SessionRuntime:
         self._invalidate_current_after_workspace_finish_failure()
         self._clear_workspace_change_notice()
         return replace(
-            result,
+            self._with_stale_task_validation(result),
             ok=False,
             summary=f"{result.summary}；收尾发现未归属的工作区变化，需下次任务前确认",
             verification="待验证",
+        )
+
+    @staticmethod
+    def _with_stale_task_validation(result: RunResult) -> RunResult:
+        """收尾无法证明 Agent 所见版本仍有效时，使命令检查同步过期。"""
+
+        report = result.task_validation
+        limitation = "工作区收尾状态与命令检查快照不一致"
+        limitations = (
+            report.limitations
+            if limitation in report.limitations
+            else (*report.limitations, limitation)
+        )
+        return replace(
+            result,
+            task_validation=replace(
+                report,
+                status="stale" if report.records else report.status,
+                limitations=limitations,
+            ),
         )
 
     @staticmethod
@@ -2806,6 +2829,7 @@ class SessionRuntime:
             for registry in registries:
                 try:
                     registry.context.change_journal = active_journal
+                    registry.context.clarifier = self._clarifier
                 except (AttributeError, TypeError) as exc:
                     raise SessionRuntimeError("自定义会话工厂无法绑定现有变更账本") from exc
                 if registry.context.change_journal is not active_journal:
@@ -2837,6 +2861,7 @@ class SessionRuntime:
                 timeout=loaded.timeout,
                 change_journal=active_journal,
                 spill_store=spill_store,
+                clarifier=self._clarifier,
             )
         )
         if loaded.audit_dir is None:

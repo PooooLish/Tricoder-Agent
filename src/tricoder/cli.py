@@ -383,6 +383,7 @@ def _run_one_shot_entry(
                 timeout=config.timeout,
                 change_journal=journal,
                 spill_store=spill_store,
+                clarifier=ui.ask_user,
             )
         )
         agent = CodingAgent(
@@ -614,6 +615,7 @@ def _run_chat(
             ),
             provider_factory=provider_factory,
             approver=ui.approve,
+            clarifier=ui.ask_user,
             observer=ui,
             workspace_confirmer=ui.confirm_workspace_change,
         )
@@ -653,6 +655,7 @@ def _run_tui(
     def runtime_factory(
         observer: AgentObserver,
         approver: Callable[[str, str], bool],
+        clarifier: object | None = None,
     ) -> SessionRuntime:
         def confirm_workspace(preview: WorkspaceGatePreview) -> bool:
             if not preview.pages:
@@ -682,6 +685,7 @@ def _run_tui(
             ),
             provider_factory=provider_factory,
             approver=approver,
+            clarifier=clarifier,
             observer=observer,
             workspace_confirmer=confirm_workspace,
         )

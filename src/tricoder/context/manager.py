@@ -15,6 +15,7 @@ from tricoder.context.memory import (
     merge_review_candidate,
     source_id_for_sequence,
     with_task_termination_facts,
+    is_trusted_task_termination,
 )
 from tricoder.models import Message, SessionContext, TokenUsage, ToolDefinition
 from tricoder.protocols import ActionProtocol
@@ -723,7 +724,7 @@ class ContextManager:
         terminal_groups = [
             index
             for index, group in enumerate(groups)
-            if len(group) == 2 and self._is_task_termination(group[1])
+            if group and self._is_task_termination(group[-1])
         ]
         if terminal_groups:
             return terminal_groups == [len(groups) - 1]
@@ -795,6 +796,8 @@ class ContextManager:
                 continue
             if message.kind == "protocol_feedback":
                 groups.append([message])
+            elif self._is_task_termination(message):
+                groups.append([message])
             index += 1
         return groups
 
@@ -802,13 +805,7 @@ class ContextManager:
     def _is_task_termination(message: Message) -> bool:
         """识别程序生成的精确失败终止标记，不接受普通用户文本冒充。"""
 
-        return bool(
-            message.role == "user"
-            and message.kind == TASK_TERMINATION_KIND
-            and message.content == TASK_TERMINATION_NOTICE
-            and not message.tool_calls
-            and message.tool_call_id is None
-        )
+        return is_trusted_task_termination(message)
 
     def _complete_round_tail(
         self,

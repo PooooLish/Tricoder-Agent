@@ -23,6 +23,49 @@ TASK_TERMINATION_NOTICE = (
 TASK_TERMINATION_MEMORY_TEXT = (
     "任务因结束协议纠正失败而停止，未完成结果仍需确认。"
 )
+CLARIFICATION_TIMEOUT_NOTICE = (
+    "本轮已停止：等待用户回答超时；任务未完成，需要用户补充信息。"
+)
+CLARIFICATION_UNAVAILABLE_NOTICE = (
+    "本轮已停止：当前入口无法取得用户回答；任务未完成，需要用户补充信息。"
+)
+CLARIFICATION_LIMIT_NOTICE = (
+    "本轮已停止：已达到需求澄清提问次数上限；任务未完成，需要用户补充信息。"
+)
+CLARIFICATION_WORKSPACE_CHANGED_NOTICE = (
+    "本轮已停止：等待回答期间工作区发生变化；回答未采用，任务未完成。"
+)
+CLARIFICATION_SCAN_FAILED_NOTICE = (
+    "本轮已停止：澄清等待前后无法完整扫描工作区；任务未完成。"
+)
+CLARIFICATION_CANCELLED_NOTICE = (
+    "本轮已停止：用户取消了需求澄清等待；任务未完成。"
+)
+REPEATED_FAILURE_NOTICE = (
+    "本轮已停止：相同工作区状态下的同一失败已累计 3 次；"
+    "任务未完成，真实失败证据与已提交修改均已保留。"
+)
+REPEATED_OBSERVATION_NOTICE = (
+    "本轮已停止：工作区无变化时同一读取已累计 4 次；"
+    "任务未完成，现有结果仍需确认。"
+)
+REPAIR_OSCILLATION_NOTICE = (
+    "本轮已停止：同一失败检查对应的代码状态出现 A→B→A→B→A 来回抵消；"
+    "任务未完成，未自动撤销已提交修改。"
+)
+
+_TASK_TERMINATION_FACTS = {
+    TASK_TERMINATION_NOTICE: TASK_TERMINATION_MEMORY_TEXT,
+    CLARIFICATION_TIMEOUT_NOTICE: "任务等待用户回答超时，仍需补充信息。",
+    CLARIFICATION_UNAVAILABLE_NOTICE: "当前入口无法取得回答，任务仍需用户补充信息。",
+    CLARIFICATION_LIMIT_NOTICE: "需求澄清已达到提问上限，任务仍需用户补充信息。",
+    CLARIFICATION_WORKSPACE_CHANGED_NOTICE: "澄清等待期间工作区发生变化，回答未采用，任务仍未完成。",
+    CLARIFICATION_SCAN_FAILED_NOTICE: "澄清等待前后无法完整扫描工作区，任务仍未完成。",
+    CLARIFICATION_CANCELLED_NOTICE: "用户取消需求澄清等待，任务仍未完成。",
+    REPEATED_FAILURE_NOTICE: "任务因相同状态下重复失败累计 3 次而停止，失败仍未解决。",
+    REPEATED_OBSERVATION_NOTICE: "任务因工作区无变化时重复读取同一结果 4 次而停止，结果仍需确认。",
+    REPAIR_OSCILLATION_NOTICE: "任务因失败检查期间代码状态来回抵消而停止，失败仍未解决。",
+}
 
 _ITEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SOURCE_ID = re.compile(r"^m([1-9][0-9]*)$")
@@ -168,9 +211,10 @@ def with_task_termination_facts(
     for message in source_messages:
         if message.kind != TASK_TERMINATION_KIND:
             continue
+        memory_text = _TASK_TERMINATION_FACTS.get(message.content or "")
         if (
             message.role != "user"
-            or message.content != TASK_TERMINATION_NOTICE
+            or memory_text is None
             or message.message_seq is None
             or message.task_id is None
             or message.tool_calls
@@ -179,7 +223,7 @@ def with_task_termination_facts(
             raise MemoryValidationError("任务终止标记无效")
         item = MemoryItem(
             id=f"task-termination-{message.message_seq}",
-            text=TASK_TERMINATION_MEMORY_TEXT,
+            text=memory_text,
             source_ids=(source_id_for_sequence(message.message_seq),),
             scope="task",
             task_id=message.task_id,
@@ -193,6 +237,18 @@ def with_task_termination_facts(
         open_items.append(item)
         by_id[item.id] = item
     return replace(candidate, open_items=tuple(open_items))
+
+
+def is_trusted_task_termination(message: Message) -> bool:
+    """仅识别 Runner 生成的精确终止种类和固定文案。"""
+
+    return bool(
+        message.role == "user"
+        and message.kind == TASK_TERMINATION_KIND
+        and message.content in _TASK_TERMINATION_FACTS
+        and not message.tool_calls
+        and message.tool_call_id is None
+    )
 
 
 def memory_to_json(memory: ConversationMemory) -> str:

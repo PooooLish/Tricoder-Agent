@@ -9,6 +9,8 @@ from typing import Any
 from tricoder.context import assign_message_sequences, conversation_memory_message
 from tricoder.context.history import complete_round_tail
 from tricoder.context.memory import ConversationMemory
+from tricoder.engine.progress import ProgressDecision, ProgressGuard
+from tricoder.engine.validation import TaskValidationTracker
 from tricoder.models import Message, SessionContext, TokenUsage, ToolResult
 
 
@@ -22,6 +24,9 @@ class ToolBatchStop(str, Enum):
     FATAL = "fatal"
     AUDIT_FAILED = "audit_failed"
     UNKNOWN_EFFECTS = "unknown_effects"
+    CLARIFIED = "clarified"
+    NEEDS_INPUT = "needs_input"
+    PROGRESS_STOP = "progress_stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +35,8 @@ class ToolBatchOutcome:
 
     stop: ToolBatchStop
     result: ToolResult | None = None
+    feedback: tuple[str, ...] = ()
+    progress: ProgressDecision | None = None
 
 
 @dataclass(slots=True)
@@ -49,6 +56,7 @@ class AgentRunState:
     review_memory_candidate: ConversationMemory | None
     latest_completed_task_seq: int
     native_missing_tool_responses: int = 0
+    clarification_requests: int = 0
     modified_files: list[str] = field(default_factory=list)
     modified_directories: list[str] = field(default_factory=list)
     verification: str = "未运行"
@@ -65,6 +73,14 @@ class AgentRunState:
     memory_summary_failed: bool = False
     memory_compacted: bool = False
     memory_warning: str = ""
+    validation: TaskValidationTracker = field(init=False)
+    progress: ProgressGuard = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not self.current_task_id:
+            raise ValueError("当前任务缺少 task_id")
+        self.validation = TaskValidationTracker(self.current_task_id)
+        self.progress = ProgressGuard()
 
     @classmethod
     def start(

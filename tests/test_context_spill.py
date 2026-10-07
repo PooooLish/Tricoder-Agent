@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 import stat
 import tempfile
@@ -234,6 +235,54 @@ class ToolRegistrySpillTests(unittest.TestCase):
         self.assertEqual("hello", result.output)
         self.assertIsNone(result.spill_reference)
 
+    def test_progress_digest_uses_full_body_before_spill(self) -> None:
+        """相同头尾和长度但中段不同，仍必须产生不同的宿主摘要。"""
+
+        first_body = "A" * 4_096 + "first" + "B" * 4_096
+        second_body = "A" * 4_096 + "other" + "B" * 4_096
+        (self.workspace / "large.txt").write_text(first_body, encoding="utf-8")
+        first = self.registry.execute(
+            "read_file", {"path": "large.txt"}, call_id="call-first"
+        )
+        (self.workspace / "large.txt").write_text(second_body, encoding="utf-8")
+        second = self.registry.execute(
+            "read_file", {"path": "large.txt"}, call_id="call-second"
+        )
+        third = self.registry.execute(
+            "read_file", {"path": "large.txt"}, call_id="call-third"
+        )
+
+        self.assertNotEqual(first.spill_reference, second.spill_reference)
+        self.assertNotEqual(first.progress_output_digest, second.progress_output_digest)
+        self.assertEqual(second.progress_output_digest, third.progress_output_digest)
+        self.assertEqual(
+            hashlib.sha256(second_body.encode("utf-8")).hexdigest(),
+            second.progress_output_digest,
+        )
+
+    def test_registry_overwrites_extension_progress_digest_claim(self) -> None:
+        class ForgedDigestTool(ToolHandler):
+            name = "forged_progress_digest"
+            description = "controlled extension output"
+            parameters = ToolHandler._schema({}, [])
+
+            def run(self, arguments):
+                return ToolResult(
+                    True,
+                    "trusted only after host hashing",
+                    progress_output_digest="0" * 64,
+                )
+
+        tool = ForgedDigestTool(self.registry.context)
+        self.registry.register(tool, origin=ToolOrigin("mcp", "probe", "read"))
+
+        result = self.registry.execute("forged_progress_digest", {})
+
+        self.assertEqual(
+            hashlib.sha256(result.output.encode("utf-8")).hexdigest(),
+            result.progress_output_digest,
+        )
+
     def test_missing_or_failed_spill_store_enforces_strict_inline_limit(self) -> None:
         """无 store 和落盘失败都必须将截断标记算入总上限，不能返回原始大结果。"""
         class LargeTool(ToolHandler):
@@ -261,6 +310,10 @@ class ToolRegistrySpillTests(unittest.TestCase):
                         self.assertLessEqual(len(result.output), limit)
                         self.assertNotEqual("X" * 200, result.output)
                         self.assertIsNone(result.spill_reference)
+                        self.assertEqual(
+                            hashlib.sha256(("X" * 200).encode("utf-8")).hexdigest(),
+                            result.progress_output_digest,
+                        )
 
     def test_agent_audit_records_only_spill_metadata(self) -> None:
         """审计应包含引用、大小和哈希，但不能包含正文或本机绝对路径。"""

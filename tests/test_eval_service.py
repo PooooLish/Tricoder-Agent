@@ -346,7 +346,9 @@ class EvalServiceTests(unittest.TestCase):
             'allowed_changes = ["app.py"]\nrequired_changes = ["app.py"]\n'
             # 命令白名单说明属于生产请求固定前缀；为本用例保留两轮各一次
             # 摘要的原验证目标，预算需覆盖扩充后的固定前缀，而不是误测第三次压缩。
-            'max_rounds = 4\nmax_context_chars = 5200\n'
+            # ask_user 的完整定义使固定工具前缀增加约 401 字符；按 0.80
+            # trigger_ratio 保留原测试的有效余量，避免误测额外 compaction。
+            'max_rounds = 4\nmax_context_chars = 5700\n'
             'category = "memory"\nsplit = "dev"\nexecution_kind = "quality"\n'
             'scorers = ["hidden_verifier"]\nfaults = ["none"]\n'
             'dimensions = ["artifact_correct", "agent_completed"]\n\n'

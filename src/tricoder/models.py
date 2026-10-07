@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError
 
 if TYPE_CHECKING:
+    from tricoder.core.clarification import ClarificationResult
+    from tricoder.core.validation import CommandCheckRecord, TaskValidationReport
     from tricoder.workspace.verification import VerificationEvidence, WorkspaceSnapshot
 
 
@@ -321,6 +323,13 @@ class ToolResult:
     file_effects: FileEffects | None = None
     error: ToolError | None = None
     verification_evidence: VerificationEvidence | None = None
+    # 由本地命令执行器签发的任务级检查事实；它不等同于文件状态验证证据。
+    command_check: CommandCheckRecord | None = None
+    # 仅本地 ask_user 处理器可签发；回答只是信息，不携带审批能力。
+    clarification: ClarificationResult | None = None
+    # 工具注册表在截断或 spill 前对完整正文生成；仅用于进展检测，不持久化正文。
+    # 扩展自报值会被宿主覆盖，Runner 不应从展示引用反推内容身份。
+    progress_output_digest: str | None = None
 
 
 def tool_failure(
@@ -375,6 +384,10 @@ class RunResult:
     unknown_effects: bool = False
     cleanup_failed: bool = False
     modified_directories: tuple[str, ...] = ()
+    # 追加默认值以保持既有位置参数和调用方兼容。
+    task_validation: TaskValidationReport = field(
+        default_factory=lambda: _empty_task_validation_report()
+    )
 
     def __post_init__(self) -> None:
         if self.cleanup_failed:
@@ -436,6 +449,14 @@ def _empty_conversation_memory() -> Any:
     from tricoder.context.memory import ConversationMemory
 
     return ConversationMemory()
+
+
+def _empty_task_validation_report() -> Any:
+    """延迟创建验证报告，避免 core.events 与共享 models 循环导入。"""
+
+    from tricoder.core.validation import TaskValidationReport
+
+    return TaskValidationReport()
 
 
 @dataclass(frozen=True, slots=True)

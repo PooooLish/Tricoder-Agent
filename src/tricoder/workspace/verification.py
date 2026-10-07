@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+from tricoder.core.validation import CommandCheckRecord
 from tricoder.policy import WorkspacePolicy, is_sensitive_workspace_path
 from tricoder.workspace.lock import CONTROL_DIRECTORY
 
@@ -33,6 +34,9 @@ class WorkspaceSnapshot:
     complete: bool
     # 只公开覆盖限制类别，不泄漏路径、源码或逐文件 hash。
     limitations: tuple[str, ...] = ()
+    # ProgressGuard 只比较路径、类型、大小和正文，不比较权限、inode 等对象身份；
+    # 完整性仍由同一次受覆盖扫描保证，不能替代上面的验证 digest。
+    content_digest: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,10 +79,18 @@ class VerificationScope:
     # 较宽协作预算。文件数与字节数硬上限保持不变。
     scan_timeout: float = field(default=10.0, repr=False)
     _authority: object = field(default_factory=object, repr=False)
+    _check_authority: object = field(default_factory=object, repr=False)
     unknown_effects: bool = False
 
-    def begin_task(self) -> None:
-        self.task_id = secrets.token_hex(16)
+    def begin_task(self, task_id: str | None = None) -> None:
+        """轮换任务身份；Runner 可绑定自己的宿主 task_id。"""
+
+        if task_id is not None and (not isinstance(task_id, str) or not task_id):
+            raise ValueError("task_id 必须为非空字符串")
+        self.task_id = task_id or secrets.token_hex(16)
+        # 消息 task_id 是历史标签，可能在新 Context 中从 task-1 重新编号；
+        # 命令检查另用每次任务轮换的不可伪造令牌，不能只依赖该标签。
+        self._check_authority = object()
 
     def revoke(self) -> None:
         self._authority = object()
@@ -97,6 +109,51 @@ class VerificationScope:
 
     def owns(self, evidence: VerificationEvidence | None) -> bool:
         return type(evidence) is VerificationEvidence and evidence._authority is self._authority
+
+    def issue_command_check(
+        self,
+        *,
+        argv: tuple[str, ...],
+        cwd: str,
+        kind: str,
+        returncode: int | None,
+        output_summary: str,
+        execution_complete: bool,
+        workspace_stable: bool,
+        targets: tuple[str, ...] = (),
+        snapshot_id: str | None = None,
+        limitations: tuple[str, ...] = (),
+        diagnostics: tuple[str, ...] = (),
+        output_truncated: bool = False,
+    ) -> CommandCheckRecord:
+        """签发仅当前 scope/任务可接受的命令检查记录。"""
+
+        return CommandCheckRecord(
+            task_id=self.task_id,
+            check_id=secrets.token_hex(16),
+            argv=argv,
+            cwd=cwd,
+            kind=kind,
+            returncode=returncode,
+            output_summary=output_summary,
+            execution_complete=execution_complete,
+            workspace_stable=workspace_stable,
+            targets=targets,
+            snapshot_id=snapshot_id,
+            limitations=limitations,
+            diagnostics=diagnostics,
+            output_truncated=output_truncated,
+            _authority=self._check_authority,
+        )
+
+    def owns_check(self, record: CommandCheckRecord | None) -> bool:
+        """只认可此 scope 当前 authority 签发的精确记录类型。"""
+
+        return (
+            type(record) is CommandCheckRecord
+            and record._authority is self._check_authority
+            and record.task_id == self.task_id
+        )
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
@@ -229,6 +286,7 @@ def capture_workspace(
         ensure_ascii=True, separators=(",", ":"),
     ).encode()).hexdigest()
     digest = hashlib.sha256()
+    content_digest = hashlib.sha256()
     limitations: set[str] = set()
     started = time.monotonic()
 
@@ -302,9 +360,18 @@ def capture_workspace(
             if stat.S_ISDIR(expected[0]):
                 # 跨快照忽略目录时间/大小，缓存新增不改变受覆盖文件版本。
                 digest.update(json.dumps([relative, expected[:3]], separators=(",", ":")).encode())
+                content_digest.update(
+                    json.dumps([relative, "directory"], separators=(",", ":")).encode()
+                )
                 continue
             path = root / relative
             digest.update(json.dumps([relative, expected], separators=(",", ":")).encode())
+            content_digest.update(
+                json.dumps(
+                    [relative, "file", expected[3]],
+                    separators=(",", ":"),
+                ).encode()
+            )
             with _bound_directory(root, path.parent) as descriptor:
                 with _open_binary(path, dir_fd=descriptor) as source:
                     actual = os.fstat(source.fileno())
@@ -325,6 +392,7 @@ def capture_workspace(
                     if size != expected[3] or _metadata(os.fstat(source.fileno())) != expected:
                         raise _IncompleteScan("race")
                     digest.update(content.digest())
+                    content_digest.update(content.digest())
         if before != inventory():
             raise _IncompleteScan("race")
         check_budget()
@@ -332,4 +400,10 @@ def capture_workspace(
         limitations.add(str(exc))
     except (OSError, ValueError, OverflowError, RecursionError):
         limitations.add("unreadable-or-identity")
-    return WorkspaceSnapshot(scope, digest.hexdigest(), not limitations, tuple(sorted(limitations)))
+    return WorkspaceSnapshot(
+        scope,
+        digest.hexdigest(),
+        not limitations,
+        tuple(sorted(limitations)),
+        content_digest.hexdigest(),
+    )

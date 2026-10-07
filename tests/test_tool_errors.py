@@ -99,7 +99,7 @@ class ToolErrorTests(unittest.TestCase):
 
     def test_real_command_nonzero_timeout_and_output_limit(self):
         self.context.approver = lambda *_: True
-        cases = [("raise SystemExit(7)", 5, 2000, "execution_failed", "stop_task"),
+        cases = [("raise SystemExit(7)", 5, 2000, "execution_failed", "replan"),
                  ("import time; time.sleep(2)", .05, 2000, "timeout", "stop_task"),
                  ("print('x' * 20000)", 5, 100, "output_limit", "stop_task")]
         for source, timeout, limit, code, recovery in cases:
@@ -440,7 +440,8 @@ class ToolErrorTests(unittest.TestCase):
         self.context.approver = lambda *_: True
         (self.root / "probe.py").write_text("print('fixture diagnostic'); raise SystemExit(7)", encoding="utf-8")
         result = self.registry.execute("run_command", {"command": "python probe.py"})
-        self.check_error(result, "execution_failed", "stop_task")
+        self.check_error(result, "execution_failed", "replan")
+        self.assertEqual(state.EffectState.NONE, result.file_effects.state)
         for protocol in (NativeToolProtocol(), LegacyJsonProtocol()):
             message = protocol.tool_result_message(ToolAction("run_command", {}, "fixture"), result, "c1")
             self.assertIn("fixture diagnostic", message.content)

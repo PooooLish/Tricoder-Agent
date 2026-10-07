@@ -10,6 +10,23 @@ Agent 的稳定入口仍是 `tricoder.agent.CodingAgent`。单任务编排位于
 - `tricoder.session`：Session 独占、SQLite 存储和 `SessionRuntime`；
 - `tricoder.presentation`：斜杠命令、审批等待、Rich 终端、Shell 和 Textual TUI。
 
+任务验证的不可变事实类型位于 `tricoder.core.validation`，单任务聚合与时效规则位于
+`tricoder.engine.validation`。前者不依赖 engine、tools 或界面；后者不执行命令，
+只接收经过本地 `VerificationScope` authority 核验的记录。旧的
+`workspace.verification.VerificationEvidence` 仍只证明受覆盖文件状态，不能替代
+任务目标覆盖结论。
+
+需求澄清的不可变请求/结果契约位于 `tricoder.core.clarification`，内置
+`tools.clarification.AskUserTool` 只负责有界参数、取消令牌和等待前后工作区观察；
+Console/TUI 的一次性输入协调位于 `presentation.clarification_wait`。澄清回答与
+审批原语分离，engine 只根据受信 ToolResult 决定“下一轮重新请求”或“未完成停止”。
+
+单任务失败与无进展收敛位于 `tricoder.engine.progress`。该模块只接收宿主生成的
+规范化指纹和完整快照标志，不持有 Provider、工具、Session 或工作区锁；
+`engine.tool_batch` 在工具结果与审计提交后产生观察，`engine.loop` 负责固定反馈、
+可信失败终止标记和统一收尾。用于进展比较的内容摘要不能替代
+`workspace.verification` 的验证 digest 或证据 authority。
+
 四个包的 `__init__.py` 只说明职责，不批量导入子模块。需要存储时直接导入
 `tricoder.session.store`，需要 TUI 时才导入 `tricoder.presentation.tui`。
 

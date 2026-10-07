@@ -90,6 +90,7 @@ class TaskFinalizer:
                 unknown_effects=state.unknown_effects,
                 verification=state.verification,
                 cleanup_failed=cleanup_bad,
+                task_validation=state.validation.report(),
             ),
             SessionContext(
                 messages=(

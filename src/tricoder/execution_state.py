@@ -18,6 +18,7 @@ class ErrorCode(str, Enum):
     CLEANUP_FAILED = "cleanup_failed"
     INVALID_RESULT = "invalid_result"
     SKIPPED = "skipped"
+    NEEDS_INPUT = "needs_input"
 
 
 class RecoveryAction(str, Enum):

@@ -1985,8 +1985,11 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
-        self.assertTrue(result.unknown_effects)
-        self.assertIn("文件影响未确认", result.summary)
+        self.assertFalse(result.unknown_effects)
+        self.assertEqual("待验证", result.verification)
+        self.assertIn("尚未运行验证命令", result.summary)
+        self.assertEqual("observed", result.task_validation.status)
+        self.assertEqual("script", result.task_validation.records[-1].kind)
 
     def test_unrelated_success_does_not_override_failed_verification(self) -> None:
         """验证失败后，无关的成功命令不得把状态覆盖为通过。"""
@@ -2008,8 +2011,10 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
-        self.assertTrue(result.unknown_effects)
-        self.assertEqual("待验证", result.verification)
+        self.assertFalse(result.unknown_effects)
+        self.assertEqual("失败", result.verification)
+        self.assertIn("验证失败", result.summary)
+        self.assertEqual("failed", result.task_validation.status)
 
     def test_successful_verification_does_not_override_prior_failure(self) -> None:
         """同一修改版本内，后续成功的验证命令也不能掩盖先前失败。"""

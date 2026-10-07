@@ -7,7 +7,9 @@ Agent 循环在后台线程运行，UI 事件通过 Textual 线程安全机制�
 
 from __future__ import annotations
 
+import inspect
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -39,7 +41,13 @@ from tricoder.presentation.commands import (
 from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 from tricoder.presentation.approval_wait import ApprovalWait
+from tricoder.presentation.clarification_wait import ClarificationWait
 from tricoder.core.cancellation import CancellationToken
+from tricoder.core.clarification import (
+    ClarificationRequest,
+    ClarificationResult,
+    ClarificationStatus,
+)
 from tricoder.session.runtime import SessionInUseError, SessionRuntime, SessionRuntimeError
 
 
@@ -54,6 +62,15 @@ def _format_token_usage(usage: TokenUsage) -> str:
         f"缓存 {count(usage.cached_tokens)} ({ratio_text}) · "
         f"输出 {count(usage.output_tokens)}"
     )
+
+
+def _validation_status(status: str) -> str:
+    return {
+        "unverified": "未运行检查",
+        "observed": "已记录检查事实",
+        "failed": "存在未解决失败",
+        "stale": "检查后代码已变化",
+    }.get(status, status)
 
 
 def _p(value: object) -> Text:
@@ -193,6 +210,67 @@ class TextInputScreen(ModalScreen[str]):
         self.dismiss(None)
 
 
+class ClarificationScreen(ModalScreen[ClarificationResult]):
+    """需求澄清模态框；选项仅供参考，始终允许自由文本。"""
+
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def __init__(self, request: ClarificationRequest, timeout: float) -> None:
+        super().__init__()
+        self.request = request
+        self.timeout = timeout
+        self._deadline = time.monotonic() + timeout
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text(self.request.question), classes="clarification-question")
+        if self.request.options:
+            options = "\n".join(
+                f"{index}. {option}"
+                for index, option in enumerate(self.request.options, start=1)
+            )
+            yield Static(Text(options), classes="clarification-options")
+        yield Static(
+            "等待回答；当前 Session 与工作区仍被本任务锁定",
+            classes="clarification-lock",
+        )
+        yield Static("", id="clarification-time")
+        yield Input(
+            id="clarification-input",
+            placeholder="输入选项内容或自由文本",
+            max_length=4000,
+        )
+        yield Static("", id="clarification-error")
+        yield Static("Enter 提交 · Esc 取消", classes="approval-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#clarification-input", Input).focus()
+        self._update_remaining()
+        self.set_interval(1.0, self._update_remaining)
+
+    def _update_remaining(self) -> None:
+        remaining = max(0, int(self._deadline - time.monotonic() + 0.999))
+        self.query_one("#clarification-time", Static).update(
+            Text(f"剩余等待时间：{remaining} 秒", style="dim")
+        )
+        if remaining <= 0:
+            self.dismiss(ClarificationResult.timed_out())
+
+    @on(Input.Submitted, "#clarification-input")
+    def _clarification_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        try:
+            result = ClarificationResult.answered(event.value or "")
+        except ValueError:
+            self.query_one("#clarification-error", Static).update(
+                Text("回答不能为空，且最多 4000 字符。", style="yellow")
+            )
+            return
+        self.dismiss(result)
+
+    def action_cancel(self) -> None:
+        self.dismiss(ClarificationResult.cancelled())
+
+
 class TuiObserver(AgentObserver):
     """把后台线程中的 Agent 事件转发到 UI 线程。"""
 
@@ -300,6 +378,18 @@ class TricoderApp(App[None]):
         max-width: 110;
         height: 80%;
     }
+    ClarificationScreen {
+        align: center middle;
+        background: $surface;
+        border: round $primary;
+        padding: 1 2;
+        width: 80%;
+        max-width: 110;
+        height: auto;
+    }
+    .clarification-question, .clarification-options, .clarification-lock {
+        margin: 0 0 1 0;
+    }
     .approval-scroll {
         margin: 1 0;
         height: 1fr;
@@ -314,7 +404,7 @@ class TricoderApp(App[None]):
 
     def __init__(
         self,
-        runtime_factory: Callable[[AgentObserver, Callable[[str, str], bool]], SessionRuntime],
+        runtime_factory: Callable[..., SessionRuntime],
     ) -> None:
         super().__init__()
         self._runtime_factory = runtime_factory
@@ -327,6 +417,9 @@ class TricoderApp(App[None]):
         self._approval_lock = threading.Lock()
         self._pending_approvals: set[ApprovalWait] = set()
         self._approvals_closed = False
+        self._clarification_lock = threading.Lock()
+        self._pending_clarifications: set[ClarificationWait] = set()
+        self._clarifications_closed = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -343,7 +436,21 @@ class TricoderApp(App[None]):
 
     def on_mount(self) -> None:
         try:
-            self.runtime = self._runtime_factory(TuiObserver(self), self._approver)
+            parameters = tuple(
+                inspect.signature(self._runtime_factory).parameters.values()
+            )
+            supports_clarifier = any(
+                parameter.kind
+                in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+                for parameter in parameters
+            ) or len(parameters) >= 3
+            if supports_clarifier:
+                self.runtime = self._runtime_factory(
+                    TuiObserver(self), self._approver, self._clarifier
+                )
+            else:
+                # 保留已有嵌入式两参数工厂；它们没有 ask_user 宿主能力。
+                self.runtime = self._runtime_factory(TuiObserver(self), self._approver)
         except SessionInUseError as exc:
             self.log_line(Text(str(exc), style="bold red"))
             self.exit(2)
@@ -564,7 +671,40 @@ class TricoderApp(App[None]):
         lines = [
             status_text,
             Text.assemble(("", "dim"), _p(result.summary)),
+            Text(
+                f"任务验证 {_validation_status(result.task_validation.status)}"
+                " · 需求覆盖未自动确认",
+                style="dim",
+            ),
         ]
+        for record in result.task_validation.records:
+            exit_code = "未知" if record.returncode is None else str(record.returncode)
+            targets = "、".join(record.targets) if record.targets else "未识别"
+            lines.append(
+                Text(
+                    f"[{record.kind}] {' '.join(record.argv)} · cwd={record.cwd} · "
+                    f"exit={exit_code} · 目标={targets}",
+                    style="dim",
+                )
+            )
+            output = record.output_summary.replace("\r", "").strip()
+            if len(output) > 300:
+                output = output[:300] + "…"
+            if record.output_truncated:
+                output = f"{output}\n[输出已截断]".strip()
+            if record.spill_reference:
+                output = (
+                    f"{output}\n完整输出引用：{record.spill_reference}"
+                ).strip()
+            if output:
+                lines.append(Text(f"输出摘要：{output}", style="dim"))
+        if len(result.task_validation.limitations) > 1:
+            lines.append(
+                Text(
+                    "验证限制：" + "；".join(result.task_validation.limitations[1:]),
+                    style="dim",
+                )
+            )
         if result.usage is not None:
             lines.append(f"[dim]累计用量 · {_format_token_usage(result.usage)}[/dim]")
         for line in lines:
@@ -620,8 +760,89 @@ class TricoderApp(App[None]):
         for approval in pending:
             approval.close()
 
+    def _clarifier(
+        self,
+        request: ClarificationRequest,
+        cancellation: CancellationToken,
+        timeout: float,
+    ) -> ClarificationResult:
+        """后台任务线程调用；UI 线程只负责模态输入，不执行 Agent。"""
+
+        pending = ClarificationWait()
+        with self._clarification_lock:
+            if self._clarifications_closed:
+                return ClarificationResult.unavailable("ui_closed")
+            self._pending_clarifications.add(pending)
+
+        def request_screen() -> None:
+            async def ask() -> None:
+                try:
+                    result = await self.push_screen_wait(
+                        ClarificationScreen(request, timeout)
+                    )
+                    if type(result) is not ClarificationResult:
+                        pending.unavailable("ui_closed")
+                    elif result.status is ClarificationStatus.ANSWERED:
+                        pending.answer(result.answer or "")
+                    elif result.status is ClarificationStatus.TIMED_OUT:
+                        pending.timed_out()
+                    elif result.status is ClarificationStatus.CANCELLED:
+                        pending.cancel()
+                    else:
+                        pending.unavailable(result.reason or "ui_closed")
+                except Exception:
+                    pending.unavailable("host_failed")
+                finally:
+                    pending.unavailable("ui_closed")
+
+            try:
+                self.run_worker(ask, thread=False, name="clarification-wait")
+            except Exception:
+                pending.unavailable("host_failed")
+
+        try:
+            try:
+                self.call_from_thread(request_screen)
+            except Exception:
+                pending.unavailable("host_failed")
+            return pending.wait(cancellation, timeout=timeout)
+        finally:
+            pending.unavailable("ui_closed")
+            with self._clarification_lock:
+                self._pending_clarifications.discard(pending)
+            try:
+                self.call_from_thread(self._dismiss_clarification, request.request_id)
+            except Exception:
+                pass
+
+    def _dismiss_clarification(self, request_id: str) -> None:
+        try:
+            screen = self.screen
+        except Exception:
+            return
+        if (
+            isinstance(screen, ClarificationScreen)
+            and screen.request.request_id == request_id
+        ):
+            screen.dismiss(ClarificationResult.cancelled())
+
+    def _close_clarifications(self, *, permanent: bool = True) -> None:
+        with self._clarification_lock:
+            if permanent:
+                self._clarifications_closed = True
+            pending = tuple(self._pending_clarifications)
+            self._pending_clarifications.clear()
+        for clarification in pending:
+            clarification.cancel()
+        try:
+            if isinstance(self.screen, ClarificationScreen):
+                self.screen.dismiss(ClarificationResult.cancelled())
+        except Exception:
+            pass
+
     def on_unmount(self) -> None:
         self._close_approvals()
+        self._close_clarifications()
         if self.runtime is not None:
             active = self.runtime.request_shutdown()
             self.runtime.cancel_current()
@@ -1085,12 +1306,17 @@ class TricoderApp(App[None]):
 
     def action_cancel(self) -> None:
         if self.runtime is not None and self.runtime.cancel_current():
+            self._close_clarifications(permanent=False)
             self.log_line(Text("正在取消当前任务……", style="yellow"))
             return
         self.query_one(Input).value = ""
 
     def action_quit(self) -> None:
         self._close_approvals()
+        # 兼容只实现旧退出协议的嵌入宿主；完整 TUI 会关闭所有等待中的澄清。
+        close_clarifications = getattr(self, "_close_clarifications", None)
+        if callable(close_clarifications):
+            close_clarifications()
         code = 1
         if self.runtime is not None:
             active = self.runtime.request_shutdown()

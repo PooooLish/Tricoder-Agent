@@ -22,7 +22,12 @@ _FREE_TEXT_KEYS = {
     "reason",
     "summary",
 }
-_SAFE_REASON_CODES = {"native_missing_tool_call"}
+_SAFE_REASON_CODES = {
+    "native_missing_tool_call",
+    "repeated_failure",
+    "repeated_observation",
+    "repair_oscillation",
+}
 
 
 class AuditError(OSError):

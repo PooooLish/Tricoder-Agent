@@ -29,6 +29,7 @@ from tricoder.task_observation import apply_tool_transition
 from tricoder.tools import ToolContext, ToolRegistry
 from tricoder.tools import command as command_module
 from tricoder.tools.handlers import ToolHandler
+from tricoder.workspace.verification import VerificationScope
 
 
 class CommandCompatibilityPolicyTests(unittest.TestCase):
@@ -374,6 +375,189 @@ class InformationCommandEffectTests(unittest.TestCase):
         self.assertFalse(turn.result.ok)
         self.assertTrue(turn.context.verification_required)
         self.assertIsNone(turn.context.verification_evidence)
+
+
+class PlainScriptEffectObservationTests(unittest.TestCase):
+    """普通脚本要观察文件状态，但不能冒充测试或静态检查。"""
+
+    class _CountingScope(VerificationScope):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capture_count = 0
+
+        def capture(self, policy):
+            self.capture_count += 1
+            return super().capture(policy)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = Path(self.temporary.name)
+        self.scope = self._CountingScope()
+        self.registry = ToolRegistry(
+            ToolContext(
+                WorkspacePolicy(self.workspace),
+                CommandPolicy(self.workspace),
+                lambda *_: True,
+                verification_scope=self.scope,
+            )
+        )
+
+    def _write_script(self, name: str, source: str) -> None:
+        (self.workspace / name).write_text(source, encoding="utf-8")
+
+    def test_plain_script_stable_workspace_does_not_create_unknown(self) -> None:
+        """若普通命令仍不采集快照，稳定 Hello 脚本会被错误标记为 UNKNOWN。"""
+
+        self._write_script("hello.py", "print('Hello from TriCoder')\n")
+
+        result = self.registry.execute(
+            "run_command",
+            {"command": "python hello.py"},
+        )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("Hello from TriCoder", result.output)
+        self.assertEqual(2, self.scope.capture_count)
+        self.assertEqual(EffectState.NONE, result.file_effects.state)
+        self.assertFalse(self.scope.unknown_effects)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_nonzero_exit_keeps_stable_effects_replannable(self) -> None:
+        """非零退出是执行失败，不应在稳定工作区上伪造 UNKNOWN。"""
+
+        self._write_script("fail.py", "raise SystemExit(3)\n")
+
+        result = self.registry.execute(
+            "run_command",
+            {"command": "python fail.py"},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(ErrorCode.EXECUTION_FAILED, result.error.code)
+        self.assertEqual(RecoveryAction.REPLAN, result.error.recovery)
+        self.assertEqual(EffectState.NONE, result.file_effects.state)
+        self.assertEqual(2, self.scope.capture_count)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_write_remains_unknown(self) -> None:
+        """若脚本改变受覆盖文件，退出码 0 也不能解除 UNKNOWN。"""
+
+        self._write_script(
+            "mutate.py",
+            "from pathlib import Path\nPath('generated.py').write_text('changed\\n')\n",
+        )
+
+        result = self.registry.execute(
+            "run_command",
+            {"command": "python mutate.py"},
+        )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
+        self.assertTrue(self.scope.unknown_effects)
+        self.assertEqual(2, self.scope.capture_count)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_pre_scan_failure_never_starts_process(self) -> None:
+        """执行前观察失败必须在进程交付之前停止，不能先运行再猜测。"""
+
+        self._write_script("hello.py", "print('Hello')\n")
+        with patch.object(
+            self._CountingScope,
+            "capture",
+            side_effect=OSError("synthetic pre-scan failure"),
+        ), patch.object(command_module, "run_bounded_process") as run:
+            result = self.registry.execute(
+                "run_command",
+                {"command": "python hello.py"},
+            )
+
+        run.assert_not_called()
+        self.assertFalse(result.ok)
+        self.assertEqual(ErrorCode.RESULT_UNCERTAIN, result.error.code)
+        self.assertEqual(RecoveryAction.STOP_TASK, result.error.recovery)
+        self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_post_scan_failure_keeps_unknown(self) -> None:
+        """进程已执行后观察失败必须保留 UNKNOWN 并停止。"""
+
+        self._write_script("hello.py", "print('Hello')\n")
+        before = VerificationScope.capture(
+            self.scope,
+            self.registry.context.workspace_policy,
+        )
+        with patch.object(
+            self._CountingScope,
+            "capture",
+            side_effect=(before, OSError("synthetic post-scan failure")),
+        ), patch.object(
+            command_module,
+            "run_bounded_process",
+            return_value=BoundedProcessResult(0, "Hello", ""),
+        ) as run:
+            result = self.registry.execute(
+                "run_command",
+                {"command": "python hello.py"},
+            )
+
+        run.assert_called_once()
+        self.assertFalse(result.ok)
+        self.assertEqual(ErrorCode.RESULT_UNCERTAIN, result.error.code)
+        self.assertEqual(RecoveryAction.STOP_TASK, result.error.recovery)
+        self.assertEqual(EffectState.UNKNOWN, result.file_effects.state)
+        self.assertTrue(self.scope.unknown_effects)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_never_clears_preexisting_unknown(self) -> None:
+        """稳定脚本只能恢复进入命令前的 UNKNOWN，不能洗掉它。"""
+
+        self._write_script("hello.py", "print('Hello')\n")
+        self.scope.unknown_effects = True
+
+        result = self.registry.execute(
+            "run_command",
+            {"command": "python hello.py"},
+        )
+        observed = apply_tool_transition(
+            SessionContext(unknown_effects=True, verification="待验证"),
+            result.file_effects,
+            result.verification_evidence,
+        )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(EffectState.NONE, result.file_effects.state)
+        self.assertTrue(self.scope.unknown_effects)
+        self.assertTrue(observed.unknown_effects)
+        self.assertEqual("待验证", observed.verification)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
+
+    def test_plain_script_async_path_matches_sync_observation(self) -> None:
+        """规范异步入口不能绕过普通脚本的前后观察。"""
+
+        self._write_script("hello.py", "print('Hello async')\n")
+
+        result = asyncio.run(
+            self.registry.execute_async(
+                "run_command",
+                {"command": "python hello.py"},
+            )
+        )
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("Hello async", result.output)
+        self.assertEqual(2, self.scope.capture_count)
+        self.assertEqual(EffectState.NONE, result.file_effects.state)
+        self.assertFalse(self.scope.unknown_effects)
+        self.assertIsNone(result.verification_passed)
+        self.assertIsNone(result.verification_evidence)
 
 
 class CommandFormRecoveryTests(unittest.TestCase):
