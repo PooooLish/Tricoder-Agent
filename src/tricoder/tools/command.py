@@ -120,6 +120,36 @@ def _check_kind_and_targets(
     return "other", ()
 
 
+def _check_scope_is_filtered(args: list[str], kind: str) -> bool:
+    """识别会缩小检查范围的已允许选项；只影响验证能力，不改变执行事实。"""
+
+    if kind not in {"tests", "syntax", "static"} or len(args) < 3:
+        return False
+    module = args[2].lower()
+    scoped_options = {
+        "unittest": {"-k", "-p", "--pattern"},
+        "pytest": {
+            "-k", "-m", "--ignore", "--deselect", "--ignore-glob",
+            "--lf", "--last-failed", "--ff", "--failed-first",
+            "--collect-only", "--co",
+        },
+        "compileall": {"-l", "-r", "-x"},
+        "ruff": {"--per-file-ignores"},
+        "mypy": {"--exclude"},
+    }.get(module, set())
+    for token in args[3:]:
+        name = token.partition("=")[0]
+        if name in scoped_options:
+            return True
+        if any(
+            name.startswith(option) and name != option
+            for option in scoped_options
+            if option in {"-k", "-m", "-p"}
+        ):
+            return True
+    return False
+
+
 def _positional_targets(
     tokens: list[str],
     *,
@@ -289,6 +319,7 @@ class RunCommandTool(ToolHandler):
             args,
             information_command=information_command,
         )
+        scope_filtered = _check_scope_is_filtered(args, check_kind)
 
         def command_check(
             *,
@@ -302,6 +333,12 @@ class RunCommandTool(ToolHandler):
             workspace_stable: bool = False,
         ):
             summary, truncated, diagnostics = _command_output_summary(stdout, stderr)
+            if scope_filtered:
+                diagnostics = (*diagnostics, "scope_filtered")
+                limitations = (
+                    *limitations,
+                    "检查使用筛选或排除参数，范围不能证明完整",
+                )
             return scope.issue_command_check(
                 argv=public_argv,
                 cwd=relative_cwd,
@@ -453,12 +490,28 @@ class RunCommandTool(ToolHandler):
             )
         stable = before is not None and after is not None and stable_snapshots(before, after)
         succeeded = completed.returncode == 0
+        _summary, _truncated, diagnostics = _command_output_summary(
+            completed.stdout, completed.stderr
+        )
+        zero_test_result = bool(
+            check_kind == "tests" and "zero_tests_reported" in diagnostics
+        )
+        effective_verification_result = not (zero_test_result or scope_filtered)
         information_stable = information_command and succeeded
         if stable or information_stable:
             scope.unknown_effects = previous_unknown
         evidence = (
-            scope.issue(before, after, completed.returncode == 0)
-            if verification_command and before is not None and after is not None
+            scope.issue(before, after, succeeded and effective_verification_result)
+            if (
+                verification_command
+                and before is not None
+                and after is not None
+                and not (
+                    succeeded
+                    and not effective_verification_result
+                    and stable
+                )
+            )
             else None
         )
         output = (
@@ -485,7 +538,14 @@ class RunCommandTool(ToolHandler):
             succeeded,
             self._bounded(output),
             verification_passed=(
-                succeeded if verification_command else None
+                succeeded and effective_verification_result
+                if verification_command
+                and not (
+                    succeeded
+                    and not effective_verification_result
+                    and stable
+                )
+                else None
             ),
             error=None if succeeded else ToolError(ErrorCode.EXECUTION_FAILED, RecoveryAction.REPLAN),
             file_effects=FileEffects(

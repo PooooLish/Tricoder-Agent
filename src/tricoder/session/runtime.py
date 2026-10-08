@@ -32,6 +32,10 @@ from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.core.clarification import Clarifier
 from tricoder.task_cleanup import TaskCleanup, cleanup_scope, current_cleanup
 from tricoder.core.events import EventSink
+from tricoder.core.validation import (
+    CommandCheckRecord,
+    has_effective_success_result,
+)
 from tricoder.context.manager import ContextManager
 from tricoder.context.spill import SpillError, ToolResultSpillStore
 from tricoder.context.summarizer import (
@@ -68,6 +72,8 @@ from tricoder.session.lock import SessionLock, SessionLockBusyError
 from tricoder.session.store import (
     SessionError,
     SessionStore,
+    StoredWorkspaceBaseline,
+    WorkspaceBaselineStoreError,
     safe_requirement_summary,
     validate_session_name,
 )
@@ -101,10 +107,19 @@ from tricoder.workspace.snapshot import (
     compare_baselines,
     task_changes_match_baselines,
 )
+from tricoder.workspace.baseline_record import (
+    BaselineRecordError,
+    compare_baseline_records,
+    make_baseline_record,
+)
 
 
 class SessionRuntimeError(RuntimeError):
     """会话装配、切换或内存持久化无法安全完成。"""
+
+
+class WorkspaceOperationCancelled(SessionRuntimeError):
+    """用户拒绝工作区候选；这是操作取消，不是 Agent 执行失败。"""
 
 
 class SessionInUseError(SessionRuntimeError):
@@ -221,6 +236,8 @@ class RuntimeStatus:
     modified_directories: int = 0
     verification_obligation: str = "none"
     pending_verification_paths: int = 0
+    workspace_baseline_state: str = "not-selected"
+    workspace_baseline_message: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,11 +352,29 @@ def _persisted_run_summary(result: RunResult, verification: str) -> str:
     return f"run: {outcome}; modified_files={len(result.modified_files)}; verification={verification}"
 
 
-def _check_target_covers_path(target: str, path: str) -> bool:
-    """保守判断宿主检查目标是否覆盖一个待验证相对路径。"""
+def _normalized_check_target(
+    record: CommandCheckRecord,
+    target: str,
+    workspace_policy: WorkspacePolicy,
+) -> str | None:
+    """将检查目标按命令 cwd 解析为工作区相对坐标；无法证明时返回 None。"""
 
-    normalized_target = target.replace("\\", "/").rstrip("/") or "."
-    normalized_path = path.replace("\\", "/").rstrip("/")
+    try:
+        resolved = workspace_policy.resolve_path(
+            Path(record.cwd) / Path(target),
+            must_exist=True,
+        )
+        relative = resolved.relative_to(workspace_policy.workspace)
+    except (OSError, PolicyError, ValueError):
+        return None
+    normalized = os.path.normcase(relative.as_posix()).replace("\\", "/").rstrip("/")
+    return normalized or "."
+
+
+def _check_target_covers_path(normalized_target: str, path: str) -> bool:
+    """保守判断已规范化的宿主检查范围是否覆盖待验证相对路径。"""
+
+    normalized_path = os.path.normcase(path).replace("\\", "/").rstrip("/")
     if normalized_target == ".":
         return True
     return normalized_path == normalized_target or normalized_path.startswith(
@@ -353,24 +388,40 @@ def _merge_verification_obligation(
     result: RunResult,
     *,
     trusted_pass: bool,
+    workspace_policy: WorkspacePolicy | None,
+    verification_scope: VerificationScope | None,
+    current_snapshot_id: str | None,
 ) -> tuple[str, tuple[str, ...]]:
     """将本轮宿主事实原子合并进跨任务义务，不信任模型摘要。"""
 
+    has_legacy_unknown = memory.verification_obligation == "legacy_unknown"
     pending = list(memory.pending_verification_paths)
     for path in (*effects.paths, *effects.directory_paths):
         if path not in pending:
             pending.append(path)
 
     successful_targets: list[str] = []
-    if trusted_pass:
+    if trusted_pass and workspace_policy is not None:
         for record in result.task_validation.records:
             if (
                 record.kind != "information"
-                and record.execution_complete
+                and has_effective_success_result(record)
                 and record.workspace_stable
-                and record.returncode == 0
+                and verification_scope is not None
+                and verification_scope.owns_check(record)
+                and current_snapshot_id is not None
+                and record.snapshot_id == current_snapshot_id
             ):
-                successful_targets.extend(record.targets)
+                successful_targets.extend(
+                    normalized
+                    for target in record.targets
+                    if (
+                        normalized := _normalized_check_target(
+                            record, target, workspace_policy
+                        )
+                    )
+                    is not None
+                )
         if successful_targets:
             pending = [
                 path
@@ -381,13 +432,14 @@ def _merge_verification_obligation(
                 )
             ]
 
-    if pending:
-        return "pending", tuple(pending)
-    if memory.verification_obligation == "legacy_unknown":
+    if has_legacy_unknown:
         # 旧数据只有完整工作区检查才足以消除来源不明状态。
         if trusted_pass and "." in successful_targets:
-            return "none", ()
-        return "legacy_unknown", ()
+            has_legacy_unknown = False
+        else:
+            return "legacy_unknown", tuple(pending)
+    if pending:
+        return "pending", tuple(pending)
     return "none", ()
 
 
@@ -439,6 +491,10 @@ class SessionRuntime:
             limits=workspace_snapshot_limits,
         )
         self._workspace_baselines: dict[str, WorkspaceBaseline] = {}
+        self._stored_workspace_baselines: dict[str, StoredWorkspaceBaseline] = {}
+        self._workspace_baseline_blocked: dict[str, str] = {}
+        self._workspace_baseline_state = "not-selected"
+        self._workspace_baseline_message = ""
         self._baseline_confirmation_required: set[str] = set()
         self._workspace_gate_generation = 0
         self._workspace_baseline_unresolved: set[str] = set()
@@ -503,7 +559,7 @@ class SessionRuntime:
                     self.current = self._build_active(record, memory)
                 self._persisted_memory = self.current.memory
                 self._cache_current()
-                self._baseline_confirmation_required.add(record.id)
+                self._activate_current_workspace_baseline(is_legacy_session=True)
         except BaseException as exc:
             if self._session_lock is not None:
                 self._session_lock.close()
@@ -531,6 +587,186 @@ class SessionRuntime:
             raise SessionInUseError() from exc
         except OSError as exc:
             raise SessionRuntimeError("无法安全锁定目标会话，当前会话未改变") from exc
+
+    def _set_workspace_baseline_status(self, state: str, message: str) -> None:
+        """发布结构化激活状态，交互层无需解析异常中文。"""
+
+        self._workspace_baseline_state = state
+        self._workspace_baseline_message = message
+
+    def _load_stored_workspace_baseline(
+        self,
+        session_id: str,
+        *,
+        refresh: bool = False,
+    ) -> StoredWorkspaceBaseline | None:
+        if not refresh and session_id in self._stored_workspace_baselines:
+            return self._stored_workspace_baselines[session_id]
+        stored = self.store.load_workspace_baseline(session_id)
+        if stored is None:
+            self._stored_workspace_baselines.pop(session_id, None)
+        else:
+            self._stored_workspace_baselines[session_id] = stored
+        return stored
+
+    def _accept_workspace_baseline(
+        self,
+        session_id: str,
+        baseline: WorkspaceBaseline,
+        *,
+        stored: StoredWorkspaceBaseline | None,
+    ) -> None:
+        """先 CAS 持久化变化，再发布运行期基线；相同稳定内容不增 revision。"""
+
+        try:
+            record = make_baseline_record(baseline)
+            needs_save = stored is None
+            if stored is not None:
+                needs_save = compare_baseline_records(stored.record, record).changed
+            if needs_save:
+                stored = self.store.save_workspace_baseline(
+                    session_id,
+                    record,
+                    expected_revision=None if stored is None else stored.revision,
+                )
+        except (BaselineRecordError, WorkspaceBaselineStoreError, SessionError, OSError) as exc:
+            self._workspace_baseline_blocked[session_id] = "storage_error"
+            self._set_workspace_baseline_status(
+                "error",
+                "工作区基线未能安全持久化，当前操作未获放行",
+            )
+            raise SessionRuntimeError("工作区基线持久化失败，当前操作未启动") from exc
+        if stored is None:
+            raise SessionRuntimeError("工作区基线持久化结果无效")
+        self._stored_workspace_baselines[session_id] = stored
+        self._workspace_baselines[session_id] = baseline
+        self._baseline_confirmation_required.discard(session_id)
+        self._workspace_baseline_unresolved.discard(session_id)
+        self._workspace_baseline_blocked.pop(session_id, None)
+
+    def _activate_current_workspace_baseline(
+        self,
+        *,
+        is_legacy_session: bool,
+    ) -> None:
+        """短时持锁扫描当前 Session；失败或拒绝只标记待处理，不丢会话。"""
+
+        active = self._require_active_session()
+        session_id = active.record.id
+        try:
+            ownership = WorkspaceLock.acquire(active.record.workspace)
+        except WorkspaceLockBusyError:
+            self._workspace_baseline_blocked[session_id] = "lock_busy"
+            self._set_workspace_baseline_status(
+                "pending", "工作区正在执行其他任务，基线检查待执行"
+            )
+            return
+        except WorkspaceRecoveryRequiredError:
+            self._workspace_baseline_blocked[session_id] = "recovery_required"
+            self._set_workspace_baseline_status(
+                "error", "检测到未确认清理，工作区基线检查未执行"
+            )
+            return
+        except (WorkspaceIdentityError, WorkspaceLockError, OSError):
+            self._workspace_baseline_blocked[session_id] = "lock_error"
+            self._set_workspace_baseline_status(
+                "error", "无法安全取得工作区锁，基线检查未执行"
+            )
+            return
+        try:
+            try:
+                stored = self._load_stored_workspace_baseline(
+                    session_id,
+                    refresh=True,
+                )
+            except WorkspaceBaselineStoreError as exc:
+                self._workspace_baseline_blocked[session_id] = exc.reason
+                self._set_workspace_baseline_status(
+                    "corrupted", "历史基线不可用，记录已保留且未被覆盖"
+                )
+                return
+            self._workspace_gate_generation += 1
+            try:
+                decision = self._workspace_gate.enter(
+                    active.record.workspace,
+                    baseline=None,
+                    require_initialization_confirmation=False,
+                    persisted_baseline=None if stored is None else stored.record,
+                    session_id=session_id,
+                    request_id=secrets.token_hex(16),
+                    generation=self._workspace_gate_generation,
+                    confirmer=self._workspace_confirmer,
+                    cancellation=None,
+                    change_observer=self._observe_workspace_change,
+                )
+                self._accept_workspace_baseline(
+                    session_id,
+                    decision.baseline,
+                    stored=stored,
+                )
+                if decision.changed and decision.preview is not None:
+                    # ``change_observer`` 已经基于新鲜磁盘状态更新了验证义务。
+                    # 这里必须读取更新后的 current，避免用激活前的 active
+                    # 覆盖 pending / legacy_unknown 等可信宿主状态。只有基线
+                    # 成功持久化后才发布“已确认变化”的下一轮临时通知。
+                    current = self._require_active_session()
+                    if current.record.id != session_id:
+                        raise SessionRuntimeError("工作区基线激活期间会话发生变化")
+                    self.current = self._with_workspace_change_notice(
+                        current,
+                        decision.preview,
+                    )
+                    self._cache_current()
+            except WorkspaceConfirmationUnavailable as exc:
+                self._workspace_baseline_blocked[session_id] = "confirmation_unavailable"
+                self._set_workspace_baseline_status(
+                    "pending",
+                    (
+                        "工作区根身份或扫描范围变化，当前入口无法确认重建"
+                        if exc.kind == "incompatible"
+                        else "工作区存在变化，当前入口无法确认"
+                    ),
+                )
+                return
+            except WorkspaceConfirmationRejected:
+                self._workspace_baseline_blocked[session_id] = "rejected"
+                self._set_workspace_baseline_status(
+                    "rejected", "已取消本次操作，会话保留"
+                )
+                return
+            except WorkspaceScanError as exc:
+                self._workspace_baseline_blocked[session_id] = exc.reason
+                self._set_workspace_baseline_status(
+                    "error", f"工作区扫描失败（{exc.reason}），旧基线未改变"
+                )
+                return
+            except (WorkspaceGateCancelled, WorkspaceGateError):
+                self._workspace_baseline_blocked[session_id] = "gate_error"
+                self._set_workspace_baseline_status(
+                    "error", "工作区基线检查未完成，旧基线未改变"
+                )
+                return
+            except SessionRuntimeError:
+                return
+            if stored is None:
+                self._set_workspace_baseline_status(
+                    "initialized",
+                    (
+                        "已建立当前工作区基线，无法核对此前变化"
+                        if is_legacy_session
+                        else "已建立新会话的当前工作区基线"
+                    ),
+                )
+            elif decision.changed:
+                self._set_workspace_baseline_status(
+                    "accepted", "已确认并保存当前工作区基线"
+                )
+            else:
+                self._set_workspace_baseline_status(
+                    "consistent", "扫描范围内未检测到变化，可以继续任务"
+                )
+        finally:
+            ownership.close()
 
     def _handoff_session(self, candidate: ActiveSession, ownership: SessionLock) -> None:
         """目标装配与旧记忆保存完成后交接；释放前丢弃旧会话缓存。"""
@@ -587,6 +823,7 @@ class SessionRuntime:
             self._workspace_baselines.pop(current.record.id, None)
             self._baseline_confirmation_required.discard(current.record.id)
             self._workspace_baseline_unresolved.discard(current.record.id)
+        self._activate_current_workspace_baseline(is_legacy_session=False)
         return self._require_active_session()
 
     @_idle_runtime_change
@@ -631,7 +868,7 @@ class SessionRuntime:
             self._workspace_baselines.pop(original.record.id, None)
             self._baseline_confirmation_required.discard(original.record.id)
             self._workspace_baseline_unresolved.discard(original.record.id)
-        self._baseline_confirmation_required.add(candidate.record.id)
+        self._activate_current_workspace_baseline(is_legacy_session=True)
         return self._require_active_session()
 
     @_idle_runtime_change
@@ -831,6 +1068,23 @@ class SessionRuntime:
                 if session_before_gate is not None
                 else f"pending:{request_id}"
             )
+            stored_before_gate: StoredWorkspaceBaseline | None = None
+            if session_before_gate is not None:
+                try:
+                    stored_before_gate = self._load_stored_workspace_baseline(
+                        session_before_gate.record.id,
+                        refresh=True,
+                    )
+                except WorkspaceBaselineStoreError as exc:
+                    self._workspace_baseline_blocked[
+                        session_before_gate.record.id
+                    ] = exc.reason
+                    self._set_workspace_baseline_status(
+                        "corrupted", "历史基线不可用，记录已保留且未被覆盖"
+                    )
+                    raise SessionRuntimeError(
+                        "历史基线不可用，任务未启动"
+                    ) from exc
             try:
                 gate = self._workspace_gate.enter(
                     task_workspace,
@@ -840,8 +1094,17 @@ class SessionRuntime:
                         else None
                     ),
                     require_initialization_confirmation=(
-                        session_before_gate is not None
-                        and session_before_gate.record.id in self._baseline_confirmation_required
+                        False
+                    ),
+                    persisted_baseline=(
+                        stored_before_gate.record
+                        if stored_before_gate is not None
+                        and (
+                            session_before_gate is None
+                            or session_before_gate.record.id
+                            not in self._workspace_baselines
+                        )
+                        else None
                     ),
                     session_id=gate_session_id,
                     request_id=request_id,
@@ -853,23 +1116,55 @@ class SessionRuntime:
             except WorkspaceScanError as exc:
                 if exc.reason == "cancelled":
                     return RunResult(False, "任务已取消", 0)
+                if session_before_gate is not None:
+                    self._workspace_baseline_blocked[
+                        session_before_gate.record.id
+                    ] = exc.reason
+                self._set_workspace_baseline_status(
+                    "error", f"工作区扫描失败（{exc.reason}），旧基线未改变"
+                )
                 raise SessionRuntimeError(
                     f"工作区扫描失败（{exc.reason}），任务未启动"
                 ) from exc
             except WorkspaceConfirmationUnavailable as exc:
+                if session_before_gate is not None:
+                    self._workspace_baseline_blocked[
+                        session_before_gate.record.id
+                    ] = "confirmation_unavailable"
+                self._set_workspace_baseline_status(
+                    "pending", "工作区存在变化，当前入口无法确认"
+                )
+                if exc.kind == "incompatible":
+                    raise SessionRuntimeError(
+                        "工作区快照身份或范围发生变化，当前入口无法确认，任务未启动"
+                    ) from exc
                 raise SessionRuntimeError("当前入口无法确认工作区变化，任务未启动") from exc
             except WorkspaceConfirmationRejected as exc:
-                if exc.kind == "initialize":
-                    raise SessionRuntimeError("已拒绝初始化恢复会话的工作区基线") from exc
-                raise SessionRuntimeError("已拒绝工作区变化，任务未启动") from exc
+                if session_before_gate is not None:
+                    self._workspace_baseline_blocked[
+                        session_before_gate.record.id
+                    ] = "rejected"
+                self._set_workspace_baseline_status(
+                    "rejected", "已取消本次操作，会话保留"
+                )
+                raise WorkspaceOperationCancelled(
+                    "已拒绝工作区变化；已取消本次操作，会话保留"
+                ) from exc
             except WorkspaceGateCancelled as exc:
                 return RunResult(False, "任务已取消", 0)
             except WorkspaceGateError as exc:
+                self._set_workspace_baseline_status(
+                    "error", "工作区基线检查未完成，旧基线未改变"
+                )
                 raise SessionRuntimeError(str(exc)) from exc
             active = self._ensure_session_for_task_locked()
-            self._workspace_baselines[active.record.id] = gate.baseline
-            self._baseline_confirmation_required.discard(active.record.id)
-            self._workspace_baseline_unresolved.discard(active.record.id)
+            if session_before_gate is None:
+                stored_before_gate = None
+            self._accept_workspace_baseline(
+                active.record.id,
+                gate.baseline,
+                stored=stored_before_gate,
+            )
             if gate.changed and gate.preview is not None:
                 active = self._with_workspace_change_notice(active, gate.preview)
                 self.current = active
@@ -1036,6 +1331,8 @@ class SessionRuntime:
             self._closed = True
             self._session_cache.clear()
             self._workspace_baselines.clear()
+            self._stored_workspace_baselines.clear()
+            self._workspace_baseline_blocked.clear()
             self._baseline_confirmation_required.clear()
             self._workspace_baseline_unresolved.clear()
             self._pending_undo_binding = None
@@ -1172,6 +1469,7 @@ class SessionRuntime:
 
         if self.current is None:
             return
+        prior_obligation = self.current.memory.verification_obligation
         self._invalidate_current_after_workspace_finish_failure()
         current = self.current
         normalized_paths = tuple(
@@ -1187,16 +1485,21 @@ class SessionRuntime:
                     (*current.memory.pending_verification_paths, *normalized_paths)
                 )
             )
+            obligation = (
+                "legacy_unknown"
+                if prior_obligation == "legacy_unknown"
+                else "pending"
+            )
             self.current = replace(
                 current,
                 memory=replace(
                     current.memory,
-                    verification_obligation="pending",
+                    verification_obligation=obligation,
                     pending_verification_paths=pending,
                 ),
                 context=replace(
                     current.context,
-                    verification_obligation="pending",
+                    verification_obligation=obligation,
                     pending_verification_paths=pending,
                 ),
             )
@@ -1308,8 +1611,8 @@ class SessionRuntime:
                 verification="待验证",
             )
         if not comparison.changed and attributable:
-            self._workspace_baselines[session_id] = current
-            self._workspace_baseline_unresolved.discard(session_id)
+            if not self._advance_workspace_baseline(session_id, current):
+                return self._workspace_baseline_persistence_failure(result)
             self._clear_workspace_change_notice()
             return result
         change_set = self._task_sealed_change_set
@@ -1319,8 +1622,8 @@ class SessionRuntime:
         elif attributable and framework_paths:
             # Provider 失败等无源码效果的任务可以吸收本框架自己的审计追加，
             # 但不能借此接受任何任务文件或未知变化。
-            self._workspace_baselines[session_id] = current
-            self._workspace_baseline_unresolved.discard(session_id)
+            if not self._advance_workspace_baseline(session_id, current):
+                return self._workspace_baseline_persistence_failure(result)
             self._clear_workspace_change_notice()
             return result
         if (
@@ -1330,8 +1633,8 @@ class SessionRuntime:
             and not result.unknown_effects
             and not result.cleanup_failed
         ):
-            self._workspace_baselines[session_id] = current
-            self._workspace_baseline_unresolved.discard(session_id)
+            if not self._advance_workspace_baseline(session_id, current):
+                return self._workspace_baseline_persistence_failure(result)
             self._clear_workspace_change_notice()
             return result
         self._workspace_baseline_unresolved.add(session_id)
@@ -1342,6 +1645,38 @@ class SessionRuntime:
             ok=False,
             summary=f"{result.summary}；收尾发现未归属的工作区变化，需下次任务前确认",
             verification="待验证",
+        )
+
+    def _advance_workspace_baseline(
+        self,
+        session_id: str,
+        baseline: WorkspaceBaseline,
+    ) -> bool:
+        """原子推进跨重启记录与运行期快照；失败时两者都保持旧值。"""
+
+        try:
+            stored = self._load_stored_workspace_baseline(session_id)
+            self._accept_workspace_baseline(
+                session_id,
+                baseline,
+                stored=stored,
+            )
+        except (SessionRuntimeError, SessionError, OSError):
+            self._workspace_baseline_unresolved.add(session_id)
+            return False
+        return True
+
+    def _workspace_baseline_persistence_failure(
+        self,
+        result: RunResult,
+    ) -> RunResult:
+        """将宿主基线落库失败与业务验证事实分开呈现。"""
+
+        self._clear_workspace_change_notice()
+        return replace(
+            result,
+            ok=False,
+            summary=f"{result.summary}；工作区基线持久化失败，旧基线已保留",
         )
 
     @staticmethod
@@ -1407,8 +1742,7 @@ class SessionRuntime:
             except (TypeError, ValueError):
                 framework_only = False
             if framework_only:
-                self._workspace_baselines[session_id] = current
-                self._workspace_baseline_unresolved.discard(session_id)
+                self._advance_workspace_baseline(session_id, current)
                 return
         try:
             changed = baseline is None or compare_baselines(baseline, current).changed
@@ -1601,6 +1935,17 @@ class SessionRuntime:
                 exception_effects,
                 RunResult(False, "任务异常", 0),
                 trusted_pass=False,
+                workspace_policy=(
+                    original.tools.context.workspace_policy
+                    if original.tools is not None
+                    else None
+                ),
+                verification_scope=(
+                    original.tools.context.verification_scope
+                    if original.tools is not None
+                    else None
+                ),
+                current_snapshot_id=None,
             )
             reconciled = replace(
                 reconciled,
@@ -1714,6 +2059,21 @@ class SessionRuntime:
             task_effects,
             result,
             trusted_pass=trusted_pass,
+            workspace_policy=(
+                original.tools.context.workspace_policy
+                if original.tools is not None
+                else None
+            ),
+            verification_scope=(
+                original.tools.context.verification_scope
+                if original.tools is not None
+                else None
+            ),
+            current_snapshot_id=(
+                current_snapshot.digest
+                if current_snapshot is not None and current_snapshot.complete
+                else None
+            ),
         )
         result = replace(
             result,
@@ -1867,11 +2227,24 @@ class SessionRuntime:
             raise SessionRuntimeError("无法安全取得撤销所需的工作区锁") from exc
         self._workspace_gate_generation += 1
         try:
+            try:
+                stored = self._load_stored_workspace_baseline(
+                    active.record.id,
+                    refresh=True,
+                )
+            except WorkspaceBaselineStoreError as exc:
+                raise SessionRuntimeError(
+                    "历史基线不可用，撤销未开始"
+                ) from exc
             gate = self._workspace_gate.enter(
                 active.record.workspace,
                 baseline=self._workspace_baselines.get(active.record.id),
-                require_initialization_confirmation=(
-                    active.record.id in self._baseline_confirmation_required
+                require_initialization_confirmation=False,
+                persisted_baseline=(
+                    stored.record
+                    if stored is not None
+                    and active.record.id not in self._workspace_baselines
+                    else None
                 ),
                 session_id=active.record.id,
                 request_id=secrets.token_hex(16),
@@ -1880,8 +2253,11 @@ class SessionRuntime:
                 cancellation=None,
                 change_observer=self._observe_workspace_change,
             )
-            self._workspace_baselines[active.record.id] = gate.baseline
-            self._baseline_confirmation_required.discard(active.record.id)
+            self._accept_workspace_baseline(
+                active.record.id,
+                gate.baseline,
+                stored=stored,
+            )
             preview = tools.preview_undo(change_set)
             bound = self._workspace_gate.capture_current(
                 active.record.workspace,
@@ -2187,15 +2563,21 @@ class SessionRuntime:
                     )
                     if not self._persist_current():
                         complete = False
-                    self._workspace_baselines[binding.session_id] = current
-                    self._workspace_baseline_unresolved.discard(binding.session_id)
+                    if not self._advance_workspace_baseline(
+                        binding.session_id,
+                        current,
+                    ):
+                        complete = False
             elif compensated_change_set is not None:
                 complete = False
                 self._workspace_baseline_unresolved.add(binding.session_id)
                 self._invalidate_current_after_workspace_finish_failure()
             elif accepted and attributable:
-                self._workspace_baselines[binding.session_id] = current
-                self._workspace_baseline_unresolved.discard(binding.session_id)
+                if not self._advance_workspace_baseline(
+                    binding.session_id,
+                    current,
+                ):
+                    complete = False
             elif accepted:
                 complete = False
                 self._workspace_baseline_unresolved.add(binding.session_id)
@@ -2205,7 +2587,11 @@ class SessionRuntime:
                 self._workspace_baseline_unresolved.add(binding.session_id)
                 self._invalidate_current_after_workspace_finish_failure()
             else:
-                self._workspace_baselines[binding.session_id] = current
+                if not self._advance_workspace_baseline(
+                    binding.session_id,
+                    current,
+                ):
+                    complete = False
         try:
             self._release_undo_workspace()
         except (WorkspaceIdentityError, WorkspaceLockError, OSError):
@@ -2393,6 +2779,8 @@ class SessionRuntime:
                 model=model,
                 read_only=self.options.read_only,
                 permission_level=self._entry_permission,
+                workspace_baseline_state=self._workspace_baseline_state,
+                workspace_baseline_message=self._workspace_baseline_message,
             )
         pending_clear = self.current.context.memory_pending_clear
         return RuntimeStatus(
@@ -2414,6 +2802,8 @@ class SessionRuntime:
             pending_verification_paths=len(
                 self.current.memory.pending_verification_paths
             ),
+            workspace_baseline_state=self._workspace_baseline_state,
+            workspace_baseline_message=self._workspace_baseline_message,
         )
 
     def render_memory(self) -> str:

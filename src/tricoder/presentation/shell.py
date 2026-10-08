@@ -13,7 +13,7 @@ from tricoder.presentation.commands import (
 )
 from tricoder.changes import UndoExecution, UndoPreview
 from tricoder.models import RunResult
-from tricoder.session.runtime import SessionRuntimeError
+from tricoder.session.runtime import SessionRuntimeError, WorkspaceOperationCancelled
 
 
 class ShellUI(Protocol):
@@ -175,6 +175,8 @@ class InteractiveShell:
             try:
                 result = self.runtime.run_task(text)
                 self.ui.show_run_result(result)
+            except WorkspaceOperationCancelled as exc:
+                self.ui.show_notice(str(exc))
             except SessionRuntimeError as exc:
                 self.ui.show_error("任务运行失败", str(exc))
             return None
@@ -288,6 +290,7 @@ class InteractiveShell:
         elif command.subcommand == "new":
             self.runtime.create(command.argument or "")
             self.ui.show_notice("已创建并切换到新会话")
+            self._show_workspace_baseline_notice()
         elif command.subcommand == "current":
             self._show_status()
         elif command.subcommand == "rename":
@@ -317,6 +320,14 @@ class InteractiveShell:
                 f"目标工作区为 {workspace}。确认切换？[y/N] "
             ),
         )
+        self._show_workspace_baseline_notice()
+
+    def _show_workspace_baseline_notice(self) -> None:
+        """仅消费结构化状态字段，不以中文异常反推基线分支。"""
+
+        message = getattr(self.runtime.status(), "workspace_baseline_message", "")
+        if message:
+            self.ui.show_notice(message)
 
     def _choose_model(self) -> None:
         provider = self.ui.choose_model(

@@ -46,6 +46,7 @@ def check_record(
     output: str = "OK",
     execution_complete: bool = True,
     workspace_stable: bool | None = None,
+    diagnostics: tuple[str, ...] = (),
 ) -> CommandCheckRecord:
     if workspace_stable is None:
         workspace_stable = kind != "information" and snapshot_id is not None
@@ -61,6 +62,7 @@ def check_record(
         workspace_stable=workspace_stable,
         targets=(argv[-1],),
         snapshot_id=snapshot_id,
+        diagnostics=diagnostics,
     )
 
 
@@ -144,6 +146,23 @@ class TaskValidationTrackerTests(unittest.TestCase):
         report = tracker.report()
         self.assertEqual("failed", report.status)
         self.assertEqual(("cleanup-failed",), report.unresolved_check_ids)
+
+    def test_explicit_zero_tests_do_not_resolve_previous_failure(self) -> None:
+        """相同命令随后 exit=0 但零测试，不能抹掉之前的真实失败。"""
+
+        tracker = TaskValidationTracker("task-a")
+        tracker.observe(check_record("failed", returncode=1))
+        tracker.observe(
+            check_record(
+                "zero-tests",
+                returncode=0,
+                diagnostics=("zero_tests_reported",),
+            )
+        )
+
+        report = tracker.report()
+        self.assertEqual("failed", report.status)
+        self.assertEqual(("failed",), report.unresolved_check_ids)
 
     def test_begin_task_rotates_check_authority_even_when_task_label_repeats(self) -> None:
         """历史序号可复用，但旧任务检查令牌不能在新任务继续有效。"""

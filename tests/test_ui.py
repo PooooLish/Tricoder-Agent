@@ -84,6 +84,21 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("历史修改验证", text)
         self.assertIn("尚未确认（1 项）", text)
 
+    def test_result_displays_unknown_source_with_known_pending_paths(self) -> None:
+        ui, console = recording_ui()
+        result = RunResult(
+            True,
+            "只读回顾已完成",
+            1,
+            verification_obligation="legacy_unknown",
+            pending_verification_paths=("src/app.py", "tests/test_app.py"),
+        )
+
+        ui.show_run_result(result)
+
+        text = console.export_text()
+        self.assertIn("历史来源未知；另有 2 项已知路径待验证", text)
+
     def test_task_validation_is_separate_and_never_claims_requirement_coverage(self) -> None:
         ui, console = recording_ui()
         report = TaskValidationReport(
@@ -190,6 +205,8 @@ class TerminalUITests(unittest.TestCase):
             context_messages=1,
             unsaved_memory=True,
             warning="本次记忆未持久化",
+            workspace_baseline_state="consistent",
+            workspace_baseline_message="扫描范围内未检测到变化，可以继续任务",
         )
         ui.show_shell_start(active_status)
         ui.show_help()
@@ -216,6 +233,8 @@ class TerminalUITests(unittest.TestCase):
         self.assertIn("/diff", text)
         self.assertIn("/undo", text)
         self.assertIn("未持久化", text)
+        self.assertIn("工作区基线", text)
+        self.assertIn("扫描范围内未检测到变化", text)
         self.assertIn("无效", text)
         self.assertIn("gpt-preview", text)
         self.assertIn("deepseek-preview", text)

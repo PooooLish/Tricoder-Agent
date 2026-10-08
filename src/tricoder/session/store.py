@@ -9,6 +9,7 @@ import sys
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,10 +22,46 @@ from tricoder.context.memory import (
     memory_from_json,
     memory_to_json,
 )
+from tricoder.workspace.baseline_record import (
+    BASELINE_RECORD_FORMAT_VERSION,
+    BaselineRecord,
+    BaselineRecordError,
+    baseline_record_from_json,
+    baseline_record_to_json,
+)
 
 
 class SessionError(ValueError):
     """会话名称或持久化数据不符合约束时的安全错误。"""
+
+
+class WorkspaceBaselineStoreError(SessionError):
+    """以固定类别报告持久化基线错误，不泄漏数据库内容。"""
+
+    _ALLOWED = {
+        "binding_mismatch",
+        "corrupted",
+        "incomplete",
+        "inconsistent_record",
+        "limit_exceeded",
+        "missing_record",
+        "revision_conflict",
+        "storage_error",
+        "unsupported_format",
+    }
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason if reason in self._ALLOWED else "storage_error"
+        super().__init__(self.reason)
+
+
+@dataclass(frozen=True, slots=True)
+class StoredWorkspaceBaseline:
+    """已验证并绑定到一个 Session 的持久化基线。"""
+
+    record: BaselineRecord
+    revision: int
+    updated_at: str
 
 
 def _is_windows() -> bool:
@@ -95,6 +132,12 @@ def _path_is_within(path: Path, directory: Path) -> bool:
         return False
 
 
+def _workspace_key(path: Path) -> str:
+    """生成与工作区扫描相同的平台规范键。"""
+
+    return os.path.normcase(os.path.normpath(str(path.resolve(strict=True))))
+
+
 def _require_text(row: sqlite3.Row, column: str) -> str:
     """拒绝 SQLite BLOB 或 NULL，避免损坏数据伪装为正常文本。"""
     value = row[column]
@@ -124,6 +167,18 @@ def _validate_obligation_paths(value: object) -> tuple[str, ...]:
         seen.add(item)
         normalized.append(item)
     return tuple(normalized)
+
+
+def _validate_obligation_state(obligation: object, paths: tuple[str, ...]) -> str:
+    """校验三态编码；legacy_unknown 可同时携带已知待验证路径。"""
+
+    if obligation not in {"none", "pending", "legacy_unknown"}:
+        raise SessionError("会话验证义务状态损坏")
+    if obligation == "none" and paths:
+        raise SessionError("会话验证义务与路径不一致")
+    if obligation == "pending" and not paths:
+        raise SessionError("会话验证义务与路径不一致")
+    return obligation
 
 
 def _utc_now() -> str:
@@ -164,7 +219,8 @@ class SessionStore:
                         provider TEXT NOT NULL,
                         model TEXT NOT NULL,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        workspace_baseline_initialized INTEGER NOT NULL DEFAULT 0
                     )
                     """
                 )
@@ -203,8 +259,33 @@ class SessionStore:
                 self._ensure_unknown_effects_column(connection)
                 self._ensure_permission_column(connection)
                 self._ensure_verification_obligation_columns(connection)
+                self._ensure_workspace_baseline_marker(connection)
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_workspace_baselines (
+                        session_id TEXT PRIMARY KEY,
+                        format_version INTEGER NOT NULL,
+                        scope_version TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    )
+                    """
+                )
         except (OSError, sqlite3.Error, TypeError, ValueError) as error:
             raise SessionError("会话数据库初始化失败") from error
+
+    @staticmethod
+    def _ensure_workspace_baseline_marker(connection: sqlite3.Connection) -> None:
+        """为旧 sessions 表补状态位；旧会话不会因此获得虚构基线。"""
+
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+        if "workspace_baseline_initialized" not in columns:
+            connection.execute(
+                "ALTER TABLE sessions ADD COLUMN workspace_baseline_initialized "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _ensure_unknown_effects_column(connection: sqlite3.Connection) -> None:
@@ -450,6 +531,179 @@ class SessionStore:
             raise SessionError("会话模型更新失败") from error
         return self.get(session_id)
 
+    def load_workspace_baseline(
+        self,
+        session_id: str,
+    ) -> StoredWorkspaceBaseline | None:
+        """读取 Session 基线；损坏、缺失与从未初始化必须严格区分。"""
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT s.workspace, s.workspace_baseline_initialized,
+                           b.format_version, b.scope_version, b.revision,
+                           b.payload_json, b.updated_at AS baseline_updated_at
+                    FROM sessions AS s
+                    LEFT JOIN session_workspace_baselines AS b
+                      ON b.session_id = s.id
+                    WHERE s.id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise WorkspaceBaselineStoreError("storage_error") from exc
+        if row is None:
+            raise SessionError("找不到会话")
+        marker = row["workspace_baseline_initialized"]
+        if type(marker) is not int or marker not in (0, 1):
+            raise WorkspaceBaselineStoreError("corrupted")
+        has_record = row["payload_json"] is not None
+        if marker == 0:
+            if has_record:
+                raise WorkspaceBaselineStoreError("inconsistent_record")
+            return None
+        if not has_record:
+            raise WorkspaceBaselineStoreError("missing_record")
+        try:
+            format_version = row["format_version"]
+            scope_version = row["scope_version"]
+            revision = row["revision"]
+            payload = row["payload_json"]
+            updated_at = row["baseline_updated_at"]
+            workspace = row["workspace"]
+            if type(format_version) is not int or not isinstance(scope_version, str):
+                raise WorkspaceBaselineStoreError("corrupted")
+            if type(revision) is not int or revision < 1:
+                raise WorkspaceBaselineStoreError("corrupted")
+            if not isinstance(payload, str) or not isinstance(updated_at, str):
+                raise WorkspaceBaselineStoreError("corrupted")
+            if not isinstance(workspace, str):
+                raise WorkspaceBaselineStoreError("corrupted")
+            record = baseline_record_from_json(payload)
+            if format_version != record.format_version:
+                raise WorkspaceBaselineStoreError("corrupted")
+            if scope_version != record.scope_version:
+                raise WorkspaceBaselineStoreError("corrupted")
+            if record.workspace_key != _workspace_key(Path(workspace)):
+                raise WorkspaceBaselineStoreError("binding_mismatch")
+        except BaselineRecordError as exc:
+            raise WorkspaceBaselineStoreError(exc.reason) from exc
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceBaselineStoreError("binding_mismatch") from exc
+        return StoredWorkspaceBaseline(record, revision, updated_at)
+
+    def save_workspace_baseline(
+        self,
+        session_id: str,
+        record: BaselineRecord,
+        *,
+        expected_revision: int | None,
+    ) -> StoredWorkspaceBaseline:
+        """用 CAS 原子保存认可基线及初始化标记。"""
+
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 1
+        ):
+            raise WorkspaceBaselineStoreError("revision_conflict")
+        try:
+            payload = baseline_record_to_json(record)
+        except BaselineRecordError as exc:
+            raise WorkspaceBaselineStoreError(exc.reason) from exc
+        updated_at = self._clock()
+        try:
+            with self._transaction() as connection:
+                session = connection.execute(
+                    """
+                    SELECT workspace, workspace_baseline_initialized
+                    FROM sessions WHERE id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if session is None:
+                    raise SessionError("找不到会话")
+                workspace = session["workspace"]
+                marker = session["workspace_baseline_initialized"]
+                if not isinstance(workspace, str) or type(marker) is not int or marker not in (0, 1):
+                    raise WorkspaceBaselineStoreError("corrupted")
+                try:
+                    if record.workspace_key != _workspace_key(Path(workspace)):
+                        raise WorkspaceBaselineStoreError("binding_mismatch")
+                except (OSError, RuntimeError) as exc:
+                    raise WorkspaceBaselineStoreError("binding_mismatch") from exc
+                existing = connection.execute(
+                    """
+                    SELECT revision FROM session_workspace_baselines
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if marker == 0 and existing is not None:
+                    raise WorkspaceBaselineStoreError("inconsistent_record")
+                if marker == 1 and existing is None:
+                    raise WorkspaceBaselineStoreError("missing_record")
+                if existing is None:
+                    if expected_revision is not None:
+                        raise WorkspaceBaselineStoreError("revision_conflict")
+                    revision = 1
+                    connection.execute(
+                        """
+                        INSERT INTO session_workspace_baselines (
+                            session_id, format_version, scope_version, revision,
+                            payload_json, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            BASELINE_RECORD_FORMAT_VERSION,
+                            record.scope_version,
+                            revision,
+                            payload,
+                            updated_at,
+                        ),
+                    )
+                else:
+                    current_revision = existing["revision"]
+                    if (
+                        type(current_revision) is not int
+                        or current_revision < 1
+                        or current_revision != expected_revision
+                    ):
+                        raise WorkspaceBaselineStoreError("revision_conflict")
+                    revision = current_revision + 1
+                    cursor = connection.execute(
+                        """
+                        UPDATE session_workspace_baselines
+                        SET format_version = ?, scope_version = ?, revision = ?,
+                            payload_json = ?, updated_at = ?
+                        WHERE session_id = ? AND revision = ?
+                        """,
+                        (
+                            BASELINE_RECORD_FORMAT_VERSION,
+                            record.scope_version,
+                            revision,
+                            payload,
+                            updated_at,
+                            session_id,
+                            current_revision,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise WorkspaceBaselineStoreError("revision_conflict")
+                cursor = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET workspace_baseline_initialized = 1
+                    WHERE id = ?
+                    """,
+                    (session_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionError("找不到会话")
+        except sqlite3.Error as exc:
+            raise WorkspaceBaselineStoreError("storage_error") from exc
+        return StoredWorkspaceBaseline(record, revision, updated_at)
+
     def load_memory(self, session_id: str) -> SessionMemory:
         """读取独立会话记忆，并拒绝损坏或类型错误的 JSON。"""
         row = self._fetchone(
@@ -473,8 +727,6 @@ class SessionStore:
         if type(unknown) is not int or unknown not in (0, 1):
             raise SessionError("会话未确认状态损坏")
         obligation = row["verification_obligation"]
-        if obligation not in {"none", "pending", "legacy_unknown"}:
-            raise SessionError("会话验证义务状态损坏")
         try:
             pending_paths = json.loads(
                 _require_text(row, "pending_verification_paths_json")
@@ -482,8 +734,7 @@ class SessionStore:
         except (TypeError, ValueError) as error:
             raise SessionError("会话验证义务路径损坏") from error
         pending_paths = _validate_obligation_paths(pending_paths)
-        if (obligation == "pending") != bool(pending_paths):
-            raise SessionError("会话验证义务与路径不一致")
+        obligation = _validate_obligation_state(obligation, pending_paths)
         return SessionMemory(
             summary=_require_text(row, "summary"),
             requirements_summary=_require_text(row, "requirements_summary"),
@@ -502,15 +753,10 @@ class SessionStore:
             raise SessionError("修改文件列表必须只包含文本路径")
         if type(memory.unknown_effects) not in (bool, int) or memory.unknown_effects not in (0, 1):
             raise SessionError("会话未确认状态必须为 0 或 1")
-        if memory.verification_obligation not in {
-            "none", "pending", "legacy_unknown"
-        }:
-            raise SessionError("会话验证义务状态无效")
         pending_paths = _validate_obligation_paths(
             list(memory.pending_verification_paths)
         )
-        if (memory.verification_obligation == "pending") != bool(pending_paths):
-            raise SessionError("会话验证义务与路径不一致")
+        _validate_obligation_state(memory.verification_obligation, pending_paths)
         files_json = json.dumps(list(memory.modified_files), ensure_ascii=False)
         pending_paths_json = json.dumps(list(pending_paths), ensure_ascii=False)
         updated_at = self._clock()

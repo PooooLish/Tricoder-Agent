@@ -119,4 +119,21 @@ class TaskValidationReport:
             raise ValueError("recent_only 必须为布尔值")
 
 
-__all__ = ["CommandCheckRecord", "TaskValidationReport"]
+def has_effective_success_result(record: CommandCheckRecord) -> bool:
+    """判断真实成功执行是否具有验证能力；明确零测试只保留诊断。"""
+
+    return bool(
+        record.execution_complete
+        and record.returncode == 0
+        and "scope_filtered" not in record.diagnostics
+        and not (
+            record.kind == "tests" and "zero_tests_reported" in record.diagnostics
+        )
+    )
+
+
+__all__ = [
+    "CommandCheckRecord",
+    "TaskValidationReport",
+    "has_effective_success_result",
+]

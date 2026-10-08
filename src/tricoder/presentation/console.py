@@ -115,12 +115,25 @@ def _current_verification_obligation(result: RunResult) -> str:
     return "待验证（本轮修改）" if result.current_verification_required else "本轮未产生修改验证义务"
 
 
-def _historical_verification_obligation(result: RunResult) -> str:
-    if result.verification_obligation == "pending":
-        return f"尚未确认（{len(result.pending_verification_paths)} 项）"
-    if result.verification_obligation == "legacy_unknown":
+def format_historical_verification_obligation(
+    obligation: str, pending_path_count: int
+) -> str:
+    """统一展示历史未知来源与已知路径并存的宿主义务。"""
+
+    if obligation == "pending":
+        return f"尚未确认（{pending_path_count} 项）"
+    if obligation == "legacy_unknown":
+        if pending_path_count:
+            return f"历史来源未知；另有 {pending_path_count} 项已知路径待验证"
         return "来源待确认"
     return "无"
+
+
+def _historical_verification_obligation(result: RunResult) -> str:
+    return format_historical_verification_obligation(
+        result.verification_obligation,
+        len(result.pending_verification_paths),
+    )
 
 
 def _safe_base_url(value: str) -> str:
@@ -275,6 +288,9 @@ class TerminalUI:
         provider = status.provider  # type: ignore[attr-defined]
         model = status.model  # type: ignore[attr-defined]
         details.add_row("模型", Text(f"{_PROVIDER_LABELS.get(provider, provider)} · {model}"))
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            details.add_row("工作区基线", Text(baseline_message, style="yellow"))
         self.console.print(Panel(details, title="[bold cyan]TriCoder 交互会话[/bold cyan]", border_style="cyan", box=box.ROUNDED))
 
     def show_help(self) -> None:
@@ -312,17 +328,17 @@ class TerminalUI:
         obligation = getattr(status, "verification_obligation", "none")
         table.add_row(
             "历史修改验证",
-            (
-                f"尚未确认（{getattr(status, 'pending_verification_paths', 0)} 项）"
-                if obligation == "pending"
-                else "来源待确认"
-                if obligation == "legacy_unknown"
-                else "无"
+            format_historical_verification_obligation(
+                obligation,
+                getattr(status, "pending_verification_paths", 0),
             ),
         )
         table.add_row("检查边界", "受覆盖文件，非业务验收")
         table.add_row("新增目录", str(getattr(status, "modified_directories", 0)))
         table.add_row("上下文消息", str(status.context_messages))  # type: ignore[attr-defined]
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            table.add_row("工作区基线", Text(baseline_message, style="yellow"))
         if status.unsaved_memory:  # type: ignore[attr-defined]
             table.add_row("记忆", Text(status.warning or "本次记忆未持久化", style="yellow"))  # type: ignore[attr-defined]
         self.console.print(Panel(table, title="[bold cyan]当前状态[/bold cyan]", border_style="cyan", box=box.ROUNDED))

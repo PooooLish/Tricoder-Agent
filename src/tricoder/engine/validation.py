@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from tricoder.core.validation import CommandCheckRecord, TaskValidationReport
+from tricoder.core.validation import (
+    CommandCheckRecord,
+    TaskValidationReport,
+    has_effective_success_result,
+)
 
 
 @dataclass(slots=True)
@@ -81,8 +85,7 @@ class TaskValidationTracker:
             self._stale.pop(record.signature, None)
 
         conclusive_success = (
-            record.execution_complete
-            and record.returncode == 0
+            has_effective_success_result(record)
             and (record.kind == "information" or record.workspace_stable)
         )
         if conclusive_success:

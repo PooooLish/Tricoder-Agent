@@ -157,42 +157,40 @@ class WorkspaceGateRuntimeTests(unittest.TestCase):
         self.assertEqual([], agent.calls)
         self.assertEqual([], self.store.list_all())
 
-    def test_restored_session_without_memory_baseline_requires_explicit_initialization(self) -> None:
-        """若重启后静默建基线，重启期间的外部修改永远不会展示。"""
+    def test_restored_session_without_persisted_baseline_initializes_once_without_confirmation(self) -> None:
+        """旧 Session 首次补齐后必须跨重启恢复，不能每次任务重复要求初始化。"""
 
         record = self.store.create("restored", self.workspace, "openai", "model")
-        denied_agent = _Agent()
-        denied_previews: list[WorkspaceGatePreview] = []
-        denied = SessionRuntime(
+        first_agent = _Agent()
+        first_previews: list[WorkspaceGatePreview] = []
+        first = SessionRuntime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
-            active_session_factory=_builder(denied_agent),
+            active_session_factory=_builder(first_agent),
             initial_session_id=record.id,
-            workspace_confirmer=lambda preview: denied_previews.append(preview) or False,
+            workspace_confirmer=lambda preview: first_previews.append(preview) or True,
         )
-        self.addCleanup(denied.close)
+        self.assertTrue(first.run_task("first").ok)
+        self.assertTrue(first.close())
 
-        with self.assertRaisesRegex(SessionRuntimeError, "初始化"):
-            denied.run_task("denied")
-        self.assertEqual([], denied_agent.calls)
-        self.assertEqual("initialize", denied_previews[0].kind)
-        denied.close()
-
-        accepted_agent = _Agent()
-        accepted_previews: list[WorkspaceGatePreview] = []
-        accepted = SessionRuntime(
+        second_agent = _Agent()
+        second_previews: list[WorkspaceGatePreview] = []
+        second = SessionRuntime(
             self.store,
             self.workspace,
             options=RuntimeOptions(environ={}),
-            active_session_factory=_builder(accepted_agent),
+            active_session_factory=_builder(second_agent),
             initial_session_id=record.id,
-            workspace_confirmer=lambda preview: accepted_previews.append(preview) or True,
+            workspace_confirmer=lambda preview: second_previews.append(preview) or False,
         )
-        self.addCleanup(accepted.close)
-        self.assertTrue(accepted.run_task("accepted").ok)
-        self.assertEqual(["accepted"], accepted_agent.calls)
-        self.assertEqual("initialize", accepted_previews[0].kind)
+        self.addCleanup(second.close)
+
+        self.assertTrue(second.run_task("second").ok)
+        self.assertEqual(["first"], first_agent.calls)
+        self.assertEqual(["second"], second_agent.calls)
+        self.assertEqual([], first_previews)
+        self.assertEqual([], second_previews)
 
     def test_confirmation_cancellation_invalidates_approval(self) -> None:
         """若确认回调期间的取消未复核，迟到的 True 会启动任务。"""

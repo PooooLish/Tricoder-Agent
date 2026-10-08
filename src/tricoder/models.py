@@ -369,6 +369,7 @@ class SessionMemory:
     permission_level: str = "strict"
     unknown_effects: bool = False
     # 宿主签发的跨任务验证义务；与 verification 展示字符串相互独立。
+    # legacy_unknown 可同时携带已知路径，表示来源未知与具体路径义务并存。
     verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
     pending_verification_paths: tuple[str, ...] = ()
 
@@ -392,6 +393,7 @@ class RunResult:
         default_factory=lambda: _empty_task_validation_report()
     )
     # 以下三个字段只描述宿主状态，不接受 Provider 或语义记忆自报。
+    # legacy_unknown 与非空路径可并存，分别表达未知来源和已知路径义务。
     current_verification_required: bool = False
     verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
     pending_verification_paths: tuple[str, ...] = ()
@@ -432,6 +434,7 @@ class SessionContext:
     # 仅进程内跟踪目录副作用；本轮不修改 SQLite schema。
     modified_directories: tuple[str, ...] = ()
     # 跨任务义务与上面的单任务门禁分开；恢复时只恢复这里，不恢复 evidence。
+    # legacy_unknown 可携带路径；纯回顾不得据此建立本轮 verification_required。
     verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
     pending_verification_paths: tuple[str, ...] = ()
 

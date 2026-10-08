@@ -126,12 +126,16 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
                     1,
                     current_verification_required=False,
                     verification_obligation="legacy_unknown",
+                    pending_verification_paths=("src/app.py",),
                 )
             )
 
         rendered = "\n".join(lines)
         self.assertIn("本轮验证义务：本轮未产生修改验证义务", rendered)
-        self.assertIn("历史修改验证：来源待确认", rendered)
+        self.assertIn(
+            "历史修改验证：历史来源未知；另有 1 项已知路径待验证",
+            rendered,
+        )
 
     async def test_undo_prepare_gate_runs_in_background_worker(self) -> None:
         """撤销扫描/工作区确认不能在 Textual UI 线程同步执行。"""

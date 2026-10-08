@@ -1,5 +1,70 @@
 # Project: tricoder-cli
 
+## 2026-10-07 工作区基线 F1/F2 补齐独立复审（通过）
+
+- 原始独立探针重跑确认 F1/F2 关闭：激活时接受变化现在进入 Provider 首轮实际消息，且 pending 路径保留、只确认一次；kind 数组类型损坏恢复为 corrupted，Runtime 保留，不再漏出 TypeError。任务入口变化和普通非法 JSON 对照保持正确。
+- 审阅新增真实 Runtime/Store/RecordingProvider 与 Shell 回归，覆盖恢复、切换、拒绝、存储失败和损坏原文/revision 保留。没有发现本轮范围内新的阻断问题。
+- 新鲜相关组合 432 项、126.456 秒、OK（6 skipped），0 failures/errors；git diff --check 通过。本轮未重跑全量，不将实施方 1628 项结果冒称独立执行。
+- 证据：`runtime/workspace-baseline/review-fixes/review2-result.md`、`review2-focused.log`、`review2-probes.log`。下一步可由用户进行恢复/切换/拒绝的本地人工验收；F1/F2 不再列为待修。真实模型/用户库及其他平台未验证。
+- 本轮仅新增审查记录/交接，无生产代码或正式测试修改，无依赖安装、提交或推送。
+
+## 2026-10-07 工作区基线持久化独立复审补齐（修复完成，待复审）
+
+- 本轮严格限定为独立复审 F1/F2，保留当前未提交工作树与既有 `compileall -r`、验证义务、失败任务记忆和默认开启记忆修改；没有从 HEAD 覆盖文件。修复前原探针再次确认：激活接受变化后下一轮 Provider 收不到变化提醒，`entries[].kind=[]/{}` 会从恢复入口漏出 `TypeError`。
+- F1：`_activate_current_workspace_baseline` 现在只在用户确认、复扫和基线持久化全部成功后发布一次性 `workspace_change_notice`。通知基于 `_observe_workspace_change` 更新后的当前 `ActiveSession`，不会用激活前对象覆盖 `pending`、`legacy_unknown`、UNKNOWN 或验证失效状态；拒绝和存储失败均不发布“已确认变化”。重启恢复与 Session 切换的首轮 Provider 请求都收到安全路径提醒且不重复确认，任务入口原有提醒行为保持。
+- F2：持久基线解析在集合判断、比较和摘要计算前严格校验顶层/条目容器及字段类型；`null`、布尔、数字、数组、对象和非法字符串等可预期损坏统一为 `BaselineRecordError("corrupted")`，Store 继续映射为固定 `WorkspaceBaselineStoreError`。没有吞异常、返回无记录、自动重建或输出 payload；真实 Runtime 恢复和 Shell 切换均保留 Session 与原 payload/revision，文件任务阻断且 Provider 调用为 0。
+- RED：正式专项初次 `Ran 13`，得到预期 2 failures + 4 errors；错误分别命中缺失通知和 `kind` 数组/对象的未捕获 `TypeError`。GREEN：类型/集成专项 `Ran 14`，OK；基线/Store/恢复/门禁组合 `Ran 39`，OK；工作区、Session、Shell、Console/TUI、验证义务和任务记忆组合 `Ran 548 tests in 136.468s`，OK（6 skipped）。
+- 最终完整项目回归 `Ran 1628 tests in 304.383s`，OK（13 skipped）；13 项均为既有平台或权限条件，本轮新增测试无跳过。运行中保留了既有 asyncio/Textual/MCP 慢回调诊断，没有失败。证据见 `runtime/workspace-baseline/review-fixes/verification.md`。
+- 未验证 Linux/macOS、Python 3.12、真实 Provider、真实用户数据库迁移和手工 Console/TUI。未读取 `.env.local`、真实凭据或用户会话库，未调用真实模型、安装依赖、提交或推送；`git_diff`、Plan/Replan、摘要和沙箱不在本轮范围。
+
+## 2026-10-07 工作区基线持久化独立复审（2 项 P2 待补齐）
+
+- 新鲜相关组合 424 项、129.504 秒、OK（6 skipped），git diff --check 通过；本轮未重跑完整 1620 项。此前 compileall -r 原始探针重跑通过，范围义务跨重启保留。
+- F1：激活接受变化后只安装/持久化基线，没有向下一轮 Agent 设置 workspace_change_notice；第一条任务已无差异，通知永久漏发。真实 RecordingProvider 对照显示：激活时变化无提醒，任务入口变化有提醒。
+- F2：持久化 JSON 的 entries[].kind 为数组/对象时，baseline_record.py 集合判断漏出 TypeError；恢复 Runtime 构造失败，而不是保持会话、标记 corrupted。普通非法 JSON 对照正常进入 corrupted。
+- 证据与最小方向：`runtime/workspace-baseline/review-findings.md`；可执行 `review-probes.py`、`review-probes.log`、`review-focused.log`。下一步交 coding session 把两个场景转为正式失败测试并补齐后复审，保留现有正确行为。
+- 本次仅追加诊断和审查记录，未修改生产代码/正式测试，未访问真实模型或用户库、安装依赖、提交或推送。
+
+## 2026-10-07 工作区基线持久化与自动恢复（实现完成，待复审）
+
+- 按 `docs/superpowers/plans/2026-10-07-persistent-workspace-baseline.md` 完成 T0—T5。新增不含正文的稳定基线投影、严格 JSON 校验、独立 SQLite 表、初始化标记与 revision CAS；跨重启摘要不复用含 inode 的运行期 `snapshot_id`。数据只含版本、工作区/范围绑定、根身份和路径/类型/大小/SHA-256/权限，拒绝不完整、损坏、超限、未知版本、绑定错误、缺失和孤立记录。
+- Session 激活、显式创建、切换和恢复现在都会在短时工作区锁内扫描。无记录自动初建；一致时安装当前新鲜运行期快照；变化时先展示差异、确认后复扫并持久化。拒绝只取消当前操作，保持目标 Session 与旧 revision；锁忙、扫描失败或损坏记录不会调用 Provider，也不会静默覆盖。任务开始仍重新持锁复查，合法任务收尾和成功撤销才推进记录，存储失败保留旧基线并阻止虚假成功。
+- 接受基线只认可执行起点：既有 `pending`/`legacy_unknown`、UNKNOWN 和检查事实不被清除，可信验证 evidence 不跨重启恢复。A/B Session 保持独立基线；同内容原子替换不误询问，根/范围/目录/权限/内容变化仍可见。跨重启只提供文件级差异，同进程继续沿用内存文本差异。
+- Console/Shell/TUI 使用结构化 `workspace_baseline_state/message` 展示激活、拒绝、锁忙和损坏状态；工作区拒绝是正常取消，不冒充任务运行失败。首次完整回归发现旧 TUI 测试宿主缺少新增状态字段、spill 隐私测试未包含新表，均补兼容后重跑通过。
+- 新鲜验证：计划八组聚焦回归合计 `Ran 408`，OK（6 skipped）；最终完整项目 `Ran 1620 tests in 324.794s`，OK（13 skipped）。13 项为既有平台、权限或可选能力条件跳过，本轮新增持久基线测试无跳过。最终编译、差异检查和完整命令记录见 `runtime/workspace-baseline/verification.md`。
+- 兼容与限制：迁移只增表和 `workspace_baseline_initialized` 列，旧 Session 首次激活会自动建立当前起点并明确无法核对此前历史；第一版没有损坏记录修复命令，也不防本地数据库主动篡改，无法发现“修改后又恢复相同内容”的历史事件。未验证 Linux/macOS、Python 3.12、真实 Provider、真实用户数据库迁移或手工跨进程 Console/TUI；未读取 `.env.local`、真实凭据/会话库，未安装依赖、调用真实模型、提交或推送。非 Git 工作区的 `git_diff`、Plan/Replan 和摘要功能不在本轮范围。
+
+## 2026-10-07 compileall 递归深度验证范围补齐（修复完成，待复审）
+
+- 独立复审遗留的 P2 已按最小范围修复：`_check_scope_is_filtered` 现在把显式 `compileall -r` 识别为范围受限检查。命令仍真实执行并保留退出码，但成功结果会带 `scope_filtered` 诊断，不签发完整工作区验证能力。
+- 修复前两条正式回归均按预期失败：历史恢复链路缺少 `scope_filtered`，本轮子目录写入则被错误交付为成功。修复后，`legacy_unknown + sub/broken.py` 在 `compileall -q -r 0 .` exit=0 后及 SQLite 重启后均保留；本轮子目录写入也继续要求有效验证。无 `-r` 的完整根检查正向行为保持不变。
+- 新鲜验证：新增专项 `Ran 2`，OK；验证义务模块 `Ran 28`，OK；验证、Session、记忆、结束协议及 Console/TUI 聚焦组合 `Ran 429 tests in 91.065s`，OK（1 skipped）。复现探针显示受限命令 diagnostics=`scope_filtered` 且义务跨重启保留；探针 exit 0 只代表执行完成。
+- 最终完整项目回归 `Ran 1596 tests in 229.746s`，OK（13 skipped）；13 项均为既有平台/权限条件跳过，本轮新增测试无跳过。证据见 `runtime/verification-obligation/review-fixes/review2-fix-verification.md`。未读取 `.env.local`、真实凭据或真实会话数据库，未调用真实模型、安装依赖、提交或推送。
+
+## 2026-10-07 验证义务补齐独立复审（剩余 1 项 P2）
+
+- 原 F1/F2/F3 原始探针已修复：cwd 范围、明确零测试、legacy_unknown 与已知路径并存均符合预期；过期通过负向对照仍有效，重启后的只读回顾正常交付。
+- 仍有范围漏判：`tools/command.py:_check_scope_is_filtered` 遗漏已允许的 compileall `-r`。真实合成链路中，子目录源码语法错误且状态为 legacy_unknown + 子目录 pending 时，根目录 `compileall -q -r 0 .` exit=0 被当成完整范围检查，误清为 none，SQLite 重启后仍为 none。无深度限制的对照真实失败并正确保留状态。
+- 新鲜聚焦回归 427 项、89.978 秒、OK（1 skipped）；git diff --check 通过，本轮未重跑全量。记录与探针位于 `runtime/verification-obligation/review-fixes/review2-findings.md`、`review2-depth-probe.py`、对应日志及 `review2-focused.log`。
+- 下一步：把显式递归深度限制纳入 scope_filtered，增加真实恢复链路和当前写入门禁回归；保留无筛选有效检查的正向行为。当前复审暂不通过；不回退已经修好的三项。
+- 本次仅新增诊断/审查记录并更新交接，无生产代码或正式测试修改；无真实用户数据/模型、依赖安装、提交或推送。
+
+## 2026-10-07 验证义务复审补齐（修复完成，待复审）
+
+- 按 `docs/superpowers/plans/2026-10-07-verification-obligation-review-fixes.md` 完成 R0—R4。R0 使用真实 `SessionRuntime`、临时 SQLite、fake Provider 和关闭/重启恢复入口，将 cwd 丢失、零测试误清义务、`legacy_unknown` 被覆盖三项探针转为正式 RED；失败均命中预期断言，不是夹具、导入或 Provider 队列错误。
+- F1 在 Runtime 消费完整 `CommandCheckRecord`，保留 cwd、目标、authority 和快照时效；通过 `WorkspacePolicy` 将 `cwd + target` 解析到统一工作区坐标。`sub/.` 只覆盖 `sub`，路径比较保留分段边界、Windows 大小写规则，越界、链接逃逸、已消失或无法证明的目标不取得解除能力。只有与最终完整快照一致且仍由当前 scope 拥有的记录参与义务合并。
+- F2 将“命令 exit=0”和“具有验证能力”分离。tests 明确报告 `zero_tests_reported` 时保留退出码、输出与诊断，但不签发通过 evidence、不清历史义务，也不能单独满足本轮写入门禁；之后的真实有效检查仍可满足门禁。带筛选/排除参数且范围不能证明完整的检查记录 `scope_filtered`，同样不取得解除能力；工作区实际变化仍发布负证据，不丢 UNKNOWN/失败事实。
+- F3 独立维护历史未知来源和已知路径，最终编码为兼容三态：`legacy_unknown` 现在允许同时携带路径。局部合格检查只移除覆盖路径，完整无筛选根检查才能解除未知来源；工作区外部变化入口在失效前保留原义务，避免把原本 `none` 凭空升级为未知，也避免覆盖真正的未知。SessionStore 严格拒绝 `none+paths`、`pending+empty`、非法枚举/JSON/路径；Console/TUI/`/status` 展示组合状态。
+- 首次完整回归 `Ran 1594`，出现 2 个失败，未记作通过：外部变化入口先强制失效后读取义务，把原本 none 临时变成 legacy_unknown。按根因修复后，两个失败与真正 legacy 组合对照均通过。最终完整回归 `Ran 1594 tests in 274.280s`，OK（13 skipped）。专项：验证义务 26、验证证据 80（1 skipped）、Session 116、任务验证 20、任务结果记忆 18、结束协议 20、TUI 35、Console UI 25，全部通过。
+- 兼容与限制：数据库没有新增列，但写入 `legacy_unknown+paths` 后旧版程序可能拒绝读取；旧代码已经误清且没有来源的数据无法自动重建。未验证 Linux/macOS、Python 3.12、真实 Provider、真实用户数据库迁移或手工 Console/TUI。未读取 `.env.local`、真实凭据或用户会话库，未安装依赖、调用真实模型、提交或推送。证据位于 `runtime/verification-obligation/review-fixes/`。
+
+## 2026-10-07 历史验证义务范围独立复审（3 项 P2 待补齐）
+
+- 审查基线 HEAD `7c26bd7`，开始时工作树干净。原始“恢复会话后只读回顾误判失败”回归已通过；新鲜聚焦 333 项、54.041 秒、OK（1 skipped），本轮未重跑全量。
+- 额外探针复现三项义务误清除：F1 检查目标忽略 cwd，子目录 compileall 点号可清除根目录 app.py；F2 unittest 明确零测试仍清除语法损坏 app.py 的义务；F3 legacy_unknown 被新 pending 覆盖，之后局部通过使历史未知也消失。三者均在临时 SQLite 重启后确认持久化。
+- 证据与修复方向：`runtime/verification-obligation/review-findings.md`；可执行探针 `review-repro.py`、输出 `review-repro.log`，回归日志 `review-focused.log`。旧通过记录过期对照仍正确保留 pending，不列为缺陷。
+- 下一步：coding session 将三项转为正式失败测试并最小补齐，之后复审；不回退当前回顾正常交付逻辑，不放宽 UNKNOWN 等硬门禁。审查仅新增诊断/记录并更新交接，没有修改生产代码或正式测试，未访问真实数据或模型服务、安装依赖、提交或推送。
+
 ## 2026-10-07 历史验证义务范围修复（修复完成，待复审）
 
 - 按 `docs/superpowers/plans/2026-10-07-verification-obligation-scope-fix.md` 完成 R0—R4。R0 使用真实 `SessionRuntime`、临时 SQLite、fake Provider 和关闭/重启后的实际 `_build_active` 恢复路径，先稳定复现 3 个 RED：历史失败、历史通过及真实修改待验证都会在恢复后把只读回顾误判为本轮未完成。

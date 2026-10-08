@@ -9,7 +9,11 @@ import unittest
 
 from tricoder.models import RunResult, SessionMemory, SessionRecord
 from tricoder.changes import UndoExecution, UndoPreview
-from tricoder.session.runtime import RuntimeStatus, SessionRuntimeError
+from tricoder.session.runtime import (
+    RuntimeStatus,
+    SessionRuntimeError,
+    WorkspaceOperationCancelled,
+)
 from tricoder.presentation.shell import InteractiveShell
 
 
@@ -74,6 +78,7 @@ class FakeRuntime:
         self.sessions = [self.first, self.second]
         self.tasks: list[str] = []
         self.run_task_calls = 0
+        self.run_task_error: SessionRuntimeError | None = None
         self.persist_ok = True
         self.fail_model = False
         self.clear_calls = 0
@@ -123,6 +128,8 @@ class FakeRuntime:
         self.run_task_calls += 1
         self.tasks.append(task)
         self.events.append("run_task")
+        if self.run_task_error is not None:
+            raise self.run_task_error
         if self.current is None:
             record = make_record(
                 "auto-created",
@@ -341,6 +348,25 @@ class InteractiveShellTests(unittest.TestCase):
 
         self.assertEqual(["检查模块"], self.runtime.tasks)
         self.assertEqual([self.runtime.run_result], self.ui.run_results)
+
+    def test_workspace_rejection_only_cancels_current_operation_and_status_still_works(self) -> None:
+        """工作区确认拒绝不能退出 Shell、切走 Session 或误调用 Provider。"""
+
+        current_id = self.runtime.current.record.id
+        self.runtime.run_task_error = WorkspaceOperationCancelled(
+            "已取消本次操作，会话保留"
+        )
+        shell = self.shell()
+
+        self.assertIsNone(shell.execute("检查工作区"))
+        self.assertIsNone(shell.execute("/status"))
+
+        self.assertEqual(current_id, self.runtime.current.record.id)
+        self.assertEqual(0, self.runtime.agent.calls)
+        self.assertEqual(0, self.runtime.provider.calls)
+        self.assertIn("status", self.ui.text)
+        self.assertTrue(any("会话保留" in item for item in self.ui.text))
+        self.assertFalse(any("任务运行失败" in item for item in self.ui.text))
 
     def test_entry_local_command_matrix_never_activates_agent_or_session(self) -> None:
         """入口本地命令只能读写草稿；会话型命令稳定拒绝且不触及 Agent。"""

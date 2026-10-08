@@ -42,13 +42,19 @@ from tricoder.core.events import AgentEvent, TextDelta
 from tricoder.models import RunResult, SessionRecord, TokenUsage, ToolAction, ToolResult
 from tricoder.presentation.approval_wait import ApprovalWait
 from tricoder.presentation.clarification_wait import ClarificationWait
+from tricoder.presentation.console import format_historical_verification_obligation
 from tricoder.core.cancellation import CancellationToken
 from tricoder.core.clarification import (
     ClarificationRequest,
     ClarificationResult,
     ClarificationStatus,
 )
-from tricoder.session.runtime import SessionInUseError, SessionRuntime, SessionRuntimeError
+from tricoder.session.runtime import (
+    SessionInUseError,
+    SessionRuntime,
+    SessionRuntimeError,
+    WorkspaceOperationCancelled,
+)
 
 
 def _format_token_usage(usage: TokenUsage) -> str:
@@ -490,6 +496,14 @@ class TricoderApp(App[None]):
                 )
             )
         self.log_line(Text.assemble(("工作区：", "dim"), _p(status.workspace)))
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            self.log_line(
+                Text.assemble(
+                    ("工作区基线：", "yellow"),
+                    _p(baseline_message),
+                )
+            )
         self._refresh_sidebar_impl()
         self.query_one(Input).focus()
 
@@ -550,6 +564,12 @@ class TricoderApp(App[None]):
         content.append("\n")
         content.append(_p(workspace))
         content.append("\n\n")
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            content.append("工作区基线", style="bold")
+            content.append("\n")
+            content.append(_p(baseline_message))
+            content.append("\n\n")
         content.append("模式", style="bold")
         content.append("\n")
         content.append(_p(mode))
@@ -568,11 +588,10 @@ class TricoderApp(App[None]):
         pending_verification_paths = getattr(status, "pending_verification_paths", 0)
         content.append(
             _p(
-                f"尚未确认（{pending_verification_paths} 项）"
-                if verification_obligation == "pending"
-                else "来源待确认"
-                if verification_obligation == "legacy_unknown"
-                else "无"
+                format_historical_verification_obligation(
+                    verification_obligation,
+                    pending_verification_paths,
+                )
             )
         )
         content.append("\n\n")
@@ -658,6 +677,10 @@ class TricoderApp(App[None]):
             return
         try:
             result = self.runtime.run_task(task)
+        except WorkspaceOperationCancelled as exc:
+            self.log_line_safe(Text(str(exc), style="yellow"))
+            self.refresh_sidebar()
+            return
         except SessionRuntimeError as exc:
             self.log_line_safe(
                 Text.assemble(("任务运行失败：", "bold red"), _p(exc))
@@ -696,12 +719,9 @@ class TricoderApp(App[None]):
             ),
             Text(
                 "历史修改验证："
-                + (
-                    f"尚未确认（{len(result.pending_verification_paths)} 项）"
-                    if result.verification_obligation == "pending"
-                    else "来源待确认"
-                    if result.verification_obligation == "legacy_unknown"
-                    else "无"
+                + format_historical_verification_obligation(
+                    result.verification_obligation,
+                    len(result.pending_verification_paths),
                 ),
                 style="dim",
             ),
@@ -1084,6 +1104,15 @@ class TricoderApp(App[None]):
                 _p(status.model),
             )
         )
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            self.log_line(
+                Text.assemble(
+                    ("工作区基线", "cyan"),
+                    " ",
+                    _p(baseline_message),
+                )
+            )
         mode = "只读" if status.read_only else "可编辑 · 人工审批"
         self.log_line(
             Text.assemble(
@@ -1105,11 +1134,10 @@ class TricoderApp(App[None]):
                 ("历史修改验证", "cyan"),
                 " ",
                 _p(
-                    f"尚未确认（{pending_verification_paths} 项）"
-                    if verification_obligation == "pending"
-                    else "来源待确认"
-                    if verification_obligation == "legacy_unknown"
-                    else "无"
+                    format_historical_verification_obligation(
+                        verification_obligation,
+                        pending_verification_paths,
+                    )
                 ),
             )
         )
@@ -1295,6 +1323,15 @@ class TricoderApp(App[None]):
         self.log_line_safe(
             Text.assemble(("已创建并切换到新会话：", "yellow"), _p(name))
         )
+        status = self.runtime.status()
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            self.log_line_safe(
+                Text.assemble(
+                    ("工作区基线：", "yellow"),
+                    _p(baseline_message),
+                )
+            )
         self.refresh_sidebar()
 
     def _choose_session(self) -> None:
@@ -1349,6 +1386,15 @@ class TricoderApp(App[None]):
         self.log_line_safe(
             Text.assemble(("已切换到会话：", "yellow"), _p(record.name))
         )
+        status = self.runtime.status()
+        baseline_message = getattr(status, "workspace_baseline_message", "")
+        if baseline_message:
+            self.log_line_safe(
+                Text.assemble(
+                    ("工作区基线：", "yellow"),
+                    _p(baseline_message),
+                )
+            )
         self.refresh_sidebar()
 
     # ---- 退出 ----

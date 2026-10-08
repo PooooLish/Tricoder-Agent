@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Callable
 
 from tricoder.core.cancellation import CancellationToken
+from tricoder.workspace.baseline_record import (
+    BaselineComparison,
+    BaselineRecord,
+    BaselineRecordError,
+    compare_baseline_records,
+    make_baseline_record,
+)
 from tricoder.workspace.snapshot import (
     SnapshotLimits,
     WorkspaceBaseline,
@@ -23,6 +30,10 @@ class WorkspaceGateError(RuntimeError):
 
 class WorkspaceConfirmationUnavailable(WorkspaceGateError):
     """当前入口没有显式确认能力。"""
+
+    def __init__(self, kind: str = "changed") -> None:
+        self.kind = kind
+        super().__init__(kind)
 
 
 class WorkspaceConfirmationRejected(WorkspaceGateError):
@@ -82,6 +93,7 @@ class WorkspaceGate:
         *,
         baseline: WorkspaceBaseline | None,
         require_initialization_confirmation: bool,
+        persisted_baseline: BaselineRecord | None = None,
         session_id: str,
         request_id: str,
         generation: int,
@@ -90,13 +102,13 @@ class WorkspaceGate:
         change_observer: ChangeObserver | None = None,
     ) -> WorkspaceGateDecision:
         candidate = self._capture(root, cancellation)
-        if baseline is None and not require_initialization_confirmation:
+        if baseline is None and persisted_baseline is None and not require_initialization_confirmation:
             return WorkspaceGateDecision(candidate, changed=False)
 
         last_preview: WorkspaceGatePreview | None = None
         for _attempt in range(self._max_confirmations):
             self._raise_if_cancelled(cancellation)
-            if baseline is None:
+            if baseline is None and persisted_baseline is None:
                 preview = WorkspaceGatePreview(
                     preview_id=secrets.token_hex(16),
                     request_id=request_id,
@@ -112,23 +124,47 @@ class WorkspaceGate:
                 )
             else:
                 try:
-                    comparison = compare_baselines(baseline, candidate)
-                except (TypeError, ValueError) as exc:
-                    raise WorkspaceGateError(
-                        "工作区快照身份或范围发生变化，任务未启动"
-                    ) from exc
-                if not comparison.changed:
+                    candidate_record = make_baseline_record(candidate)
+                    reference_record = (
+                        make_baseline_record(baseline)
+                        if baseline is not None
+                        else persisted_baseline
+                    )
+                    assert reference_record is not None
+                    stable_comparison = compare_baseline_records(
+                        reference_record,
+                        candidate_record,
+                    )
+                except (BaselineRecordError, TypeError, ValueError) as exc:
+                    raise WorkspaceGateError("工作区基线比较失败，任务未启动") from exc
+                if not stable_comparison.changed:
                     return WorkspaceGateDecision(candidate, changed=False)
-                preview = self._changed_preview(
-                    comparison,
-                    request_id=request_id,
-                    generation=generation,
-                    session_id=session_id,
-                )
+                if baseline is not None and stable_comparison.compatible:
+                    try:
+                        comparison = compare_baselines(baseline, candidate)
+                    except (TypeError, ValueError) as exc:
+                        raise WorkspaceGateError(
+                            "工作区快照身份或范围发生变化，任务未启动"
+                        ) from exc
+                    preview = self._changed_preview(
+                        comparison,
+                        request_id=request_id,
+                        generation=generation,
+                        session_id=session_id,
+                    )
+                else:
+                    preview = self._persistent_preview(
+                        stable_comparison,
+                        reference_record,
+                        candidate_record,
+                        request_id=request_id,
+                        generation=generation,
+                        session_id=session_id,
+                    )
                 if change_observer is not None:
                     change_observer(preview)
             if confirmer is None:
-                raise WorkspaceConfirmationUnavailable()
+                raise WorkspaceConfirmationUnavailable(preview.kind)
             approved = confirmer(preview)
             self._raise_if_cancelled(cancellation)
             if approved is not True:
@@ -138,7 +174,7 @@ class WorkspaceGate:
             if rescanned.snapshot_id == candidate.snapshot_id:
                 return WorkspaceGateDecision(
                     rescanned,
-                    changed=baseline is not None,
+                    changed=(baseline is not None or persisted_baseline is not None),
                     preview=preview,
                 )
             candidate = rescanned
@@ -147,6 +183,57 @@ class WorkspaceGate:
             "工作区在确认期间持续变化，任务未启动"
             if last_preview is not None
             else "工作区门禁无法完成"
+        )
+
+    @staticmethod
+    def _persistent_preview(
+        comparison: BaselineComparison,
+        baseline: BaselineRecord,
+        candidate: BaselineRecord,
+        *,
+        request_id: str,
+        generation: int,
+        session_id: str,
+    ) -> WorkspaceGatePreview:
+        """为跨进程记录生成不含源码正文的文件级预览。"""
+
+        labels = {
+            "added": "新增",
+            "deleted": "删除",
+            "modified": "修改",
+            "type_changed": "类型变化",
+            "permission_changed": "权限变化",
+        }
+        lines = [
+            f"{labels.get(change.change_type, '变化')}  {change.path}"
+            for change in comparison.changes
+        ]
+        if not comparison.compatible:
+            reason_labels = {
+                "workspace_mismatch": "工作区绑定不一致",
+                "scope_version_changed": "扫描范围版本变化",
+                "root_identity_changed": "工作区根身份变化",
+            }
+            lines = [reason_labels.get(comparison.reason, "持久化基线不兼容")]
+        pages = tuple(
+            "\n".join(lines[index:index + 50])
+            for index in range(0, len(lines), 50)
+        )
+        return WorkspaceGatePreview(
+            preview_id=secrets.token_hex(16),
+            request_id=request_id,
+            generation=generation,
+            session_id=session_id,
+            workspace_key=candidate.workspace_key,
+            baseline_id=baseline.content_digest,
+            candidate_id=candidate.content_digest,
+            kind="changed" if comparison.compatible else "incompatible",
+            changed_paths=comparison.changed_paths,
+            pages=pages,
+            message=(
+                "工作区相对于本 Session 上次持久化基线发生变化；"
+                "跨重启仅提供文件级差异，确认只接受当前候选作为操作起点"
+            ),
         )
 
     def _capture(
