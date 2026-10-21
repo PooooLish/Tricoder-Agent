@@ -107,3 +107,8 @@ def check_current_cancellation() -> None:
     token = _current_cancellation.get()
     if token is not None:
         token.raise_if_cancelled()
+
+
+def current_cancellation() -> CancellationToken | None:
+    """向同步内部子进程传递当前令牌，不把任务状态写入共享工具上下文。"""
+    return _current_cancellation.get()

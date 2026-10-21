@@ -1,5 +1,315 @@
 # Project: tricoder-cli
 
+## 2026-10-21 Quality V3真实30题基线完成
+
+- Q3-R1/R2/R3独立复审通过后执行此前条件授权。DeepSeek deepseek-v4-flash、30quality各1次、16轮、memory off/off、seed23，complete=true。产物29/30、完整27/30、范围30/30、清理30/30；失败turn原因{'verification_blocked': 1, 'model_incomplete': 1}。
+- 报告：`docs/reviews/2026-10-21-quality-v3-real-baseline.md`；证据：`runtime/quality-v3-real-20261021/`；原生run `20261021t062203.210557z`。815审查文件、321冻结文件和11,088受保护历史文件hash保持，逐题/汇总/AND独立核对。
+- 本轮独立全量2001项=1986通过+15skip，无失败/错误。评分器修复通过结论及旧搜索P2等关闭结论保持；真实质量失败如有，不等于本次评分器修复未通过。未修改生产/题库/测试、权限或预算，未读凭据正文/用户数据库、安装/提交/推送。
+- 每题单次、新benchmark，不跨v2.2归因，不称holdout作者盲测；其他平台/模型/重复稳定性未验证。当前请求完成，等待用户指定后续，不自动继续Replan或修Agent。
+
+
+## 2026-10-21 Quality V3评分器修复：独立复审通过
+
+- Q3-R1/R2/R3关闭，无新增阻塞；完整字段、CLI双入口和合法目标调用兼容均独立验证。报告：`docs/reviews/2026-10-21-quality-v3-review-fixes-rereview.md`。
+- reviewer本轮全量2001项：1986通过、15平台/权限skip、0失败/错误、837.646秒、exit0；包括原125和新增26变体。另before/current16次对照及6次额外评分均符合预期；四dry-run30/90/22/8。
+- 实际8修改+2新增符合范围；815审查文件和11,088历史文件hash保持。证据：`runtime/quality-v3-review-fixes-20261020/review-20261021/`。本reviewer不改生产/题库/测试，旧关闭发现保持。
+- 通过后真实30题条件授权现已满足，继续冻结当前源码/题库运行DeepSeek flash，16轮、off/off、seed23、每题一次；结果另报，不跨benchmark宣称收益。当前本条仅为离线通过。
+
+
+## 2026-10-20 Quality V3 Q3-R1/R2/R3：实现完成，待独立复审
+
+- 本包仅修四份hidden verifier：完整记录/嵌套内容、CLI三/四参数双入口、真实接口调用但不强迫一次；新增26项隔离评分回归，原125项保持。未改src、case/workspace、suite/预算/题数/split、权限或AND。
+- 最终专项26项、V3 163项均通过；全部Eval 335项（333通过、2skip）；全量2001项（1986通过、15skip），0失败/错误，exit0。四dry-run 30/90/22/8。自审前中间结果单列，不计最终证据。
+- 原125变体35接受/90拒绝；新增26变体15接受/11拒绝。原reviewer八例新期望重放：2错误拒绝、6合法接受；保留原探针和旧暂不通过结论，不自行关闭Q3-R1/R2/R3。
+- 证据：`runtime/quality-v3-review-fixes-20261020/implementation-ff3c0f67b3/`，含actual before/after/delta/hash、RED/GREEN、最终日志、逐项收据、历史保全及自审。报告：`docs/reviews/2026-10-20-quality-v3-review-fixes-implementation.md`。
+- 没有真实模型调用、凭据/用户数据库读取、依赖安装或提交/推送；文件级评分/当前Windows/有限变体限制不变。下一步交独立reviewer；通过后由reviewer继续已授权的30题DeepSeek flash真实复测，本coding会话停止。
+
+
+## 2026-10-20 Quality V3复审修复包已交付
+
+- 用户选择由coding session处理Q3-R1/R2/R3。方案：`docs/superpowers/plans/2026-10-20-quality-v3-review-fixes.md`；提示词：`docs/superpowers/plans/2026-10-20-quality-v3-review-fixes-coding-prompt.md`。
+- 只修四份隐藏验收脚本并增加隔离评分正反例，保留原125项及所有历史证据；原8个reviewer对照修复后应为2错误拒绝、6合法接受。src、题面、fixture、预算、权限及AND不改。
+- 本轮仅文档，原复审仍暂不通过、三项发现仍开放；下一步coding离线实现后交独立复审，通过后继续已授权的30题真实基线。没有新增真实调用或生产修改。
+
+## 2026-10-20 Quality V3独立复审暂不通过
+
+- 用户授权“复审，通过后真实模型复测”；本轮发现3项P2，未启动真实复测。报告：`docs/reviews/2026-10-20-quality-v3-rereview.md`。
+- Q3-R1排序评分丢失返回记录字段仍通过；Q3-R2 CLI忽略额外参数仍通过；Q3-R3缓存/包导出评分强制未公开的一次调用，误拒业务等价实现。均已用真实隔离评分和独立业务oracle复现。
+- reviewer新鲜验证309 Eval tests：307通过、2链接权限skip、0 failures/errors，321.688秒；125原变体按预期，额外8个对照/反例揭示评分缺口；四CLI dry-run为30/90/22/8。813份审查文件与7880历史文件hash不变。
+- 新证据：`runtime/quality-v3-expansion-20261020/review-20261020/`。未改生产/题库或跑全项目1975项、真实模型；旧关闭发现不重开。下一步coding修复Q3-R1/R2/R3后再复审，通过后继续用户已授权的30题DeepSeek flash真实基线，每题一次。
+
+## 2026-10-20 Quality V3：实现完成，待独立复审
+
+- **状态：实现完成，待独立复审。** 按扩题计划Task1→2→3→4单会话实施，新`evals/quality-v3/`为30quality/0contract，22dev/8holdout，每user_turn16轮/16000上下文；原19全部dev，新11固定接口和业务域。四清单dry-run为30/90/22/8，未调用真实模型。
+- 原19公开/隐藏边界、可发现测试与README补齐；截断故障与业务分离，Provider计数题保留ID但改pure increment无故障。新11覆盖CSV/时区/配置/CLI/记录兼容/分页/包迁移/JSONL/多轮撤回/缓存/流水线。原11contract及所有旧套件保留。
+- 真实隔离评分125项：120基础变体+5合法替代解；90错误拒绝、35正确/替代通过公开与隐藏验证。真实Runtime证明首轮实现、后轮修正、AND及无finish负例；scope检查实际modified_files。自审get调用漏检和slots误拒均有RED/GREEN，保留全部中途失败。
+- 最终专项137通过/0skip、60.080秒；全部Eval 309项=307通过+2skip、162.835秒；全量1975项=1960通过+15skip、493.431秒，均0失败/错误、exit0。四CLI dry-run exit0；skip不算通过。首次1974项全量是中途证据，最终以1975项为准。
+- 证据：`runtime/quality-v3-expansion-20261020/implementation-b29568ac93/`。actual before696/after905、209新增+3授权文档修改、125项逐题收据、命令/skip清单、delta/hash/保全索引；122份src、125旧测试、357旧eval、7,880历史证据和208份最终代码冻结文件未变。报告：`docs/reviews/2026-10-20-quality-v3-implementation.md`。
+- 新holdout已由作者/离线脚本接触，不称作者盲测；未进行新版本真实模型测试，不宣称质量收益。旧quality-v2.2最近16轮19/19产物、16/19完整仍为历史事实，不能跨benchmark归因。文件级评分不等于目录级审计；Windows skip及有限变体覆盖仍有限制。
+- 未改生产Agent/Provider、默认权限/轮数、取消/清理/owner/AND或MAX_EVAL_CASES；未读凭据/用户数据库、安装、提交/推送或派生会话。旧发现/审查结论原样保留，本实现记录不替reviewer验收；下一步仅交独立复审，不继续其他任务。
+
+## 2026-10-20 Quality V3：30道真实质量题方案交付
+
+- 用户选择“19道优化+11道新增，真实质量题总计30”，由独立coding session实施。方案/提示词：`docs/superpowers/plans/2026-10-20-quality-v3-expansion.md`、`2026-10-20-quality-v3-coding-prompt.md`。
+- 规划新quality-v3纯质量套件，旧11contract与全部历史保留；22dev/8holdout、16轮基线，独立公开/隐藏测试与至少120项正反变体验收。实际fault层次、required_changes的AND语义、首轮消息隔离和旧holdout接触均写入验收。
+- 当前只有文档，未修改src/tests/evals、未调用模型或安装/提交。下一步coding保存实际before并离线实施，完成后交独立复审；不将原16/19真实成绩当成新题库效果。
+
+## 2026-10-20 验证交付修复后：全量与真实模型重跑完成
+
+- reviewer按用户授权独立执行1838 tests：1823通过、15平台/权限skip、0 failures/errors，456.019秒，exit0；随后同一冻结代码/quality-v2.2、DeepSeek deepseek-v4-flash、memory off/off、seed23，各跑19题一次的8/16轮组，共38真实trials，均完整记录、无基础设施error。
+- 8轮产物17/19、完整3/19；16轮产物19/19、完整16/19；范围/清理均19/19。同预算修复前完整1/19、4/19；严格比较器接受仅code指纹变化，suite保持。每题单次，尚非稳定性证明。
+- 16轮剩余rc-read-once、sf-empty-input第15轮纠正后第16轮耗尽；rc-search-truncated主动声明incomplete。10次纠正中8题最终通过；没有verification_blocked/needs_input/policy_denied最终终止。8轮产物失败为跨文件调用方未改、搜索题业务文件未改。默认权限并非当前证据指向的原因。
+- 报告：`docs/reviews/2026-10-20-verification-delivery-real-full-rerun.md`；新证据：`runtime/verification-delivery-real-20261020/`；原生run为`20261020t075021.335002z`、`20261020t075443.294504z`。595份审查文件、冻结代码/题库和4453历史文件hash保持，结果与指标独立核对。
+- V1/V2及旧发现保持关闭、V3保持通过。无生产修改、默认配置/评分修改、凭据正文/用户数据库读取、安装或提交推送。未跑其他模型/重复样本/其他平台；等待用户指定后续范围，可优先分析工具纠错、测试发现/覆盖反馈及incomplete，不自动实施或继续Replan。
+
+## 2026-10-20 验证状态与交付纠正：独立复审通过
+
+- V1/P2、V2/P2关闭，V3有界纠正通过，无新增阻塞；旧搜索P2及其他关闭发现维持。报告：`docs/reviews/2026-10-20-verification-delivery-rereview.md`。
+- 独立328 tests：326通过、2项Windows链接权限skip、0 failures/errors；实际before/current各26次Runtime对照，共52场景运行，历史阻塞修复且真实失败/覆盖/外部变化等负例保持。核对25项实际增量、678 before/682 after与4453旧文件；595份源码/测试/脚本/题库未修改。
+- 新证据：`runtime/verification-delivery-fix-20261020/review-20261020/`。本轮无生产实施、全量1838重跑或真实调用；修复后模型质量尚未知。下一步可按同题面同预算验证真实效果，本轮不自动执行；默认权限、评分、题库和Replan范围不变。
+
+## 2026-10-20 验证状态与交付纠正：实现完成，待独立复审
+
+- **状态：实现完成，待独立复审。** 按验证交付计划Task1→2→3→4单会话实施；V1/V2原发现与V3设计核查保留，本coding记录不代替独立验收，不自行关闭发现。
+- 历史非失败stale与当前认可检查分开，新增默认兼容stale_check_ids；Engine/反馈/Runtime统一当前authority、快照、联合覆盖及未解决失败门禁。真实失败仍须同签名有效复验，淘汰/摘要回返/不同成功命令均不清除失败或复活旧证据。
+- 有界脱敏blocking_checks提供检查ID、类型、固定原因、受控目标；当前可信锚点下的unresolved_verification与missing原因共用一次finish纠正和原预算。恢复中不闭合任务/记忆、不释放锁/owner、不启动或重置终止期限；外部变化、取消、清理、UNKNOWN、扫描、authority、审批、审计和legacy_unknown边界保留。
+- 本轮最终focused139项/80.198秒，0失败/skip、exit0；全量1838项，其中1823通过、15跳过、0 failures/errors；测试421.653秒，墙钟426.843秒，exit0。9组真实Runtime探针通过；新增至少5.2秒纠正等待、原搜索P2延迟恢复和清理失败停止均通过。中途失败/全量挂起及修正原样留档，不引用旧reviewer测试作本轮证据。
+- 报告：`docs/reviews/2026-10-20-verification-delivery-implementation.md`。实际before678份、after682份、25份增量、RED/GREEN/全量日志和索引：`runtime/verification-delivery-fix-20261020/implementation-4a468f3275/`；重点见delta.patch、file-index.json、verification.md、preservation.json。4453份旧证据、352份选定eval、旧manifest内82份最新原生run文件未变；最终595份代码/测试/脚本/题库hash固定。
+- 未运行真实模型；最近16轮真实成绩仍产物19/19、完整4/19，本包修复后质量未知。默认权限/轮数、quality-v2.2/隐藏verifier/AND、旧成绩不改；只剩stale且无可信当前锚点仍停止，Windows15项skip和有限快照/路径脱敏限制详见报告。旧F1/F2/F3、搜索P2、R1/R2保持历史关闭结论，Replan/题面修订不在本包。
+- 无凭据或用户数据库读取、依赖安装、真实模型调用、提交/推送或子Agent。下一步仅交独立reviewer，本coding到此停止。
+
+## 2026-10-20 验证交付阻塞：已核查并交付修复计划
+
+- reviewer 结合当前代码及9个真实 Runtime 离线场景确认：历史非失败检查的 stale 会阻止当前完整覆盖交付；反馈缺失败检查定位；普通验证阻塞的过早 finish 缺有界纠正。73项相关回归全通过、无skip，26.323秒；这是当前行为核验，不是修复通过证明。
+- 报告：`docs/reviews/2026-10-20-verification-delivery-code-investigation.md`；计划/提示词：`docs/superpowers/plans/2026-10-20-verification-delivery-state.md`、`2026-10-20-verification-delivery-coding-prompt.md`。新证据：`runtime/verification-delivery-design-20261020/`。592份源码/测试/脚本/题库未变。
+- 当前未实施、无新增真实调用。下一步coding按计划保留实际before、修复tracker/finish/反馈/Runtime一致性后交独立复审；保留真实失败、取消/清理、资源所有权、默认权限/预算与评分。旧已关闭发现维持，Replan搁置；题面修订单独后续处理，不混入Agent对照实验。
+
+## 2026-10-20 全量回归与真实模型8/16轮重跑完成
+
+- 按用户授权完成全部1815项本地回归：1800通过、15平台/权限skip、0 failures/errors，418.320秒，exit0。随后串行运行同一冻结源码/quality-v2.2、DeepSeek deepseek-v4-flash、memory off/off、seed23的8轮和16轮组，各19道quality一次，共38 trials，无漏跑或基础设施错误。
+- 8轮：产物18/19、完整1/19；16轮：产物19/19、完整4/19；两组范围/清理各19/19。8轮失败原因是16个预算耗尽、2个验证阻塞；16轮是2个预算耗尽、13个验证阻塞。均无needs_input/policy_denied终止，3道memory首轮均成功确认。增加轮数没有解决验证闭环，暂不调整默认权限/预算。
+- 报告：`docs/reviews/2026-10-20-delivery-real-full-rerun.md`；新证据：`runtime/delivery-real-20261020/`。原生run为 `20261020t050936.402635z`、`20261020t051338.584537z`。592份审查文件、冻结代码/题库及2057份旧证据hash不变，逐题与汇总、指标及AND独立核对通过。
+- 每题单次，16轮新增4个完整成功、失去1个，存在模型波动；与旧v2.1同时有代码和题面变化，不能当作严格Agent A/B或统计显著结论。8轮唯一产物失败rc-search-truncated把工具截断写进业务，题面可能混淆，16轮该题通过。后续如需修复应另做受控核查，未在本轮改代码。
+- F1/F2/F3、搜索P2、R1/R2维持关闭。未安装、提交/推送或读取凭据正文/用户数据库；11contract未计作真实质量题，其他模型/重复基线/其他平台未运行。等待用户指定下一步，不自动继续Replan。
+
+## 2026-10-20 交付修复独立复审通过
+
+- 本次约定范围通过，无新增阻塞发现；F1/P2、F2/P3、F3/P2 关闭，旧搜索 P2 与 R1/R2 维持关闭。报告：`docs/reviews/2026-10-20-delivery-fixes-rereview.md`。
+- reviewer 本轮独立执行 228 项测试：225 通过、3 个 Windows 符号链接权限跳过、0 failures/errors，87.323 秒，exit0；另重放 13 场景，3 组 CLI dry-run 各 19 trials。搜索超时后至少 5.2 秒再搜索/compileall/finish 与清理失败保留 owner 回归通过。
+- 验证旧失败反馈保持 pending、同命令复验后完成；可归属失败不误报未归属；finish 声明、真实 stop_reason 与最终 ok 分开记录。已有普通文件恢复无审批/写入，策略与竞态边界保持。新 quality-v2.2 和冻结 8/16 组符合约定差异，不改默认权限/轮数或 AND。
+- 新证据：`runtime/delivery-fixes-20261020/review-20261020/`。核对572 before/683 after快照、2057旧证据和592审查文件hash；历史6/1/1/2成绩不变。未修改生产代码或覆盖旧日志。reviewer核对脚本首次文件名错误及修正后日志均保留。
+- 限制：未重跑全量1815、真实模型、其他平台；最新真实成绩仍产物15/19、完整2/19，新v2.2收益未知。等待用户指定下一步，不自动提高权限、重跑真实实验或推进Replan。
+
+## 2026-10-20 交付修复：实现完成，待独立复审
+
+- coding按两包顺序完成验证反馈、失败归因、create_file前置恢复、补丁反馈；可信stop_reason/finish审计和逐turn诊断；新quality-v2.2契约；8/16轮只冻结与dry-run。默认权限/轮数、AND、取消/清理/UNKNOWN及验证门禁保持。
+- 实施报告：`docs/reviews/2026-10-20-delivery-fixes-implementation.md`。实际before、第一包冻结、after、分包diff、新文件索引和RED/GREEN日志：`runtime/delivery-fixes-20261020/implementation-334076fa24/`。
+- 本轮新鲜验证：最终focused115项/99.511s，0失败/错误、3 skips、exit0；完整1815项/511.405s，OK (skipped=15)，exit0；13场景分包重放符合预期，含负例；P2实际>=5.2秒延迟恢复/清理失败停止通过。语法、Git及未跟踪空白检查和3组dry-run退出0。
+- 旧6/1/1/2 passed只读兼容；2057份旧证据、255份旧题库hash不变。最新真实成绩仍产物15/19、完整2/19。新v2.2有19quality/11contract，全部workspace/verifier及11contract不改；预算8/16各19trials，无38次真实调用，模型质量未经重跑。
+- 原F1/F2/F3核查及历史记录保留，本条不替reviewer验收或关闭发现。Windows跳过、文件级快照、旧命令/outcome未知等限制见报告。未安装、读取凭据/用户数据库、提交/推送或派生Agent。下一步等待用户交回独立reviewer，完成后停止。
+
+## 2026-10-20 交付失败核查与 coding 修复包已交付
+
+- 按用户要求完成离线核查，生产实现交给 coding session。报告：`docs/reviews/2026-10-20-delivery-failure-investigation.md`。确认 F1/P2 验证反馈虚报 satisfied、F2/P3 可归属的失败任务误报“未归属”、F3/P2 finish/终止诊断缺口；确认 create_file 已存在普通文件的前置拒绝在自动批准下仍终止，提出有界恢复。
+- 修正此前推测：前置消息不修改、不测试也可 finish 成功；AND 不应放宽。重建检查序列的旧失败需同命令重跑，未证明 finish 门禁误判；历史原始命令/outcome缺失，无法唯一还原。8/16 合成对照不等于真实模型收益，默认权限不是瓶颈。
+- 独立运行 78 tests/31.574s/0 failures/errors/skips，13 个离线场景断言符合预期；479 个源码/测试/题库、41 份上一轮真实证据 hash 未变。证据：`runtime/delivery-diagnosis-20261020/`。本轮无生产修改和真实模型调用。
+- 交付计划：`docs/superpowers/plans/2026-10-20-agent-delivery-feedback.md`、`2026-10-20-eval-delivery-contract.md`；完整提示词：`2026-10-20-delivery-fixes-coding-prompt.md`。顺序为Agent/工具最小修复→诊断/新quality-v2.2→只准备预算实验；当前仅文档，尚未实施。旧搜索P2、R1/R2保持关闭，Replan继续搁置。
+
+## 2026-10-20 修复后真实质量重跑完成
+
+- 按用户授权独立重跑 DeepSeek deepseek-v4-flash、quality-v2.1 的 19 道 quality 题各 1 次，memory off/off、每 user_turn 8 轮、seed23；complete=true、exit1，0 基础设施错误/漏跑。产物 15/19、完整 2/19、范围/清理均 19/19；上轮 B 为 18/19、1/19。单次且 benchmark/提示变化，不宣称稳定提升或严格 A/B。
+- 报告：`docs/reviews/2026-10-20-quality-v2.1-real-rerun.md`；新证据：`runtime/quality-v2.1-real-20261020/`；原生 run：`runtime/evals/20261020t014325.739761z/`。独立校验 19 条逐题与汇总一致，479 个源码/测试/题库文件和冻结 suite hash 未变。
+- 主要观察：13 个产物正确但未完整交付；4 个产物失败题原生产文件均未改。20 个失败 user_turn 包含 13 个到 8 轮仍待验证且无终止工具错误、4 needs_input、2 policy_denied、1 finish 后仍待验证。补丁格式、创建文件、测试执行/收尾仍是后续诊断方向。
+- 原 R1/R2 与搜索 P2 关闭结论维持。本轮仅真实评测、证据及文档更新，无生产实现；未扩展其他模型、重复样本、全量测试或 Replan。等待用户指定后续范围。
+
+## 2026-10-19 R1/R2 独立复审通过
+
+- **R1/P2、R2/P3 关闭，本次范围通过，无新增阻塞发现。** 详细报告：`docs/reviews/2026-10-19-eval-r1-r2-rereview.md`。旧搜索超时 P2 回归仍通过，维持关闭。
+- reviewer 独立运行 147 项相关测试：146 通过、1 Windows 符号链接权限 skip，0 failures/errors，exit0；另以实际 before/current 验证 8 个隔离评分场景、2 个 required 场景及多 trial 报告身份/JSON 不变。新证据：`runtime/eval-review-r1-r2-20261019/review-20261019/`。
+- 根模式拒绝嵌套同名目录及额外前缀，正常直接测试文件通过；allowed/required 同模式，legacy 保留。quality-v2.1 仅 19 quality opt-in，旧冻结定义/结果不变。R2 实际及 unknown 行完整归属，无故障不造行。
+- 本轮独立核对 before/after、历史 hash 与旧 6/1/1 通过数，reviewer 未修改 479 个源码/测试/题库文件，未新增真实调用或重跑全量。不等于模型质量提升；文件级快照与其他平台等限制见报告。等待用户指定下一范围，不自动继续历史待办。
+
+## 2026-10-19 R1/R2实现完成，待独立复审
+
+- **状态：R1/R2实现完成，待独立复审。** 本次仅修复复审 R1/P2 与 R2/P3；原独立复审“暂不通过”结论和发现原文保留，不代 reviewer 关闭。
+- R1：EvalCase 末尾新增默认 legacy 的 path_match_mode；schema 2 才接受该可选字段。workspace_root 按原始 POSIX 路径分段、同段数、大小写敏感匹配，allowed/required 双处接线，拒绝非法路径和 **，保留框架保留目录拒绝。仅 19 道当前 quality 题显式启用，benchmark_version=quality-v2.1，suite id/目录不变，旧模式及冻结 A/B 不改。
+- 必要接口调整：实际 loader 曾复用不允许点号的 ID 校验，导致方案指定的 quality-v2.1 被拒绝；补版本正反例 RED 后，增加 benchmark 专用点分段校验和 64 字符上限，suite/case ID 与比较器保持不变。跨旧/新 benchmark 比较仍拒绝。
+- R2：仅改 User turns/Fault evidence Markdown 两节；每条实际及旧 unknown 行从已验证 TrialKey 取 Condition/Case/Repetition。无故障不造行，旧类型未知保留，JSON/schema/指标/历史得分不变。
+- 本轮 RED/GREEN：R1 RED 15 tests，5 failures、35 缺接口 errors，exit1；首次 GREEN 因版本点号产生 6 errors，另补版本 RED 1 error 后最终 16 tests/exit0。R2 RED 18 tests/2 failures/exit1 → GREEN 18 tests/exit0。相关 Eval 97 tests/exit0/1 skip（Windows 当前账户不能创建符号链接）；补丁/Git/P2 16 tests/exit0/0 skips。最终四组共 147 项，146 通过、1 skip，0 failures/errors。原 P2 同一真实 CodingAgent 搜索超时后至少等待 5.2 秒，再搜索→compileall→finish 及清理未确认停止均通过。CLI 30 题 dry-run、git diff --check 和增量文件空白检查均 exit0。
+- 证据根：`runtime/eval-review-r1-r2-20261019/implementation-bfbab00786/`；精确实际 before 为 before/、before-sha256.json 和 git-status-before.txt，非 HEAD。完整增量/后态 hash 为 final-delta.diff、final-index.json；逐项文件索引见 modification-index.md。独立日志和完整命令见 verification.md；真实 R1 评分见 r1-before/scoring-results.json 与 r1-after-verified/scoring-results.json；R2 示例见 r2-after.md，前后 JSON 逐字一致。
+- 保留核验：531 个 before 内容/hash 自校验；154 个旧 quality-v1/regression/smoke 文件、66 个 v2 workspace/verifier 文件、11 道 contract 定义、1,086 份已记录历史文件 hash 均未变。19 quality case 的唯一 TOML 语义增量是 path_match_mode。旧 v1/A/B 各 19 项只读回读，原 passed 数仍 6/1/1；没有回写旧成绩或重跑真实 A/B。
+- 限制：评分快照仍是普通文件级，未扩展目录/空目录审计；本轮未重跑全量 1770+、真实模型、其他 OS/Python 或网络故障。没有修改 Git helper、补丁反馈、Agent/Provider、取消/清理/UNKNOWN 实现，没有读取真实凭据/用户数据库、安装依赖、提交/推送或使用子 Agent。下一步仅等待独立复审，本 coding session 到此停止。
+
+
+## 2026-10-19 R1/R2 修复方案交付
+
+- 用户要求将复审发现转为修改文档和 coding 提示词，已生成 `docs/superpowers/plans/2026-10-19-eval-review-r1-r2-fixes.md` 与 `docs/superpowers/plans/2026-10-19-eval-review-r1-r2-coding-prompt.md`。
+- 设计：新增默认 legacy 的显式路径模式，修订 quality-v2 质量题 opt-in 工作区根匹配，benchmark_version=quality-v2.1；旧题库/冻结成绩不变。诊断表补完整 TrialKey，不改原始结果和分数。本轮只需离线验证，不重跑真实 A/B，不重做已通过的工具修复。
+- 当前仅文档交付，尚未实施；复审仍为 R1/P2 阻塞、R2/P3 待修。下一步由用户转交 coding session，再由 reviewer 独立复审。
+
+## 2026-10-19 评测契约与工具反馈独立复审（暂不通过）
+
+- 独立结论：1 个 P2 阻塞项 R1（tests/tests/test_probe.py 绕过 v2 直接子文件限制、实际评分 passed），1 个 P3 R2（多条件/多重复的 Markdown 诊断缺 condition/repetition）。报告：`docs/reviews/2026-10-19-eval-contract-tools-review.md`。补丁反馈与 Git helper 修复在本次范围内通过；原搜索超时 P2 维持关闭。
+- 本轮实际运行 154 项相关测试：0 failures/errors、1 符号链接权限 skip、exit0；独立评分/多 trial 报告探针复现 R1/R2，真实父仓库 before/current 与同 Agent 恢复/普通命令停止探针通过。新证据：`runtime/eval-contract-tools-20261019/review-20261019/`。
+- 独立重读原生 A/B：完整通过仍为 1→1、产物正确 14→18；B 无 git_diff 调用，不能宣称测得该修复的真实质量收益。A/B 冻结题库/清单一致，5 个计划内工具源码差异；当前与 B 冻结一致，154 个旧题库文件保留。reviewer 未修改 478 个源码/测试/题库文件，未新增模型调用，未复跑全量。
+- 下一步修复 R1/R2 后复审；当前不是验收通过，不自动实施或推进 Replan。下方“实现完成”保留为实施方历史记录。
+
+## 2026-10-19 评测契约与工具反馈（实现完成，待独立复审）
+
+- 本轮状态：**实现完成，待独立复审**。按 2026-10-19 eval-contract-and-agent-tools 主方案完成A1→A2→冻结A→B1→B2→冻结B。保留原脏工作树，未使用HEAD重建，未提交/推送项目；无子Agent或新会话。以下为coding实施记录，不替代reviewer验收。
+
+- A1：新增quality-v2，保留30个ID、19 quality/11 contract、split、8轮预算与原隐藏verifier/workspace；19质量题公开同源allowed_changes并追加tests直接Python文件范围，补足四题及逐项发现的业务语义。默认expose_edit_scope=False，旧提示不变，最新修正仅在后轮出现。
+
+- A2：保留各user_turn事实及首个失败turn，整体仍AND；只记录实际STOP_TASK根错误，无法归因保持null。固定fault_evidence区分counter_only与synthetic_tool_result，保留旧评分/计数；旧原生19条读取正常且旧6条通过保留。
+
+- B1：ToolError追加可选白名单detail_code，PatchError结构分类，固定脱敏反馈与可被解析器执行的完整unified diff示例。未扩展语法；原子预检、审批、恢复主码及隐私边界保持。B2：仅固定git_diff的已确认父仓库分支返回EXECUTION_FAILED/REPLAN/git_workspace_unavailable，不执行diff、NONE且无验证证据；补探测后取消检查。普通命令、全局策略及UNKNOWN/清理门禁保持。
+
+- RED/GREEN：A1 RED8个失败子例→51 tests/1 skip；A2 RED4→66 tests/1 skip；B1 RED9个失败子例→152 tests/0 skips；B2校准夹具后RED3→134 tests/0 skips，GREEN均exit0。最终全量1770 tests in 398.367s，exit0，0 failures/errors，13平台skips，12条asyncio慢回调诊断。原P2同任务>=5.2秒延迟恢复、搜索→compileall→finish及未确认清理停止回归均通过。最终git diff --check exit0；新文件另检无尾随空白。
+
+- 真实A/B各19题，均complete=true、exit1（质量失败，非伪造通过）。A完整1/19、产物14/19；B完整1/19、产物18/19。同一冻结quality-v2/manifest，DeepSeek deepseek-v4-flash，seed23、memory off/off、原规划、每user_turn8轮、3600s、max_trials19。A原生run为runtime/evals/20261019t113749.503913z/，B为runtime/evals/20261019t115744.613637z/。逐题、分项、token/耗时、实际故障和逐轮诊断见本轮ab-results.md及JSON，单次不宣称统计显著；v1→v2契约变化不计Agent提升。
+
+- 精确before与哈希、四项diff、冻结源码、实际命令/日志位于runtime/eval-contract-tools-20261019/implementation-f36328bab5/；入口为modification-index.md、verification.md、self-review.md。181份旧证据及154个旧题库文件哈希未变。A1/A2共享文件没有各自时间点快照，分项diff为实际before与A冻结后态之间的逻辑拆分；B1换行归一化的前后hash/AST一致证明单列，未冒充额外功能修复。
+
+- 限制/后续：A/B完整率同为1/19，一题改善、一题退化；产物14→18不能视为统计显著提升。B未调用git_diff，该修复的质量收益本轮未测得，只能引用离线真实Agent与负例；不要据单次分数扩大范围。Git根探测仍沿用既有同步/None回退，本轮未重构不确定探测及资源管理。13 skips、其他平台/模型、真实网络故障、持久记忆/压缩和预算优化未验证；Replan框架继续搁置。配置仅由现有评测加载器在程序内使用，未人工读取凭据正文或用户数据库，未安装依赖。下一步独立复审，不自动继续历史待办。
+
+
+## 2026-10-19 评测契约与工具反馈方案交付
+
+- 用户要求将失败分析转为 coding session 可执行的方案和提示词。已生成 `docs/superpowers/plans/2026-10-19-eval-contract-and-agent-tools.md`、`docs/superpowers/plans/2026-10-19-eval-contract-and-agent-tools-coding-prompt.md`。
+- 范围：quality-v2 公开契约、逐轮/故障证据诊断、补丁结构化反馈、Git 固定 helper 不可用处理。方案规定先完成 Eval 侧并取得 A 组基线，再改 Agent 工具取得 B 组，同题库各 19 次；旧 v1/日志保留，Replan 和覆盖扩展不纳入。
+- 当前仅文档已完成并自审，未修改生产代码/题库、未新增真实模型调用。下一步由用户交给 coding session 实施，再由独立 reviewer 按增量与新证据复审。
+
+## 2026-10-19 quality-v1 失败归因
+
+- 已独立分析本次 13 个 failed trial：不能等同 13 个 Agent 缺陷；同时存在题面与评分契约差距、Git 辅助工具不可用时的整任务停止、模型边界语义错误及预算/补丁调用摩擦。故障模拟通过不等于真实传输重试机制验收，短多轮题不证明长期记忆质量。
+- 分析及修改建议：`docs/reviews/2026-10-19-quality-v1-failure-analysis.md`。新增离线只读探针退出 0，确认父仓库 git_diff 拒绝、保留产物的具体错误、计数型故障钩子及结果汇总；新证据在 `runtime/quality-v1-real-20261019/diagnosis/`。
+- 建议顺序：版本化校准评测契约 → Git 能力暴露/补丁诊断 → 同一修订题库对照 → 重复运行与覆盖扩展。尚未实施，未新增真实调用、修改生产代码/题库或覆盖旧分数；Replan 保持搁置。
+
+## 2026-10-19 quality-v1 真实模型单次基线
+
+- 用户授权真实密钥测试并确认所有配置可用；本轮使用 DeepSeek `deepseek-v4-flash`，19 道 quality 题各 1 次，memory off/off，保留原题预算和故障注入。未运行 11 道 contract 题、三家比较或 57 次重复实验。
+- 实际结果：19/19 完成，6 passed、13 failed、0 error/未运行；产物正确 14/19（73.7%），Agent 完成 11/19，完整通过 6/19（31.6%）。耗时 234.078 秒；输入 334184（缓存 289280 已含在内）、输出 15788 tokens，金额未知。
+- 5 题代码和收尾正确但因新增测试文件越界失败；3 题产物正确但任务停止；5 题产物错误。发现题面未完整公开修改范围，部分行为只在隐藏测试中明确；另有 5 题受 git_diff 策略停止影响。原始成绩不重算、不覆盖，不能将所有失败直接归为模型能力不足。
+- 详细记录：`docs/reviews/2026-10-19-quality-v1-real-baseline.md`。原生结果：`runtime/evals/20261019t091216.781907z/`；冻结题库、实验清单、命令与审计摘要：`runtime/quality-v1-real-20261019/`。
+- 生产源码、正式测试与原题库相关 324 个 .py/.toml 文件哈希未变。密钥仅程序加载，未输出或写入记录；未访问用户数据库、安装依赖、提交或推送。Replan 搁置；等待用户决定评测契约审查或后续模型比较，不自动实施。
+
+## 2026-10-19 可恢复搜索超时独立复审（通过）
+
+- 本次范围内通过，原 P2 关闭，无新增阻塞发现。审查记录：`docs/reviews/2026-10-19-recoverable-search-cleanup-review.md`；reviewer 交接记录已同步更新。
+- 独立对照 before 快照，真实 regex 超时后等待 5.313 秒仍复现旧 compileall 误报；当前等待 5.312 秒后编译成功，共享 deadline 未启动，无 helper/读写线程/cache 遗留。同一真实 CodingAgent 延迟恢复与清理失败停止负例通过。
+- 本 reviewer 实际验证 114 项相关测试，0 failures/errors/skipped，另有 8 个独立探针场景符合预期；CLI help、git diff --check 退出 0。覆盖取消、已消费清理预算、已有/过期期限、普通命令、输出超限、资源归属及 Runtime 锁。保留 1 条 asyncio 慢回调诊断。
+- 新证据：`runtime/recoverable-search-cleanup-20261015/review-20261019/`。未修改生产代码/正式测试，225 个 Python 文件哈希保持一致，旧日志与全部现有修改保留。未重跑全量，未验证其他平台/Python、真实模型或分发产物。
+- 无凭据/用户数据库读取、依赖安装、真实模型调用、提交/推送。当前无复审阻塞；等待用户指定下一审查范围，不自动推进历史待办。
+
+## 2026-10-19 Reviewer 会话交接
+
+- 交接文档：`docs/reviews/2026-10-19-reviewer-handoff.md`。新会话继续独立审查，首项为 10 月 15 日可恢复搜索超时修复。
+- 已核对当前实现记录、Git 状态及关键调用点；最新修复在本 reviewer 中仍未独立验收，实施方 110 项/1744 项结果不替代新会话验证。
+- 上轮未关闭问题为搜索超时误启动任务终止期限，延迟下一轮响应后导致正常 compileall 清理失败。文档包含原复现、增量基线、相关文件、测试入口和验收边界。
+- 本次仅生成交接资料，无生产代码修改、测试重跑或提交推送。下一步由新 reviewer 核对实现、独立验证并报告是否关闭原 P2。
+
+## 2026-10-15 可恢复搜索超时补齐（实现完成，待独立复审）
+
+- 上轮独立复审：306 项相关现有测试通过，额外工具级与 CodingAgent 探针发现 P2：正则 helper 超时清理成功后虽返回 REPLAN，却启动了任务共享的 5 秒终止期限；等待 5.2 秒后正常 compileall 会误报 cleanup_failed。
+- 执行方案：`docs/superpowers/plans/2026-10-15-recoverable-search-cleanup.md`。限定固定只读 helper 使用局部超时清理，取消/实际清理失败/已有任务终止仍保留原门禁，不重置共享 deadline，不改变普通命令和评分规则。
+- 本轮保留当前全部未提交修改，只在 `process/control.py` 添加内部默认 False 的 `recoverable_timeout` 接线及超时终止判定，由 `tools/search.py` 的固定只读 regex helper 唯一显式启用。复用原局部预算、失败升级和 exact owner；不重置共享期限、不清空 failed/pending、不新建 scope 隐藏资源。清理期间取消在返回前再次检查，沿已消费期限终止；默认命令、输出超限和异常仍不获可恢复权限。
+- RED：真实搜索确认无遗留资源却已启动 deadline；真实 CodingAgent 等待 >=5.2 秒后 compileall 返回码为 0 却被标为 cleanup_failed，第 4 轮停止。底层仅接通新参数时 15 项出现 6 个预期失败子例（局部期限和清理期间取消）。中间一次 Windows 计时粒度导致的测试断言失败单独保留，不计产品 RED；等待校准后确认真实缺陷。
+- GREEN：执行文档要求的 10 组回归共 110 项，退出均为 0，无失败/错误/skips。新增 10 项覆盖真实 helper、同一 Agent/scope 延迟响应后再次 regex→compileall→finish、无 pyc/helper/cache 遗留、清理确认失败阻止复用、取消、已有更早/过期期限、旧失败与资源归属保留。最终完整项目 `Ran 1744 tests in 388.403s`，OK（13 skipped，0 failures/errors），退出 0；15 条 asyncio 慢回调诊断保留，跳过不计通过。compileall（缓存写入本轮 runtime）与 `git diff --check` 退出 0，均为本轮新鲜证据。
+- 本轮自审和一次只读补充复核未发现新问题；不等同于用户独立验收。证据与精确命令在 `runtime/recoverable-search-cleanup-20261015/verification.md`，RED 原日志和修改前文件快照保留。仅 Windows/Python 3.11.6 离线验证，不代表真实模型、跨平台或分发产物已通过。
+- 下一步：交独立复审，不自动继续其他历史任务。不读取真实凭据/用户库，不安装依赖、不调用真实模型、不提交/推送。
+
+## 2026-10-12 阻塞保护与验证一致性（实现完成，待独立复审）
+
+- A1：DONE 后立即结束解析并关闭连接；首进展/有效进展空闲 T、逻辑请求总预算 3T。受管 urllib worker 保留迟到连接及清理所有权，未确认清理禁止复用；二次取消在等待前登记 owner，未结束读取不进入 aclose；可重试失败不提前启动整项任务终止预算。最终流式专项 13 项通过。
+- A2：正则移入固定 `-I -S` helper 子进程；扫描 10000 条目/16 MiB，扫描匹配共用 min(timeout,10s)。有界 stdin writer 与 reader/进程同属清理链；同步入口也传递取消令牌。搜索专项 11 项、进程专项 8 项通过；A 批相邻组合 179 项通过（无跳过）。
+- B1：`workspace/check_coverage.py` 共享路径规范化、覆盖并集与结构目录计算。Runtime 只接受当前 authority/快照的 tests/syntax/static 最新记录，不复活被替代记录；本轮结构父目录随其全部子文件验证解除，原有同名历史 pending、legacy_unknown 保留。50 项覆盖/恢复聚焦通过，含真实 Runtime + 临时 SQLite 关闭重启。
+- B2：`process/cache.py` 仅为受控 compileall 覆盖子环境缓存位置，精确目录身份核验、进程依赖及可重试清理归属；创建后身份读取失败也保留 owner，不盲删。原 q-nested-create 整体离线路径通过，非法额外缓存仍 change_out_of_scope；未修改题目、fixture、verifier 或评分规则。
+- 本轮单次只读代码复核两项发现均转为 RED→GREEN；补充 worker 启动失败/重试清理期限对照。首次全量 1733 项有 3 failures/2 errors/13 skipped（446.601s）：旧读取 mock 未命中、旧迟到字节取消预期及过小测试计时；保留原断言含义后对齐实际入口，50 项复测通过，其后最终代码全量结果见下条。详细 RED/GREEN、自审选择与日志在 `runtime/liveness-verification-20261012/verification.md`、`progress.md`。
+- 无公开接口/配置或数据库迁移，不恢复跨重启 evidence，不放宽审批/UNKNOWN/清理/锁门禁。文件 I/O 仍合作式；身份未确认的缓存需人工诊断。仅 Windows/Python 3.11.6 离线验证，不代表真实模型效果或其他平台已验证；未安装依赖、读取真实凭据/用户数据库、提交或推送。
+- 最终代码全量：`full-final-v2.log`，Ran 1734 tests in 349.223s，OK（13 skipped，0 failures/errors），进程退出 0。13 项跳过为 9 项 Windows 链接权限、2 项打开锁文件/目录替换限制、1 项 Linux 抽象 socket、1 项控制字符文件名限制；不计为通过。最终 compileall 与 git diff --check 退出 0。下一步独立复审本轮源码和 RED/GREEN 证据，勿重做旧任务或自动提交。
+
+## 2026-10-12 阻塞保护与验证一致性方案（待 coding session 实施）
+
+- 用户指定整体审查建议中的顺序 1、2，已形成 `docs/superpowers/plans/2026-10-12-liveness-verification-consistency.md`。A 批处理 SSE DONE/有效进展超时/资源回收及正则搜索隔离；B 批统一验证覆盖与父目录义务，并将 compileall 缓存移出评分工作区。
+- 保留普通脚本不能签发验证证据、一次 finish 恢复、历史 pending/legacy_unknown、审批/锁/取消/清理门禁和原题评分边界。Plan/Replan、计划消息角色、记忆扩展及真实模型评测不在本期。
+- 前一轮独立整体审查实际运行 1698 项测试，0 failures/errors、13 skipped（275.295 秒）；另以离线探针确认流结束等待、心跳无进展和正则阻塞，以真实 Runtime 用例确认父目录 pending 残留。该结果仅作修改前基线。
+- 本轮仅编写执行文档和交接记录，没有改生产代码/测试或调用真实 API；下一步由 coding session 按 A1→A2→B1→B2 先复现再实现，保存各批 RED/GREEN 日志，最终完整回归后独立复审。
+
+## 2026-10-08 验证收尾覆盖 F1/F2 独立复审（通过）
+
+- 原始五组独立探针重跑全部符合预期，mismatches=0：新建父目录的定向检查、两文件分次检查均可完成，缺少一个目标检查仍不能完成。F1/F2 关闭。
+- 审阅统一覆盖计算、当前有效记录过滤、剩余目标反馈与一次恢复；新鲜相关组合 405 项，0 failures/errors，4 skipped，`git diff --check` 通过。本轮范围内未发现新阻塞，未重跑全量或调用真实模型。
+- 证据：`runtime/verification-finish-recovery/review/review2-result.md`、`review2-focused.log`、`coverage-probes-review2.json`、`coverage-probes-review2.log`。上轮失败日志保留。
+- q-nested-create 的 __pycache__ / change_out_of_scope 仍单独保留，不能声称整题或真实模型效果已通过。历史目录 pending 展示未统一，已测后续只读任务不被否决。下一步如推进完整评测，应先定义检查生成物与允许修改范围的独立契约。
+- 本轮仅新增审查记录和交接，无生产代码/正式测试修改、安装、提交或推送。
+
+## 2026-10-08 验证收尾覆盖 F1/F2 补齐（修复完成，待复审）
+
+- 保留全部已有未提交修改，按原独立探针先得到 5 场景中的 2 项错误未完成，再将 F1/F2 转为正式 RED：13 项、7 failures、0 errors；原 review 日志未覆盖，新证据在 `runtime/verification-finish-recovery/review-fixes/`。
+- `engine/completion.py` 用统一覆盖计算合并当前任务/当前完整快照的有效检查；已确认创建的父目录不要求源码检查反向覆盖，独立目录维持原要求。`engine/validation.py` 提供未过期且未被同检查替代的当前记录，防止旧摘要重现导致证据复活。
+- `engine/verification_feedback.py` 与 `engine/loop.py` 复用同一剩余目标，finish 撤销不充分 evidence 后，反馈和审计仍使用本次 assessment，不重复列出已满足的文件。未改普通脚本证据权限、恢复次数、预算、审批、取消、审计、清理、目录账本或最终快照门禁。
+- 新专项最终 20 项通过，含 create_parents、显式目录、预建父目录、分次/一次/部分检查、不同 cwd、修改失效、父目录替换、零测试/筛选/失败/旧任务、真实 Runtime 两任务流程和部分覆盖后一次恢复。独立探针 GREEN 5 场景均符合预期（mismatches=0）。相关组合 237 项通过（1 skipped），Eval 143 项通过（2 skipped）；跳过均为 Windows 链接权限条件。全量 `Ran 1696 tests in 337.734s`、OK（13 skipped，0 failures/errors）；全量启动后生产代码未变，测试列表加载后新增的两个边界测试随最终 20 项专项另行通过。13 项跳过为 Windows 链接/打开锁文件重命名权限、Linux 抽象 socket 和文件系统控制字符限制。compileall 与 `git diff --check` 退出 0。
+- 只读代码复核未发现本轮新阻塞，不等同于独立验收通过。既有 Runtime 跨任务目录义务仍可能显示父目录 pending，定向源码检查可交付且后续只读任务不受其否决；本轮不统一历史目录义务。`q-nested-create` 的缓存 `change_out_of_scope` 仍单列保留，未改题目、fixture、verifier 或评分。
+- 无公开配置/数据库变更，未使用真实 Provider、凭据、用户库或安装依赖，未提交/推送。未验证 Linux/macOS、Python 3.12 与真实模型效果。详细命令与日志见本轮 `verification.md`。
+
+## 2026-10-08 验证收尾纠正独立复审（两项 P2 待补齐）
+
+- 本轮新鲜相关组合 385 项、0 failures/errors、4 skipped，覆盖恢复/终止/验证/协议/命令/上下文及全部 Eval；`git diff --check` 通过。没有重跑全量或调用真实 API。
+- F1：`engine/completion.py` 把新建父目录作为必须由代码检查覆盖的目标，create_parents 后对目标文件 compileall 成功仍不能完成；预建父目录的相同操作能完成。
+- F2：覆盖判定要求单条检查覆盖全部修改，a.py/b.py 分别成功编译仍失败，一条命令编译两者可通过。需在当前有效证据边界内合并覆盖，并正确区分目录结构事实与源码检查目标。
+- 独立探针 5 组对照复现 2 项误判；证据在 `runtime/verification-finish-recovery/review/findings.md`、`coverage_probe.py`、`coverage-probes.json` 和 `focused.log`。
+- 原 q-nested-create 使用 compileall app 后仍因缓存文件 change_out_of_scope，已有测试明确保留该失败；此为另一个端到端限制，不代表本次全题通过。下一步将 F1/F2 转正式测试并最小修复，之后复审；本轮仅增加审查证据/交接，没有改生产代码或正式测试。
+
+## 2026-10-08 验证反馈与一次收尾纠正（T0—T4 实现完成，待复审）
+
+- 在当前未提交工作树上实施 `docs/superpowers/plans/2026-10-08-verification-finish-recovery.md`，保留上一轮 Eval 修改。先用创建文件→普通脚本→finish 的正式测试得到 RED（1 项预期失败），再实现统一 `FinishAssessment`、宿主 `verification_feedback` 和任务内一次恢复。
+- `engine/completion.py` 统一快照/证据/范围及停止判定；`engine/verification_feedback.py` 生成真实状态、有界受控路径。`state.py`、`tool_batch.py` 只从本轮已确认效果记录路径；Runner 在工具配对和审计后、任何历史闭合/终结摘要/释放之前决定是否续轮。两种协议共用，不自动执行或重放 skipped 工具、不扩充 max_rounds；incomplete 直接结束。
+- 更新系统与命令/finish 工具说明、ContextManager 反馈分组、摘要提示和 README。Console/TUI 经既有纠错通道提示“本轮尚未结束”，最终事件仍只在收尾发布。真实 Runtime + 临时 SQLite 测试确认纠正期间 Session/工作区锁均保持，结束后按原所有权释放。
+- 自审补齐了无关检查反馈误称 satisfied、Windows 盘符路径过滤、cleanup.failed 恢复前阻断。统一检查同时核对本轮目标范围，旧测试明确未验证时增加 incomplete 响应或采用真正覆盖工作区的检查，保留失败和验证断言。真实 `python -m unittest -q` 会默认发现测试，修正其既有空目标记录为有效 cwd 的 `.`；零测试/筛选仍不能签发通过，命令权限未改。
+- 新增 25 项恢复专项均执行通过，覆盖成功恢复、第二次停止、预算、两协议、只读任务、零测试/无关目标、失败/过期/扫描不完整、UNKNOWN、取消/审批/审计/清理失败、工具配对、记忆候选及真实锁生命周期。Eval 回归 `Ran 143 tests in 50.599s`，OK（2 skipped）。最终串行全量 `Ran 1678 tests in 274.466s`，OK（13 skipped，0 failures/errors）；跳过为 Windows 链接权限、锁文件重命名、Linux 抽象 socket 和控制字符文件名条件，无新增专项跳过。compileall 与 `git diff --check` 退出 0。
+- 中间全量曾有一项既有命令集成用例保守停止为 UNKNOWN；单项重跑及最终串行全量通过，未修改安全门禁或放宽断言。未完全定位该偶发现象，原失败日志保留；详见 `runtime/verification-finish-recovery/verification.md` 与 `full-serial-final.log`。
+- 原 q-nested-create 的离线对照已恢复并通过 Agent 门禁，隐藏产物也正确；但 compileall 产生的字节码缓存被原允许路径评分判为 `change_out_of_scope`。测试保留这个失败，未修改题目、fixture、隐藏 verifier 或评分条件，不能声称整题或真实质量提升已通过。检查范围仍保守，不自动推断测试 import 的源码覆盖。
+- 本轮未读取真实凭据/用户库，未调用真实模型、安装依赖、提交或推送；无数据库/CLI 参数变更。未验证 Linux/macOS、Python 3.12、真实模型和人工终端操作。下一步为独立复审；真实模型及付费预算须另行授权。
+
+## 2026-10-08 固定任务回归评测（T0—T4 实现完成）
+
+- 基于起点 `806b7427760f57abf5571081959b17d30a6be4ab` 完成
+  `evals/regression-v1/`：6 个真实 Provider quality 场景、6 个离线 contract 场景、
+  两份固定实验模板和逐题说明。原 `evals/smoke/`、`evals/quality-v1/` 未修改。
+- 新增固定注册行为断言与独立 `expectation_met`。隐藏 verifier、正常 finish 和宿主行为
+  分开计分；审查发现项目测试失败仍可交付，正确安全阻止可契约通过，但原始
+  `agent_completed=false`、`agent_failed` 和子场景结果不会被改写。
+- Eval 观察器记录脱敏工具/审批/Runtime/Provider/基线事实；spill 题必须真实发生暂存，
+  且回读片段实际覆盖尾部标识与原因。记忆测试沿用真实 SessionRuntime 保存/重启入口；
+  工作区变化接受/拒绝及三种损坏基线由固定控制器在独立临时副本/SQLite 中执行。
+- 报告新增断言、期望和子场景；汇总新增期望达成率。任务、控制步骤、预期值、断言源码
+  和脚本控制器都进入指纹；混合 v2 suite 仅规划与条件 `execution_kind` 匹配的 trial。
+  旧 v1/v2 case 和无新字段的旧报告保持兼容。
+- RED/GREEN 覆盖缺回读、只调用回读但未覆盖尾部、缺审批拒绝、错误停止原因、缺观察、
+  子场景失败、评分指纹变化、模板占位模型阻断、正负 fixture 及 trial 隔离。最终新增专项
+  `Ran 24 tests in 17.129s`，OK；全部 Eval `Ran 142 tests in 88.241s`，OK
+  （2 skipped，均为 Windows 当前账户无符号链接权限）。compileall 与
+  `git diff --check` 退出 0。
+- 三项 dry-run 分别确认混合套件 12、quality 18、contract 6 次计划。离线 contract
+  实际运行 6/6，`complete=true`、全部 `expectation_met=true`；文本终止、重复失败、
+  审批拒绝和损坏基线仍保留 Agent 未完成原始状态。报告位于
+  `runtime/evals/20261008t091615.576217z/`；接受/拒绝及三种损坏记录共 5 个子场景
+  已在 JSON/Markdown 逐项展开，验证记录位于
+  `runtime/evals/regression-v1-validation/`。
+- 离线实施阶段未读取真实凭据/用户数据库，也未调用真实 Provider。随后经用户明确授权，
+  对 `q-nested-create` 分别执行 1 次 OpenAI `gpt-5`、DeepSeek `deepseek-v4-flash`、
+  GLM `glm-5.2` 真实冒烟；未运行 18 次完整 baseline。OpenAI 首次被优先级更高且与
+  `.env.local` 不同的进程环境 Key 以 HTTP 401 拒绝；仅在测试子进程内移除覆盖后，
+  三家均成功联网并进入工具循环。三次的隐藏产物验证、行为与范围均正确，但模型都只运行
+  目标脚本，没有建立受信验证证据，因此分别以 7/6/3 轮、6/8/3 次工具调用结束为
+  `agent_unverified`，`expectation_met=false`。这验证了 API 可用性及评分分层，不能表述为
+  质量 baseline 通过或 Agent 效果提升。结构化 run 为 `20261008t092410.011608z`、
+  `20261008t092600.723493z`、`20261008t092635.862670z`；脱敏记录见
+  `runtime/evals/regression-v1-validation/verification.md`。未访问真实用户数据库、安装依赖、
+  提交或推送；仍未验证 Linux/macOS、Python 3.12。下一步如需完整 baseline，应先确认
+  18 次调用预算，并决定是否让 quality fixture 提供可见验证入口或保留当前严格门禁作为
+  能力缺口测试。
+
 ## 2026-10-07 工作区基线 F1/F2 补齐独立复审（通过）
 
 - 原始独立探针重跑确认 F1/F2 关闭：激活时接受变化现在进入 Provider 首轮实际消息，且 pending 路径保留、只确认一次；kind 数组类型损坏恢复为 corrupted，Runtime 保留，不再漏出 TypeError。任务入口变化和普通非法 JSON 对照保持正确。

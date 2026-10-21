@@ -1,0 +1,5 @@
+schema_version = 2
+benchmark_version = "quality-v3"
+id = "quality-v3"
+title = "TriCoder Quality V3"
+cases = ["sf-subtract", "sf-tail-boundary", "sf-empty-input", "sf-unique-stable", "sf-negative-boundary", "cf-price-discount", "cf-parameter-validation", "cf-module-interface", "cf-update-caller", "cf-backward-api", "rc-read-once", "rc-invalid-args", "rc-provider-transient", "rc-search-truncated", "rc-patch-conflict", "mm-early-constraint", "mm-latest-correction", "mm-todo-once", "dl-regression", "sf-csv-records", "sf-aware-time-order", "cf-config-precedence", "cf-cli-result-contract", "cf-record-schema-compat", "cf-page-merge", "cf-package-api-migration", "dl-jsonl-line-diagnostics", "mm-partial-revision", "cf-cache-copy-isolation", "dl-order-summary-pipeline"]

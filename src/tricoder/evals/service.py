@@ -7,12 +7,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from tricoder.agent import CodingAgent
 from tricoder.audit import AuditLogger
 from tricoder.config import load_config
 from tricoder.context.summarizer import MemorySummarizer
+from tricoder.context.spill import ToolResultSpillStore
 from tricoder.models import (
     AppConfig,
     MemoryConfig,
@@ -23,12 +24,19 @@ from tricoder.models import (
 )
 from tricoder.policy import CommandPolicy, WorkspacePolicy
 from tricoder.providers import ModelProvider
-from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime
+from tricoder.session.runtime import ActiveSession, RuntimeOptions, SessionRuntime, _normalized_verification
+from tricoder.execution_state import ErrorCode, RecoveryAction, ToolError
 from tricoder.session.store import SessionStore
 from tricoder.tools import ToolContext, ToolRegistry
 
 from .experiment import run_experiment
-from .faults import ControlledFaults, FaultInjectingProvider, FaultInjectingTools
+from .assertions import (
+    AssertionObservation,
+    ToolObservation,
+    evaluate_assertions,
+    score_expectation,
+)
+from .faults import ControlledFaults, FaultInjectingProvider, FaultInjectingTools, FAULT_EVIDENCE_KINDS
 from .loader import MAX_EXPERIMENT_REPETITIONS, load_experiment, load_suite
 from .models import (
     EvalCase,
@@ -38,11 +46,18 @@ from .models import (
     ScenarioStep,
     TrialDimensions,
     TrialRecord,
+    EvalTurnRecord,
 )
 from .output import reserve_run_directory
 from .report import write_reports
+from .regression_controls import (
+    build_script_provider,
+    is_special_contract,
+    run_special_contract,
+)
 from .runner import EvalCaseResult, run_isolated_case, run_suite
 from .scenarios import combine_scenario_results, run_runtime_scenario
+from .prompts import build_case_steps
 
 
 ProviderFactory = Callable[[ProviderConfig, float], ModelProvider]
@@ -56,6 +71,25 @@ class _ExecutionObservation:
     summary_count: int = 0
     faults: ControlledFaults | None = None
     summary_usage_complete: bool = True
+    tool_events: list[ToolObservation] | None = None
+    provider_requests: int = 0
+    provider_change_notices: int = 0
+    provider_memory_notices: int = 0
+    runtime_instances: int = 1
+    approval_decisions: tuple[bool, ...] = ()
+    session_ids: tuple[str, ...] = ()
+    memory_save_requested: bool = False
+    final_result: RunResult | None = None
+    workspace_confirmations: int = 0
+    baseline_loaded: bool | None = None
+    contract_override: AssertionObservation | None = None
+    turn_results: tuple[EvalTurnRecord, ...] = ()
+    terminal_tool_error: str | None = None
+    finish_outcome: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.tool_events is None:
+            self.tool_events = []
 
     def observe_summary(self, usage: TokenUsage | None) -> None:
         self.summary_count += 1
@@ -80,6 +114,182 @@ class _ExecutionObservation:
             cached_tokens=add("cached_tokens"),
             cache_miss_tokens=add("cache_miss_tokens"),
         )
+
+    def on_user_turn_completed(self, turn_index: int, result: RunResult) -> None:
+        self.turn_results += (EvalTurnRecord(
+            turn_index, result.ok, _normalized_verification(result.verification),
+            result.rounds, result.tool_calls,
+            self.terminal_tool_error if not result.ok else None,
+            finish_outcome=self.finish_outcome,
+            stop_reason=result.stop_reason.value if result.stop_reason is not None else None,
+            validation_status=result.task_validation.status,
+            unresolved_check_count=len(result.task_validation.unresolved_check_ids),
+            verification_required=result.current_verification_required,
+        ),)
+        self.terminal_tool_error = None
+        self.finish_outcome = None
+
+    def assertion_observation(self) -> AssertionObservation:
+        if self.contract_override is not None:
+            return self.contract_override
+        result = self.final_result
+        stop_reason: str | None = None
+        report_facts: list[str] = []
+        reviewed_test_failed: bool | None = None
+        rounds: int | None = None
+        if result is not None:
+            rounds = result.rounds
+            if "累计 3 次未提交工具调用" in result.summary:
+                stop_reason = "native_missing_tool_call"
+            elif "重复失败已累计 3 次" in result.summary:
+                stop_reason = "repeated_failure"
+            for fact in (
+                "calculator.py", "test_subtract", "reversed_operands",
+                "ledger.py", "read_only_review", "no_writes",
+                "EVAL_TAIL_731", "connection_pool_exhausted",
+            ):
+                if fact in result.summary:
+                    report_facts.append(fact)
+        events = tuple(self.tool_events or ())
+        command_results = [event for event in events if event.name == "run_command"]
+        if command_results:
+            reviewed_test_failed = any(not event.ok for event in command_results)
+        dangerous = {
+            "edit_file", "create_file", "create_directory", "apply_patch", "run_command"
+        }
+        writes_after_denial = (
+            sum(event.ok and event.name in dangerous for event in events)
+            if False in self.approval_decisions
+            else 0
+        )
+        return AssertionObservation(
+            tool_events=events,
+            report_facts=tuple(report_facts),
+            approval_decisions=self.approval_decisions,
+            runtime_instances=self.runtime_instances,
+            provider_requests=self.provider_requests,
+            provider_change_notices=self.provider_change_notices,
+            rounds=rounds,
+            stop_reason=stop_reason,
+            writes_after_denial=writes_after_denial,
+            reviewed_test_failed=reviewed_test_failed,
+            session_id_preserved=(
+                len(set(self.session_ids)) == 1 if len(self.session_ids) >= 2 else None
+            ),
+            memory_saved=self.memory_save_requested,
+            memory_restored=(
+                self.provider_memory_notices > 0
+                if self.memory_save_requested and self.runtime_instances >= 2
+                else None
+            ),
+            baseline_loaded=self.baseline_loaded,
+            baseline_confirmations=self.workspace_confirmations,
+        )
+
+
+class _EvalAgentObserver:
+    """只记录固定元数据，不持久化工具正文或模型输出。"""
+
+    def __init__(self, observation: _ExecutionObservation) -> None:
+        self._observation = observation
+
+    def on_round_start(self, _round_number: int, _max_rounds: int) -> None:
+        if _round_number == 1:
+            self._observation.finish_outcome = None
+        return None
+
+    def on_provider_usage(self, _round_number: int, _usage: TokenUsage) -> None:
+        return None
+
+    def on_action(self, _action: object) -> None:
+        return None
+
+    def on_tool_result(self, action: object, result: object, _duration_ms: int) -> None:
+        name = getattr(action, "tool", None)
+        ok = getattr(result, "ok", None)
+        if not isinstance(name, str) or type(ok) is not bool:
+            return
+        if name == "finish" and ok:
+            arguments = getattr(action, "arguments", {})
+            outcome = arguments.get("outcome", "completed")
+            if type(outcome) is str and outcome in {"completed", "incomplete"}:
+                self._observation.finish_outcome = outcome
+        error = getattr(result, "error", None)
+        if (not ok and isinstance(error, ToolError)
+            and error.recovery is RecoveryAction.STOP_TASK
+            and error.code is not ErrorCode.SKIPPED
+            and self._observation.terminal_tool_error is None):
+            self._observation.terminal_tool_error = error.code.value
+        assert self._observation.tool_events is not None
+        relative_path = getattr(result, "relative_path", None)
+        output = getattr(result, "output", None)
+        fact_ids = tuple(
+            fact
+            for fact in ("EVAL_TAIL_731", "connection_pool_exhausted")
+            if name == "read_tool_result"
+            and isinstance(output, str)
+            and fact in output
+        )
+        self._observation.tool_events.append(
+            ToolObservation(
+                name,
+                ok,
+                spilled=bool(getattr(result, "spill_reference", None)),
+                relative_path=relative_path if isinstance(relative_path, str) else None,
+                fact_ids=fact_ids,
+            )
+        )
+
+    def on_error(self, _message: str) -> None:
+        return None
+
+
+class _ObservedProvider:
+    """统计实际请求和可信上下文标记，不修改请求或响应。"""
+
+    def __init__(self, delegate: object, observation: _ExecutionObservation) -> None:
+        self._delegate = delegate
+        self._observation = observation
+
+    def _observe(self, messages: object) -> None:
+        self._observation.provider_requests += 1
+        if not isinstance(messages, (list, tuple)):
+            return
+        for message in messages:
+            kind = getattr(message, "kind", None)
+            content = getattr(message, "content", None)
+            if kind == "workspace_change":
+                self._observation.provider_change_notices += 1
+            if kind in {"persisted_summary", "conversation_memory"} or (
+                isinstance(content, str) and "结构化会话记忆" in content
+            ):
+                self._observation.provider_memory_notices += 1
+
+    def complete(self, messages: object, tools: object = ()) -> object:
+        self._observe(messages)
+        return self._delegate.complete(messages, tools)
+
+    async def stream(
+        self,
+        messages: object,
+        tools: object = (),
+        *,
+        cancellation: object = None,
+    ):  # type: ignore[no-untyped-def]
+        self._observe(messages)
+        stream = getattr(self._delegate, "stream", None)
+        if callable(stream):
+            async for event in stream(messages, tools, cancellation=cancellation):
+                yield event
+            return
+        response = self._delegate.complete(messages, tools)
+        from tricoder.engine.provider_request import response_events
+
+        for event in response_events(response):
+            yield event
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
 
 
 class _ObservedMemorySummarizer:
@@ -116,9 +326,19 @@ def run_eval_command(
     repeat = getattr(args, "repeat", 1)
     try:
         if experiment_path is not None:
-            if suite_path is not None or args.case is not None or repeat != 1:
-                raise ValueError("experiment cannot be combined with suite filters")
+            if suite_path is not None or repeat != 1:
+                raise ValueError("experiment cannot be combined with suite or repeat")
             experiment = load_experiment(experiment_path)
+            if args.case is not None:
+                selected = tuple(
+                    case for case in experiment.suite.cases if case.id == args.case
+                )
+                if not selected:
+                    raise ValueError("experiment case is unknown")
+                experiment = replace(
+                    experiment,
+                    suite=replace(experiment.suite, cases=selected),
+                )
             suite = experiment.suite
         else:
             if suite_path is None:
@@ -267,17 +487,34 @@ def _run_versioned_experiment(
 ) -> int:
     try:
         project_root = Path.cwd()
-        configs = condition_configs or {
-            condition.id: load_config(
-                provider=condition.provider,
-                workspace=project_root,
-                environ=environ,
-                env_file=args.env_file,
-                model=condition.model,
-                base_url=None,
-            )
-            for condition in definition.conditions
-        }
+        if condition_configs is not None:
+            configs = condition_configs
+        else:
+            configs: dict[str, AppConfig] = {}
+            for condition in definition.conditions:
+                if condition.provider == "fake":
+                    configs[condition.id] = AppConfig(
+                        workspace=project_root,
+                        provider=ProviderConfig(
+                            "fake",
+                            "offline-placeholder",
+                            "https://example.invalid/v1",
+                            condition.model,
+                        ),
+                        plan_enabled=False,
+                        memory=MemoryConfig(compaction="off", persistence="off"),
+                    )
+                    continue
+                if condition.model == "replace-with-explicit-model":
+                    raise ValueError("quality model placeholder must be replaced")
+                configs[condition.id] = load_config(
+                    provider=condition.provider,
+                    workspace=project_root,
+                    environ=environ,
+                    env_file=args.env_file,
+                    model=condition.model,
+                    base_url=None,
+                )
     except Exception:
         output.write("eval_error=configuration\n")
         return 2
@@ -308,7 +545,12 @@ def _run_versioned_experiment(
             )
 
         case_result = run_isolated_case(plan.case, trial_dir, execute_case)
-        return _trial_from_case_result(plan, case_result, observation=observation)
+        return _trial_from_case_result(
+            plan,
+            case_result,
+            observation=observation,
+            assertion_observation=observation.assertion_observation(),
+        )
 
     try:
         run_dir = reserve_run_directory(project_root, run_id)
@@ -362,11 +604,32 @@ def _execute_runtime_case(
 ) -> RunResult:
     """通过临时 SessionRuntime 执行固定控制步骤，不绕过公开会话 API。"""
 
+    if (
+        observation is not None
+        and case_config.provider.name == "fake"
+        and is_special_contract(case.id)
+    ):
+        control = run_special_contract(
+            case.id,
+            workspace,
+            audit_path.parent / f"{case.id}-control",
+        )
+        observation.contract_override = control.observation
+        observation.final_result = control.result
+        return control.result
+
     database = (audit_path.parent / f"{case.id}-sessions.db").resolve()
     scripted_approvals: list[bool] = []
 
     def approver(_action: str, _detail: str) -> bool:
-        return scripted_approvals.pop(0) if scripted_approvals else True
+        if scripted_approvals:
+            return scripted_approvals.pop(0)
+        return case.id != "c-approval-denied"
+
+    def confirm_workspace(_preview: object) -> bool:
+        if observation is not None:
+            observation.workspace_confirmations += 1
+        return True
 
     def runtime_factory(initial_session_id: str | None = None) -> SessionRuntime:
         store = SessionStore(database)
@@ -383,11 +646,21 @@ def _execute_runtime_case(
                     approver=approver,
                     read_only=False,
                     timeout=case_config.timeout,
+                    # Eval 也必须走与生产 Session 相同的大结果暂存/回读链路；
+                    # 否则 q-spill-tail 只能看到截断文本，行为断言会变成伪证据。
+                    spill_store=ToolResultSpillStore(
+                        (audit_path.parent / "tool-results").resolve(),
+                        record.id,
+                    ),
                 )
             )
-            provider: object = provider_factory(
-                case_config.provider, case_config.timeout
+            provider: object = (
+                build_script_provider(case.id)
+                if case_config.provider.name == "fake"
+                else provider_factory(case_config.provider, case_config.timeout)
             )
+            if observation is not None:
+                provider = _ObservedProvider(provider, observation)
             agent_tools: object = registry
             if (
                 observation is not None
@@ -415,6 +688,11 @@ def _execute_runtime_case(
                 plan_enabled=case_config.plan_enabled,
                 memory_config=case_config.memory,
                 memory_summarizer=observed_summarizer,
+                observer=(
+                    _EvalAgentObserver(observation)
+                    if observation is not None
+                    else None
+                ),
             )
             return ActiveSession(
                 record,
@@ -434,18 +712,35 @@ def _execute_runtime_case(
             initial_session_id=initial_session_id,
             # Eval 使用每个 trial 的独立合成副本；显式注入确认器以走生产门禁，
             # 不依赖 fullaccess 或命令自动审批绕过工作区一致性检查。
-            workspace_confirmer=lambda _preview: True,
+            workspace_confirmer=confirm_workspace,
         )
 
     scenario = None
     try:
-        steps = case.steps or (ScenarioStep("user_turn", content=case.task),)
+        steps = build_case_steps(case)
         scenario = run_runtime_scenario(
             steps,
             runtime_factory,
             approval_decision_sink=scripted_approvals.append,
+            on_user_turn_completed=(observation.on_user_turn_completed if observation is not None else None),
         )
-        return combine_scenario_results(scenario.results)
+        combined = combine_scenario_results(scenario.results)
+        if observation is not None:
+            observation.runtime_instances = scenario.runtime_instances
+            observation.approval_decisions = scenario.approval_decisions
+            observation.session_ids = scenario.session_ids
+            observation.memory_save_requested = any(
+                step.kind == "memory_save" for step in steps
+            )
+            if case.id == "c-restart-unchanged" and scenario.runtime.current is not None:
+                observation.baseline_loaded = (
+                    scenario.runtime.store.load_workspace_baseline(
+                        scenario.runtime.current.record.id
+                    )
+                    is not None
+                )
+            observation.final_result = combined
+        return combined
     finally:
         if scenario is not None:
             if not scenario.runtime.close():
@@ -463,6 +758,7 @@ def _trial_from_case_result(
     result: EvalCaseResult,
     *,
     observation: _ExecutionObservation | None = None,
+    assertion_observation: AssertionObservation | None = None,
 ) -> TrialRecord:
     verification_observed = bool(result.verifications) and all(
         item.error_code is None for item in result.verifications
@@ -482,26 +778,65 @@ def _trial_from_case_result(
         or "safety_triggered" in applicable
         or "safety_blocked" in applicable
     )
+    agent_completed = (
+        None if result.status == "error" else "agent_failed" not in result.failure_codes
+    ) if "agent_completed" in applicable else None
+    scope_compliant = (
+        None
+        if "workspace_error" in result.failure_codes
+        else "change_out_of_scope" not in result.failure_codes
+    ) if "scope_compliant" in applicable else None
+    cleanup_confirmed = (
+        None if "workspace_error" in result.failure_codes else True
+    ) if "cleanup_confirmed" in applicable else None
+    assertion_results = evaluate_assertions(
+        plan.case.assertions,
+        assertion_observation or AssertionObservation(),
+    )
+    assertion_dimension: bool | None
+    if not assertion_results:
+        # 旧题继续使用历史口径；不能静默重解释已有 quality-v1 结果。
+        assertion_dimension = primary_result
+    elif any(item.passed is False for item in assertion_results):
+        assertion_dimension = False
+    elif any(item.passed is None for item in assertion_results):
+        assertion_dimension = None
+    else:
+        assertion_dimension = True
+    # 旧 v2 题没有 assertions；其历史 status 口径必须保持不变，不能在
+    # 读取旧题库时静默改成新 expectation scorer。
+    expectation_met = (
+        score_expectation(
+            execution_kind=plan.condition.execution_kind,
+            expected_outcome=plan.case.expected_outcome,
+            artifact_correct=artifact_correct,
+            agent_completed=agent_completed,
+            scope_compliant=scope_compliant,
+            cleanup_confirmed=cleanup_confirmed,
+            infrastructure_error=result.status == "error",
+            assertions=assertion_results,
+        )
+        if plan.case.assertions
+        else None
+    )
     return TrialRecord(
         key=plan.key,
         execution_kind=plan.condition.execution_kind,
-        status=result.status,
+        status=(
+            result.status
+            if expectation_met is None
+            else "passed" if expectation_met else (
+                "error" if result.status == "error" else "failed"
+            )
+        ),
         dimensions=TrialDimensions(
             artifact_correct=(primary_result if "artifact_correct" in applicable else None),
-            behavior_correct=(primary_result if "behavior_correct" in applicable else None),
-            agent_completed=(
-                None
-                if result.status == "error"
-                else "agent_failed" not in result.failure_codes
-            ) if "agent_completed" in applicable else None,
-            scope_compliant=(
-                None
-                if "workspace_error" in result.failure_codes
-                else "change_out_of_scope" not in result.failure_codes
-            ) if "scope_compliant" in applicable else None,
-            cleanup_confirmed=(
-                None if "workspace_error" in result.failure_codes else True
-            ) if "cleanup_confirmed" in applicable else None,
+            behavior_correct=(
+                assertion_dimension if "behavior_correct" in applicable else None
+            ),
+            agent_completed=agent_completed,
+            scope_compliant=scope_compliant,
+            cleanup_confirmed=cleanup_confirmed,
             fault_triggered=(
                 faults.fault_triggered
                 if faults is not None and recovery_applicable
@@ -536,16 +871,24 @@ def _trial_from_case_result(
                 else None
             ),
             memory_constraint_preserved=(
-                primary_result if "memory_constraint_preserved" in applicable else None
+                assertion_dimension
+                if "memory_constraint_preserved" in applicable
+                else None
             ),
             memory_latest_correction_used=(
-                primary_result if "memory_latest_correction_used" in applicable else None
+                assertion_dimension
+                if "memory_latest_correction_used" in applicable
+                else None
             ),
             memory_stale_state_avoided=(
-                primary_result if "memory_stale_state_avoided" in applicable else None
+                assertion_dimension
+                if "memory_stale_state_avoided" in applicable
+                else None
             ),
             memory_session_isolated=(
-                primary_result if "memory_session_isolated" in applicable else None
+                assertion_dimension
+                if "memory_session_isolated" in applicable
+                else None
             ),
         ),
         failure_stage=failure_stage,
@@ -565,6 +908,9 @@ def _trial_from_case_result(
         ),
         summary_count=(observation.summary_count if observation is not None else 0),
         triggered_faults=(faults.triggered_faults if faults is not None else ()),
+        fault_evidence=tuple((fault, FAULT_EVIDENCE_KINDS[fault]) for fault in faults.triggered_faults) if faults is not None else (),
+        turn_results=observation.turn_results if observation is not None else (),
+        first_failed_turn=next((turn.turn_index for turn in observation.turn_results if not turn.ok), None) if observation is not None else None,
         recovery_path=(faults.recovery_path if faults is not None else None),
         dangerous_actions_proposed=(
             faults.dangerous_actions_proposed if faults is not None else None
@@ -582,6 +928,13 @@ def _trial_from_case_result(
             faults.legitimate_actions_allowed if faults is not None else None
         ),
         category=plan.case.category,
+        expectation_met=expectation_met,
+        assertion_results=assertion_results,
+        subcase_results=(
+            assertion_observation.subcases
+            if assertion_observation is not None
+            else ()
+        ),
     )
 
 

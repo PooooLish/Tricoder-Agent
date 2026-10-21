@@ -717,11 +717,13 @@ class RuntimeEvidenceTests(WorkspaceCase):
 
         (self.root / "bad.py").write_text("def broken(:\n", encoding="utf-8")
         bad = ("run_command", {"command": "python -m compileall -q bad.py"})
-        runtime = self.runtime([EDIT, bad, CHECK, FINISH])
+        runtime = self.runtime([EDIT, bad, CHECK, FINISH, FINISH])
 
         result = runtime.run_task("修改 app.py，并报告全部检查结果")
 
         self.assertFalse(result.ok)
+        self.assertEqual(5, result.rounds)
+        self.assertTrue(result.task_validation.unresolved_check_ids)
         self.assertTrue(runtime.current.context.verification_required)
         self.assertIsNotNone(runtime.current.context.verification_failure)
         self.assertIn(1, [record.returncode for record in result.task_validation.records])
@@ -1672,7 +1674,8 @@ class RuntimeEvidenceTests(WorkspaceCase):
                 self.assertIsNotNone(failures[0])
                 self.assertTrue(self.api().stable_snapshots(failures[0], runtime.current.tools.context.verification_scope.capture(self.policy)))
                 self.assertEqual(failures[0], runtime.current.context.verification_failure)
-                self.assertTrue(runtime.run_task("同版本无修改回顾可以报告失败").ok)
+                followup = runtime.run_task("同版本无修改回顾可以报告失败")
+                self.assertTrue(followup.ok, followup)
                 self.assertEqual("pending", runtime.current.memory.verification_obligation)
 
     def test_n2_builtin_failure_survives_output_processing_exception(self):

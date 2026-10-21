@@ -96,10 +96,17 @@ class TaskValidationTracker:
     def report(self) -> TaskValidationReport:
         """生成不可变公开视图；状态不等同于业务验收结论。"""
 
-        if self._stale:
-            status = "stale"
-        elif self._unresolved:
+        current_success = any(
+            signature not in self._stale
+            and record.kind in {"tests", "syntax", "static"}
+            and record.workspace_stable
+            and has_effective_success_result(record)
+            for signature, record in self._latest.items()
+        )
+        if self._unresolved:
             status = "failed"
+        elif self._stale and not current_success:
+            status = "stale"
         elif self._records:
             status = "observed"
         else:
@@ -127,6 +134,17 @@ class TaskValidationTracker:
             limitations=tuple(limitations),
             unresolved_check_ids=tuple(self._unresolved.values()),
             recent_only=self._recent_only,
+            stale_check_ids=tuple(self._stale.values()),
+        )
+
+    def current_records(self, snapshot_id: str) -> tuple[CommandCheckRecord, ...]:
+        """只提供仍有效的当前版本记录；内容回到旧摘要也不复活失效检查。"""
+
+        return tuple(
+            record for signature, record in self._latest.items()
+            if signature not in self._stale
+            and record.task_id == self.task_id
+            and record.snapshot_id == snapshot_id
         )
 
 

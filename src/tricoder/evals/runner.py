@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 import time
 from typing import Literal, TypeAlias
@@ -13,8 +14,8 @@ from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.process.control import run_bounded_process
 
-from .loader import is_reserved_eval_path
-from .models import EvalCase, EvalSuite, VerificationSpec
+from .loader import is_reserved_eval_path, is_workspace_relative_path
+from .models import EvalCase, EvalSuite, PathMatchMode, VerificationSpec
 from .output import validate_run_directory
 from .workspace import (
     FileFingerprint,
@@ -329,24 +330,42 @@ def _score(
         failure_codes.append("verification_failed")
     if any(result.error_code is not None for result in verifications):
         failure_codes.append("verification_error")
-    if any(not _path_is_allowed(path, case.allowed_changes) for path in modified_files):
+    if any(not _path_is_allowed(path, case.allowed_changes, mode=case.path_match_mode) for path in modified_files):
         failure_codes.append("change_out_of_scope")
     if any(
-        not any(_path_matches(path, pattern) for path in modified_files)
+        not any(_path_matches(path, pattern, mode=case.path_match_mode) for path in modified_files)
         for pattern in case.required_changes
     ):
         failure_codes.append("required_change_missing")
     return tuple(failure_codes)
 
 
-def _path_is_allowed(path: str, patterns: tuple[str, ...]) -> bool:
+def _path_is_allowed(path: str, patterns: tuple[str, ...], *, mode: PathMatchMode = "legacy") -> bool:
+    _validate_match_mode(mode)
     if is_reserved_eval_path(path):
         return False
-    return any(_path_matches(path, pattern) for pattern in patterns)
+    return any(_path_matches(path, pattern, mode=mode) for pattern in patterns)
 
 
-def _path_matches(path: str, pattern: str) -> bool:
-    return PurePosixPath(path).match(pattern)
+def _path_matches(path: str, pattern: str, *, mode: PathMatchMode = "legacy") -> bool:
+    _validate_match_mode(mode)
+    if mode == "legacy":
+        return PurePosixPath(path).match(pattern)
+    if (
+        not is_workspace_relative_path(path)
+        or not is_workspace_relative_path(pattern)
+        or "**" in pattern
+    ):
+        return False
+    parts, patterns = path.split("/"), pattern.split("/")
+    return len(parts) == len(patterns) and all(
+        fnmatchcase(part, segment) for part, segment in zip(parts, patterns)
+    )
+
+
+def _validate_match_mode(mode: PathMatchMode) -> None:
+    if type(mode) is not str or mode not in {"legacy", "workspace_root"}:
+        raise ValueError("unsupported path_match_mode")
 
 
 def _case_result(

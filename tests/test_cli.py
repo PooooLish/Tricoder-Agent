@@ -1124,6 +1124,11 @@ class CliTests(unittest.TestCase):
                         "arguments": {"summary": "已创建文件"},
                         "reason": "结束任务",
                     },
+                    {
+                        "tool": "finish",
+                        "arguments": {"summary": "尚未补充验证", "outcome": "incomplete"},
+                        "reason": "明确停止",
+                    },
                 ]
             )
 

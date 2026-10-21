@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from tricoder.execution_state import TaskStopReason
 
 from tricoder.context.manager import ContextManager
 from tricoder.context.memory import (
@@ -193,6 +194,12 @@ class TaskFinalizer:
                 current_verification_required=state.verification_required,
                 verification_obligation=state.verification_obligation,
                 pending_verification_paths=state.pending_verification_paths,
+                stop_reason=(
+                    TaskStopReason.CANCELLED if self.cancellation.is_cancelled else
+                    TaskStopReason.CLEANUP_FAILED if cleanup_bad else
+                    TaskStopReason.UNKNOWN_EFFECTS if state.unknown_effects else
+                    result.stop_reason
+                ),
             ),
             SessionContext(
                 messages=(

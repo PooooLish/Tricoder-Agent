@@ -1,0 +1,24 @@
+id = "q-review-failing-tests"
+title = "Review a project whose tests correctly expose a bug"
+task = "只读审查项目并运行测试，不修改代码。报告必须准确包含证据标识 calculator.py、test_subtract、reversed_operands；测试失败是审查发现，不代表审查任务失败。最后调用 finish。"
+allowed_changes = []
+required_changes = []
+max_rounds = 10
+max_context_chars = 40000
+category = "delivery"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier", "behavior_assertions"]
+faults = ["none"]
+dimensions = ["artifact_correct", "behavior_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+assertions = ["review_report_facts", "provider_called"]
+expected_outcome = "completed"
+
+[[steps]]
+kind = "user_turn"
+content = "只读审查项目并运行测试，不修改代码。报告必须准确包含证据标识 calculator.py、test_subtract、reversed_operands；测试失败是审查发现，不代表审查任务失败。最后调用 finish。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

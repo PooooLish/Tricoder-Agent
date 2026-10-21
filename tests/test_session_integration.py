@@ -373,7 +373,9 @@ class SessionIntegrationTests(unittest.TestCase):
             self.assertEqual("task", histories[0][-1].kind)
             for history in histories[1:]:
                 with self.subTest(request_length=len(history)):
-                    assistant, tool_result = history[-2:]
+                    self.assertEqual("verification_feedback", history[-1].kind)
+                    self.assertEqual("user", history[-1].role)
+                    assistant, tool_result = history[-3:-1]
                     self.assertEqual("assistant", assistant.role)
                     self.assertEqual("tool", tool_result.role)
                     self.assertEqual(

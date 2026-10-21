@@ -58,8 +58,10 @@ class CancellationTokenTests(unittest.TestCase):
             self.assertFalse(exited.is_set())
             self.assertFalse(task.done())
             release.set()
-            await asyncio.wait_for(task, 1)
+            # 受管读取现在在当前等待中观察取消，不再向调用方发布迟到字节。
             with self.assertRaises(CancellationError):
+                await asyncio.wait_for(task, 1)
+            with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
             self.assertTrue(exited.is_set())
             self.assertTrue(closed.is_set())

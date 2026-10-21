@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from tricoder.models import TokenUsage
+from tricoder.execution_state import ErrorCode, TaskStopReason
+
+if TYPE_CHECKING:
+    from .assertions import AssertionResult, SubcaseResult
 
 
 ExecutionKind: TypeAlias = Literal["quality", "contract"]
+ExpectedOutcome: TypeAlias = Literal["completed", "blocked"]
+PathMatchMode: TypeAlias = Literal["legacy", "workspace_root"]
 TrialStatus: TypeAlias = Literal[
     "passed",
     "failed",
@@ -62,6 +68,10 @@ class EvalCase:
         "cleanup_confirmed",
     )
     steps: tuple["ScenarioStep", ...] = ()
+    assertions: tuple[str, ...] = ()
+    expected_outcome: ExpectedOutcome = "completed"
+    expose_edit_scope: bool = False
+    path_match_mode: PathMatchMode = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +156,45 @@ class TrialDimensions:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalTurnRecord:
+    """Only bounded status facts; never model summaries or tool output."""
+
+    turn_index: int
+    ok: bool
+    verification: str
+    rounds: int
+    tool_calls: int
+    terminal_tool_error: str | None = None
+    finish_outcome: str | None = None
+    stop_reason: str | None = None
+    validation_status: str | None = None
+    unresolved_check_count: int | None = None
+    verification_required: bool | None = None
+
+    def __post_init__(self) -> None:
+        for value, allowed in (
+            (self.finish_outcome, ("completed", "incomplete")),
+            (self.stop_reason, tuple(reason.value for reason in TaskStopReason)),
+            (self.validation_status, ("unverified", "observed", "failed", "stale")),
+        ):
+            if value is not None and (type(value) is not str or value not in allowed):
+                raise ValueError("eval turn diagnostic is invalid")
+        if self.unresolved_check_count is not None and (
+            type(self.unresolved_check_count) is not int or self.unresolved_check_count < 0
+        ):
+            raise ValueError("eval turn diagnostic count is invalid")
+        if self.verification_required is not None and type(self.verification_required) is not bool:
+            raise ValueError("eval turn diagnostic flag is invalid")
+        if (type(self.turn_index) is not int or self.turn_index < 1
+            or type(self.ok) is not bool
+            or type(self.rounds) is not int or self.rounds < 0
+            or type(self.tool_calls) is not int or self.tool_calls < 0
+            or self.verification not in ("passed", "failed", "not-run", "待验证", "unknown")
+            or (self.terminal_tool_error is not None and self.terminal_tool_error not in tuple(code.value for code in ErrorCode))):
+            raise ValueError("eval turn record is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class TrialRecord:
     """Safe per-trial facts used by aggregation and persistence."""
 
@@ -171,6 +220,14 @@ class TrialRecord:
     legitimate_actions_attempted: int | None = None
     legitimate_actions_allowed: int | None = None
     category: str = "unknown"
+    # 与原始 Agent/验证事实分开；blocked 契约可以达成期望但仍保持
+    # agent_completed=False 和原始 agent_failed failure code。
+    expectation_met: bool | None = None
+    assertion_results: tuple["AssertionResult", ...] = ()
+    subcase_results: tuple["SubcaseResult", ...] = ()
+    turn_results: tuple[EvalTurnRecord, ...] = ()
+    first_failed_turn: int | None = None
+    fault_evidence: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

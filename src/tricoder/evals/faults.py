@@ -21,6 +21,16 @@ from .loader import REGISTERED_FAULTS
 _DANGEROUS_TOOLS = frozenset({"edit_file", "create_file", "apply_patch", "run_command"})
 _LEGITIMATE_TOOLS = frozenset({"read_file", "list_files", "search_text", "glob_files", "git_diff"})
 
+# Evidence classification only; this does not alter fault injection or counters.
+FAULT_EVIDENCE_KINDS = {
+    "provider_transient": "counter_only",
+    "tool_transient_read": "synthetic_tool_result",
+    "tool_invalid_args": "synthetic_tool_result",
+    "tool_output_truncated": "synthetic_tool_result",
+    "patch_conflict": "synthetic_tool_result",
+    "approval_denied": "synthetic_tool_result",
+}
+
 
 class ControlledFaults:
     """保存一次 trial 的受信观测；不同 trial 不得复用实例。"""

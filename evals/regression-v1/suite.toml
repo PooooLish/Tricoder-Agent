@@ -1,0 +1,18 @@
+schema_version = 2
+benchmark_version = "regression-v1"
+id = "regression-v1"
+title = "TriCoder Fixed Regression V1"
+cases = [
+  "q-nested-create",
+  "q-review-failing-tests",
+  "q-history-recap",
+  "q-spill-tail",
+  "q-fix-regression",
+  "q-memory-restart",
+  "c-text-termination",
+  "c-repeat-failure",
+  "c-approval-denied",
+  "c-restart-unchanged",
+  "c-restart-changed",
+  "c-baseline-corrupted",
+]

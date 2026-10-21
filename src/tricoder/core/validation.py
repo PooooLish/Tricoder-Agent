@@ -97,6 +97,7 @@ class TaskValidationReport:
     unresolved_check_ids: tuple[str, ...] = ()
     recent_only: bool = False
     requirements_coverage_confirmed: bool = False
+    stale_check_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in _REPORT_STATUSES:
@@ -117,6 +118,10 @@ class TaskValidationReport:
             raise ValueError("未解决检查 ID 必须为非空字符串元组")
         if type(self.recent_only) is not bool:
             raise ValueError("recent_only 必须为布尔值")
+        if not isinstance(self.stale_check_ids, tuple) or not all(
+            isinstance(item, str) and item for item in self.stale_check_ids
+        ):
+            raise ValueError("过期检查 ID 必须为非空字符串元组")
 
 
 def has_effective_success_result(record: CommandCheckRecord) -> bool:

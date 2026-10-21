@@ -87,6 +87,7 @@ def _report(condition: str, model: str, trials: list[dict[str, object]]) -> dict
             "approval_policy": "eval-auto-approve",
             "environment": "e" * 64,
             "code": "f" * 64,
+            "scoring": "1" * 64,
         },
         "coverage": {},
         "dimensions": {},
@@ -129,6 +130,11 @@ class EvalCompareTests(unittest.TestCase):
                 candidate,
                 allowed_variables=frozenset({"model"}),
             )
+
+        candidate = _report("candidate", "model-a", [_trial("candidate", "one", 1, True)])
+        candidate["fingerprints"] = dict(candidate["fingerprints"], scoring="2" * 64)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ComparisonError, "scoring"):
+            compare_report_payloads(baseline, candidate)
 
     def test_incomplete_pairing_is_visible_and_execution_kinds_cannot_mix(self) -> None:
         baseline = _report("base", "model-a", [_trial("base", "one", 1, True), _trial("base", "orphan", 1, True)])

@@ -155,7 +155,7 @@ class ToolErrorTests(unittest.TestCase):
         (self.root / "broken.txt").write_text("needle", encoding="utf-8")
         primary = ValueError(FAKE)
         for asynchronous in (False, True):
-            with self.subTest(asynchronous=asynchronous), patch.object(Path, "read_bytes", side_effect=primary):
+            with self.subTest(asynchronous=asynchronous), patch.object(Path, "open", side_effect=primary):
                 with self.assertRaises(ValueError) as caught:
                     if asynchronous:
                         asyncio.run(self.registry.execute_async("search_text", {"query": "needle"}))
@@ -168,14 +168,14 @@ class ToolErrorTests(unittest.TestCase):
         (self.root / "broken.txt").write_text("needle", encoding="utf-8")
         (self.root / "invalid.txt").write_bytes(b"\xff")
         (self.root / "good.txt").write_text("needle", encoding="utf-8")
-        real_read = Path.read_bytes
+        real_open = Path.open
 
-        def read(path):
+        def read(path, *args, **kwargs):
             if path.name == "broken.txt":
                 raise OSError(FAKE)
-            return real_read(path)
+            return real_open(path, *args, **kwargs)
 
-        with patch.object(Path, "read_bytes", read):
+        with patch.object(Path, "open", read):
             for result in self.execute_both("search_text", {"query": "needle"}):
                 self.assertTrue(result.ok)
                 self.assertIsNone(result.error)

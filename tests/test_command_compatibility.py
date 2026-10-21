@@ -352,6 +352,7 @@ class InformationCommandEffectTests(unittest.TestCase):
                 ("edit_file", {"path": "app.py", "old_text": "value = 1", "new_text": "value = 2"}),
                 ("run_command", {"command": "python --version"}),
                 ("finish", {"summary": "done"}),
+                ("finish", {"summary": "尚无可信验证", "outcome": "incomplete"}),
             )
         )
 
@@ -958,6 +959,7 @@ class SyntheticCommandEndToEndTests(unittest.TestCase):
                 ),
                 ("version", "run_command", {"command": "python3 --version"}),
                 ("finish", "finish", {"summary": "version is enough"}),
+                ("stop", "finish", {"summary": "无法补充验证", "outcome": "incomplete"}),
             )
         )
         version_only = CodingAgent(

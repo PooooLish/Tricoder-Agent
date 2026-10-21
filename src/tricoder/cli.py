@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_command.add_argument(
         "--experiment",
         type=Path,
-        help="运行严格校验的实验清单；不能与 suite/--case/--repeat 组合",
+        help="运行严格校验的实验清单；不能与 suite/--repeat 组合，可用 --case 缩小题目",
     )
     eval_command.add_argument(
         "--repeat",

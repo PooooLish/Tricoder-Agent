@@ -1,0 +1,28 @@
+path_match_mode = "workspace_root"
+expose_edit_scope = true
+id = "mm-todo-once"
+title = "mm-todo-once"
+task = "修复 tasks.py，使完成项和重复项不会再次出现；未完成项保持首次出现的顺序。"
+allowed_changes = ["tasks.py", "tests", "tests/*.py"]
+required_changes = ["tasks.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_stale_state_avoided"]
+
+[[steps]]
+kind = "user_turn"
+content = "待办 a 已完成，不要重复执行。\n当前为非交互执行；已有信息足够时自主完成。确实缺少会改变结果的必要信息时，应明确报告无法继续，不能编造回答。调用 ask_user 将无法获得即时回答。\n本轮只确认并记住这条约束/决定，不修改文件、不运行测试；确认后结束本轮，等待下一条任务"
+
+[[steps]]
+kind = "user_turn"
+content = "修复 tasks.py，使完成项和重复项不会再次出现；未完成项保持首次出现的顺序。\n当前为非交互执行；已有信息足够时自主完成。确实缺少会改变结果的必要信息时，应明确报告无法继续，不能编造回答。调用 ask_user 将无法获得即时回答。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

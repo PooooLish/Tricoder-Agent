@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -123,7 +124,7 @@ class _FileWriteTool(ToolHandler):
 
 class EditFileTool(_FileWriteTool):
     name = "edit_file"
-    description = "经审批后精确替换工作区内文件的一段文本。"
+    description = "经审批后精确替换工作区内文件的一段文本；小范围修改已读文件时优先使用。"
     parameters = ToolHandler._schema(
         {
             "path": {"type": "string"},
@@ -245,7 +246,7 @@ class EditFileTool(_FileWriteTool):
 
 class CreateFileTool(_FileWriteTool):
     name = "create_file"
-    description = "经审批后在工作区内创建新的 UTF-8 文件。"
+    description = "仅创建新的 UTF-8 文件；已存在文件先 read_file 再 edit_file/apply_patch。缺父目录时用 create_parents=true 或先 create_directory。"
     parameters = ToolHandler._schema(
         {
             "path": {"type": "string"},
@@ -282,6 +283,26 @@ class CreateFileTool(_FileWriteTool):
                 exist_ok=True,
             )
         if path.exists():
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = self.context.workspace_policy.workspace / candidate
+            try:
+                metadata = candidate.lstat()
+                ordinary_file = (
+                    candidate.absolute() == path
+                    and stat.S_ISREG(metadata.st_mode)
+                    and not getattr(metadata, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                )
+            except OSError:
+                ordinary_file = False
+            if ordinary_file:
+                return tool_failure(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "create_file 仅创建新文件；目标普通文件已存在。请先 read_file，"
+                    "再使用 edit_file 或 apply_patch 修改。",
+                    detail_code="file_already_exists",
+                )
             return tool_failure(ErrorCode.POLICY_DENIED, "create_file 的目标文件已存在，拒绝覆盖")
 
         workspace = self.context.workspace_policy.workspace
@@ -487,9 +508,36 @@ class CreateFileTool(_FileWriteTool):
         return ToolResult(True, output, relative_path)
 
 
+_PATCH_FEEDBACK = {
+    "patch_invalid_header": "补丁文件头无效：请连续提供 --- a/路径 和 +++ b/路径。",
+    "patch_invalid_hunk": "补丁 hunk 无效：请检查 @@ 行号、计数、递增范围及上下文前缀。",
+    "patch_count_mismatch": "补丁行数与 hunk 声明不一致：请重新计算旧行与新行计数。",
+    "patch_unsupported_operation": "补丁操作不支持：仅支持创建或原路径更新，不支持删除、重命名或重复目标。",
+    "patch_context_mismatch": "补丁上下文与当前文件不匹配：请重新读取目标文件，再生成精确匹配的补丁。",
+    "patch_invalid_format": "补丁格式无效：请按工具说明提供受限 unified diff。",
+}
+
+
+def _patch_feedback(error: PatchError) -> str:
+    message = _PATCH_FEEDBACK[error.detail_code]
+    if error.diagnostics:
+        message += " 确定的计数：" + "，".join(f"{key}={value}" for key, value in error.diagnostics)
+    return message
+
+
 class ApplyPatchTool(_FileWriteTool):
     name = "apply_patch"
-    description = "经一次审批后原子应用受限的多文件 unified diff。"
+    description = (
+        "复杂或多文件修改可经一次审批原子应用受限 unified diff；小范围已读文件优先 edit_file。父目录须先存在。"
+        "文件头必须为连续的 --- a/路径、+++ b/路径（创建时旧路径为 /dev/null）；"
+        "hunk 使用带行号与计数的 @@ -旧起点,旧行数 +新起点,新行数 @@。"
+        "上下文行以一个空格开头，删除行以 - 开头，新增行以 + 开头；"
+        "旧计数包含上下文和删除行，新计数包含上下文和新增行。"
+        "文本须使用真实换行，不接受 Markdown 围栏或 Begin/End Patch 语法。"
+        "仅支持创建或同路径更新，不支持删除、重命名。完整更新示例：\n"
+        "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n"
+        " value = 1\n-enabled = False\n+enabled = True\n"
+    )
     parameters = ToolHandler._schema({"patch": {"type": "string"}}, ["patch"])
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -500,8 +548,9 @@ class ApplyPatchTool(_FileWriteTool):
         source = self._required_str(arguments, "patch")
         try:
             file_patches = parse_unified_diff(source)
-        except PatchError:
-            return tool_failure(ErrorCode.INVALID_ARGUMENT, "补丁无效：格式不满足受限补丁契约")
+        except PatchError as exc:
+            return tool_failure(ErrorCode.INVALID_ARGUMENT, _patch_feedback(exc),
+                                detail_code=exc.detail_code)
 
         workspace = self.context.workspace_policy.workspace
         resolved: list[tuple[FilePatch, Path, str]] = []
@@ -554,8 +603,9 @@ class ApplyPatchTool(_FileWriteTool):
                     return tool_failure(ErrorCode.RESULT_UNCERTAIN, f"任务内文件状态不连续：{relative_path}")
                 try:
                     after_content = apply_file_patch(original, file_patch)
-                except PatchError:
-                    return tool_failure(ErrorCode.EXECUTION_FAILED, f"补丁无法应用到 {relative_path}")
+                except PatchError as exc:
+                    return tool_failure(ErrorCode.EXECUTION_FAILED, _patch_feedback(exc),
+                                        detail_code=exc.detail_code)
                 if not file_patch.create and after_content == original:
                     return tool_failure(ErrorCode.EXECUTION_FAILED, f"补丁对现有文件没有净变化：{relative_path}")
                 prepared.append(

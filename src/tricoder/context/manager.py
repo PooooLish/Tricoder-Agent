@@ -956,7 +956,7 @@ class ContextManager:
                 groups.append(messages[index : index + 2])
                 index += 2
                 continue
-            if message.kind == "protocol_feedback":
+            if message.kind in {"protocol_feedback", "verification_feedback"}:
                 groups.append([message])
             elif self._is_task_termination(message):
                 groups.append([message])

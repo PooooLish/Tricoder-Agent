@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 from tricoder.audit import AuditLogger
+from tricoder.execution_state import TaskStopReason
 from tricoder.context import CONTEXT_COMPACTION_NOTICE, ContextBudget, ContextManager
 from tricoder.context.coordinator import MemoryAuditFailure, MemoryCoordinator
 from tricoder.context.history import (
@@ -241,6 +242,7 @@ class CodingAgent:
                 "旧任务资源清理尚未确认，禁止复用执行资源",
                 0,
                 cleanup_failed=True,
+                stop_reason=TaskStopReason.CLEANUP_FAILED,
             )
             emit(event_sink, RuntimeFailed("runtime", result.summary))
             return SessionTurnResult(result, context)

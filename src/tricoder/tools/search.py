@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from tricoder.models import ToolResult, tool_failure
-from tricoder.execution_state import ErrorCode
+from tricoder.execution_state import ErrorCode, RecoveryAction
 from tricoder.policy import PolicyError
+from tricoder.core.cancellation import CancellationToken, check_current_cancellation, current_cancellation
+from tricoder.process.control import run_bounded_process
+from tricoder.process.env import filtered_subprocess_env
+from tricoder.task_cleanup import run_in_cleanup_thread
 
 from tricoder.tools.gitignore import _GitIgnoreMatcher
 from tricoder.tools.handlers import ToolHandler
@@ -21,6 +28,8 @@ _MAX_GLOB_PATTERN_CHARS = 200
 _MAX_GLOB_STARS = 2
 _MAX_REGEX_CHARS = 200
 _MAX_SEARCH_LINE_CHARS = 4_096
+_MAX_SEARCH_ENTRIES = 10_000
+_MAX_SEARCH_BYTES = 16 * 1024 * 1024
 _ABSOLUTE_PATH_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
 
 
@@ -37,6 +46,27 @@ class SearchTextTool(ToolHandler):
     )
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
+        return self._run(arguments, current_cancellation())
+
+    async def run_async(self, arguments, *, cancellation=None):
+        return await run_in_cleanup_thread(self._run, arguments, cancellation)
+
+    def _run(self, arguments, cancellation: CancellationToken | None) -> ToolResult:
+        deadline = time.monotonic() + min(self.context.timeout, 10)
+
+        def check_budget():
+            check_current_cancellation()
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+
+        try:
+            return self._search(arguments, cancellation, deadline, check_budget)
+        except TimeoutError:
+            return tool_failure(ErrorCode.TIMEOUT, "搜索预算耗尽，未完成搜索", recovery=RecoveryAction.REPLAN)
+
+    def _search(self, arguments, cancellation, deadline, check_budget):
         query = self._required_str(arguments, "query")
         use_regex = arguments.get("use_regex", False)
         if not isinstance(use_regex, bool):
@@ -49,7 +79,7 @@ class SearchTextTool(ToolHandler):
                     "防止灾难性回溯拖慢 Agent",
                 )
             try:
-                compiled = re.compile(query)
+                re.compile(query)
             except re.error:
                 return tool_failure(ErrorCode.INVALID_ARGUMENT, "正则表达式无效")
         root = self.context.workspace_policy.resolve_path(str(arguments.get("path", ".")))
@@ -59,54 +89,87 @@ class SearchTextTool(ToolHandler):
         workspace = self.context.workspace_policy.workspace
         ignore_matcher = _GitIgnoreMatcher(workspace)
         matches: list[str] = []
-        for current_root, directories, files in os.walk(root, followlinks=False):
-            current = Path(current_root)
-            # 在进入子目录前过滤敏感目录、可能逃逸的链接和 .gitignore 忽略项。
-            allowed_directories: list[str] = []
-            for name in directories:
-                try:
-                    candidate = self.context.workspace_policy.resolve_path(current / name)
-                except PolicyError:
-                    continue
-                if candidate.is_symlink():
-                    continue
-                if ignore_matcher.is_ignored(
-                    candidate.relative_to(workspace).as_posix() + "/"
-                ):
-                    continue
-                allowed_directories.append(name)
-            directories[:] = allowed_directories
-
-            for name in files:
-                try:
-                    path = self.context.workspace_policy.resolve_path(current / name)
-                except PolicyError:
-                    continue
-                relative = path.relative_to(workspace).as_posix()
-                if ignore_matcher.is_ignored(relative):
-                    continue
-                try:
-                    if path.stat().st_size > self.context.max_search_file_bytes:
+        records = []
+        stack = [root]
+        entries = total_bytes = 0
+        # scandir 逐项计数，避免 os.walk 先物化整个大型目录。
+        while stack:
+            check_budget()
+            with os.scandir(stack.pop()) as iterator:
+                for entry in iterator:
+                    check_budget()
+                    entries += 1
+                    if entries > _MAX_SEARCH_ENTRIES:
+                        return tool_failure(ErrorCode.EXECUTION_FAILED, "搜索条目预算耗尽，未完成搜索")
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        path = self.context.workspace_policy.resolve_path(entry.path)
+                    except PolicyError:
                         continue
-                    raw = path.read_bytes()
-                    if b"\x00" in raw:
+                    relative = path.relative_to(workspace).as_posix()
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    if ignore_matcher.is_ignored(relative + ("/" if is_directory else "")):
                         continue
-                    text = raw.decode("utf-8")
-                except (OSError, UnicodeError):
-                    # 仅跳过预期的单文件读取故障；执行阶段 ValueError 不能伪装成无匹配。
-                    continue
-                for line_number, line in enumerate(text.splitlines(), start=1):
-                    if len(line) > _MAX_SEARCH_LINE_CHARS:
+                    if is_directory:
+                        stack.append(path)
                         continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        if path.stat().st_size > self.context.max_search_file_bytes:
+                            continue
+                        limit = min(self.context.max_search_file_bytes, _MAX_SEARCH_BYTES - total_bytes)
+                        with path.open("rb") as stream:
+                            raw = stream.read(limit + 1)
+                        total_bytes += len(raw)
+                        if total_bytes > _MAX_SEARCH_BYTES:
+                            return tool_failure(ErrorCode.EXECUTION_FAILED, "搜索字节预算耗尽，未完成搜索")
+                        if len(raw) > self.context.max_search_file_bytes or b"\x00" in raw:
+                            continue
+                        text = raw.decode("utf-8")
+                    except (OSError, UnicodeError):
+                        continue
+                    check_budget()
                     if use_regex:
-                        found = compiled.search(line) is not None
-                    else:
-                        found = query in line
-                    if not found:
+                        records.append((relative, text))
                         continue
-                    matches.append(f"{relative}:{line_number}: {line.strip()}")
-                    if len(matches) >= 200:
-                        return ToolResult(True, self._bounded("\n".join(matches)))
+                    for number, line in enumerate(text.splitlines(), 1):
+                        check_budget()
+                        if len(line) <= _MAX_SEARCH_LINE_CHARS and query in line:
+                            matches.append(f"{relative}:{number}: {line.strip()}")
+                            if len(matches) == 200:
+                                return ToolResult(True, self._bounded("\n".join(matches) + "\n（已截断：200 条匹配）"))
+        if use_regex:
+            payload = json.dumps({"query": query, "files": records}, ensure_ascii=False).encode("utf-8")
+            if len(payload) > 32 * 1024 * 1024:
+                return tool_failure(ErrorCode.EXECUTION_FAILED, "搜索输入预算耗尽，未完成搜索")
+            check_budget()
+            helper = Path(__file__).resolve().parents[1] / "process" / "regex_worker.py"
+            result = run_bounded_process(
+                [sys.executable, "-I", "-S", str(helper)], cwd=helper.parent,
+                env=filtered_subprocess_env(excluded_paths=(workspace,)),
+                timeout=deadline-time.monotonic(), max_output_bytes=8*1024*1024,
+                cancellation=cancellation, stdin_bytes=payload,
+                recoverable_timeout=True,
+            )
+            if result.cleanup_failed:
+                return tool_failure(ErrorCode.CLEANUP_FAILED, "搜索进程清理未确认")
+            if result.timed_out:
+                return tool_failure(ErrorCode.TIMEOUT, "正则搜索超时，未完成搜索", recovery=RecoveryAction.REPLAN)
+            if result.returncode or result.output_exceeded or result.input_failed:
+                return tool_failure(ErrorCode.EXECUTION_FAILED, "搜索子进程未完整返回结果")
+            try:
+                data = json.loads(result.stdout)
+                if not isinstance(data, dict) or set(data) != {"matches", "truncated"}:
+                    raise ValueError
+                matches = data["matches"]
+                if not isinstance(matches, list) or len(matches) > 200 or not all(isinstance(item, str) for item in matches) or type(data["truncated"]) is not bool:
+                    raise ValueError
+                if data["truncated"]:
+                    matches.append("（已截断：200 条匹配）")
+            except (ValueError, TypeError):
+                return tool_failure(ErrorCode.EXECUTION_FAILED, "搜索子进程结果格式无效")
         return ToolResult(True, self._bounded("\n".join(matches) or "(无匹配)"))
 
 

@@ -692,11 +692,17 @@ class NativeToolCallingTests(unittest.TestCase):
             (self.workspace / "sample.py").read_text(encoding="utf-8"),
         )
         first_round = provider.histories[1]
-        self.assertEqual("assistant", first_round[-4].role)
-        self.assertEqual(3, len(first_round[-4].tool_calls))
-        self.assertEqual("tool", first_round[-3].role)
-        self.assertEqual("tool", first_round[-2].role)
-        self.assertEqual("tool", first_round[-1].role)
+        assistant_index = next(
+            index
+            for index, message in enumerate(first_round)
+            if len(message.tool_calls) == 3
+        )
+        self.assertEqual("assistant", first_round[assistant_index].role)
+        self.assertEqual(
+            ["tool", "tool", "tool"],
+            [message.role for message in first_round[assistant_index + 1 : assistant_index + 4]],
+        )
+        self.assertEqual("verification_feedback", first_round[-1].kind)
 
     def test_protocol_error_can_recover_but_provider_error_stops_and_rolls_back(
         self,
@@ -1263,7 +1269,12 @@ class AgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(
-            ["task", "generic", "tool_result", "task_termination"],
+            [
+                "task",
+                "generic",
+                "tool_result",
+                "task_termination",
+            ],
             [message.kind for message in failed.context.messages],
         )
         resumed_provider = ScriptedProvider([action("finish", {"summary": "继续完成"})])
@@ -1284,7 +1295,12 @@ class AgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(
-            ["task", "generic", "tool_result", "task_termination"],
+            [
+                "task",
+                "generic",
+                "tool_result",
+                "task_termination",
+            ],
             [message.kind for message in failed.context.messages],
         )
 
@@ -1342,7 +1358,13 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(failed.result.ok)
         self.assertEqual(2, len(provider.histories))
         self.assertEqual(
-            ["task", "generic", "tool_result", "task_termination"],
+            [
+                "task",
+                "generic",
+                "tool_result",
+                "verification_feedback",
+                "task_termination",
+            ],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
@@ -1377,7 +1399,14 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(failed.result.ok)
         self.assertEqual(2, len(provider.histories))
         self.assertEqual(
-            ["task", "generic", "tool_result", "tool_result", "task_termination"],
+            [
+                "task",
+                "generic",
+                "tool_result",
+                "tool_result",
+                "verification_feedback",
+                "task_termination",
+            ],
             [message.kind for message in failed.context.messages],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
@@ -1476,7 +1505,7 @@ class AgentTests(unittest.TestCase):
                 action("finish", {"summary": "完成"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, max_context_chars=2_000, plan_enabled=False)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=2, max_context_chars=2_000, plan_enabled=False)
 
         failed = agent.run_with_context("修改模块", SessionContext())
 
@@ -1485,14 +1514,15 @@ class AgentTests(unittest.TestCase):
         second_request = provider.histories[1]
         self.assertIn(CONTEXT_COMPACTION_NOTICE, [m.content for m in second_request])
         self.assertEqual(
-            ["task", "generic", "tool_result"],
-            [message.kind for message in second_request[-3:]],
+            ["task", "generic", "tool_result", "verification_feedback"],
+            [message.kind for message in second_request[-4:]],
         )
         self.assertEqual(
             [
                 "task",
                 "generic",
                 "tool_result",
+                "verification_feedback",
                 "generic",
                 "tool_result",
                 "task_termination",
@@ -1620,6 +1650,7 @@ class AgentTests(unittest.TestCase):
                     {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
                 ),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "尚未补充验证", "outcome": "incomplete"}),
                 action("run_command", {"command": "python -m compileall -q sample.py"}),
                 action("finish", {"summary": "已验证"}),
             ]
@@ -1961,6 +1992,7 @@ class AgentTests(unittest.TestCase):
                     {"path": "sample.py", "old_text": "value = 1", "new_text": "value = 2"},
                 ),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "尚未验证", "outcome": "incomplete"}),
             ]
         )
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=3, plan_enabled=False)
@@ -1982,6 +2014,7 @@ class AgentTests(unittest.TestCase):
                 ),
                 action("run_command", {"command": "python -m compileall -q bad.py"}),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "仍未修复"}),
             ]
         )
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
@@ -1989,6 +2022,8 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
+        self.assertEqual(4, result.rounds)
+        self.assertTrue(result.task_validation.unresolved_check_ids)
         self.assertEqual("失败", result.verification)
         self.assertIn("验证失败", result.summary)
 
@@ -2003,9 +2038,10 @@ class AgentTests(unittest.TestCase):
                 ),
                 action("run_command", {"command": "python helper.py"}),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "尚未验证", "outcome": "incomplete"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=4, plan_enabled=False)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
 
         result = agent.run("修改示例")
 
@@ -2029,6 +2065,7 @@ class AgentTests(unittest.TestCase):
                 action("run_command", {"command": "python -m compileall -q bad.py"}),
                 action("run_command", {"command": "python helper.py"}),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "仍未修复"}),
             ]
         )
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
@@ -2036,6 +2073,8 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
+        self.assertEqual(5, result.rounds)
+        self.assertTrue(result.task_validation.unresolved_check_ids)
         self.assertFalse(result.unknown_effects)
         self.assertEqual("失败", result.verification)
         self.assertIn("验证失败", result.summary)
@@ -2053,6 +2092,7 @@ class AgentTests(unittest.TestCase):
                 action("run_command", {"command": "python -m compileall -q bad.py"}),
                 action("run_command", {"command": "python -m compileall -q sample.py"}),
                 action("finish", {"summary": "已修改"}),
+                action("finish", {"summary": "仍未修复"}),
             ]
         )
         agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
@@ -2060,6 +2100,8 @@ class AgentTests(unittest.TestCase):
         result = agent.run("修改示例")
 
         self.assertFalse(result.ok)
+        self.assertEqual(5, result.rounds)
+        self.assertTrue(result.task_validation.unresolved_check_ids)
         self.assertEqual("失败", result.verification)
 
     def test_finish_after_successful_verification_succeeds(self) -> None:
@@ -2095,9 +2137,10 @@ class AgentTests(unittest.TestCase):
                     {"path": "sample.py", "old_text": "value = 2", "new_text": "value = 3"},
                 ),
                 action("finish", {"summary": "再次修改"}),
+                action("finish", {"summary": "尚未重新验证", "outcome": "incomplete"}),
             ]
         )
-        agent = LegacyCodingAgent(provider, self.tools, max_rounds=5, plan_enabled=False)
+        agent = LegacyCodingAgent(provider, self.tools, max_rounds=6, plan_enabled=False)
 
         result = agent.run("连续修改示例")
 
@@ -2264,9 +2307,15 @@ class AgentTests(unittest.TestCase):
 
         result = agent.run("验证后尝试失败创建")
 
-        # 拒绝覆盖属于 STOP_TASK；终止不等于此前验证证据失效。
-        self.assertFalse(result.ok)
-        self.assertEqual(3, len(provider.histories))
+        # 审批前普通文件已存在是无副作用使用错误；可继续 finish，不能覆写。
+        self.assertTrue(result.ok)
+        self.assertEqual(4, len(provider.histories))
+        feedback = [json.loads(message.content) for message in provider.histories[-1]
+                    if message.kind == "tool_result"][-1]["tool_result"]
+        self.assertFalse(feedback["ok"])
+        self.assertEqual("invalid_argument", feedback["error"]["code"])
+        self.assertEqual("replan", feedback["error"]["recovery"])
+        self.assertEqual("file_already_exists", feedback["error"]["detail_code"])
         self.assertEqual("通过", result.verification)
         self.assertEqual(("sample.py",), result.modified_files)
         self.assertEqual("value = 2\n", (self.workspace / "sample.py").read_text(encoding="utf-8"))

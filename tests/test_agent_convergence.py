@@ -297,7 +297,8 @@ class AgentConvergenceTests(unittest.TestCase):
             "        self.assertEqual(2, VALUE)\n",
             encoding="utf-8",
         )
-        command = {"command": "python -m unittest -v test_value"}
+        # 使用工作区级发现，既验证业务断言，也明确覆盖 sample.py 的修改义务。
+        command = {"command": "python -m unittest discover -v"}
         responses: list[ProviderResponse] = []
         current = 0
         call_index = 1
@@ -737,7 +738,7 @@ class AgentConvergenceTests(unittest.TestCase):
                     )
                 ),
                 response(call(6, "read_file", {"path": "sample.py"})),
-                response(call(7, "finish", {"summary": "已检查修改"})),
+                response(call(7, "finish", {"summary": "已回读但未验证", "outcome": "incomplete"})),
             ]
         )
         agent, provider = self.make_agent(responses)

@@ -9,7 +9,7 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 
 - **统一 Provider 边界**：OpenAI、DeepSeek、GLM 的 OpenAI-compatible SSE 流统一归一化为类型化文本、工具、usage 与完成事件；同步 `complete()` 仍保持兼容。
 - **原生工具调用**：默认使用厂商 structured tool calling，并保留显式 `legacy_json` 回滚协议。
-- **可控本地执行**：读取、检索（`search_text` 支持正则、基础 `.gitignore` 常用语义（尾随 `/` 目录规则按任意层级匹配）与二进制/超大文件跳过，正则长度与单行长度受限以防灾难性回溯；`glob_files` 按相对模式定位文件，pattern 长度、`**` 数量与扫描结果规模均受限）、编辑、创建目录、创建文件和运行受限命令；`create_directory` 支持有限父目录链，`create_file` 只有显式 `create_parents=true` 才补父目录，默认仍要求父目录存在；`git_diff` 只读展示工作区未提交变更统计；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除、重命名或自动补父目录；`--read-only` 禁止这些写入；写操作与命令执行需要人工审批。
+- **可控本地执行**：读取、检索（`search_text` 支持正则、基础 `.gitignore` 常用语义（尾随 `/` 目录规则按任意层级匹配）与二进制/超大文件跳过；正则计算在可终止的固定子进程内执行，扫描与匹配共用预算；`glob_files` 按相对模式定位文件，pattern 长度、`**` 数量与扫描结果规模均受限）、编辑、创建目录、创建文件和运行受限命令；`create_directory` 支持有限父目录链，`create_file` 只有显式 `create_parents=true` 才补父目录，默认仍要求父目录存在；`git_diff` 只读展示工作区未提交变更统计；Provider 原生 `apply_patch` 可在一次审批中应用受限的多文件 unified diff，只允许修改或创建文件，不支持删除、重命名或自动补父目录；`--read-only` 禁止这些写入；写操作与命令执行需要人工审批。
 - **独立 Session 记忆**：每个 Session 保存独立工作区、Provider、模型、安全摘要和结构化状态；结构化压缩与经审阅的会话记忆持久化默认开启，保存仍需用户确认。
 - **本地斜杠命令**：`/session`、`/model`、`/status`、`/memory`、`/clear` 等命令不会发送给 Provider。
 - **可审计与可验证**：运行过程写入 JSONL 审计记录，并由跨平台自动化测试覆盖核心边界。
@@ -19,6 +19,24 @@ TriCoder CLI 是一个强调可控执行、会话记忆和多模型适配的本�
 - **统一 Extension Host**：扩展以安全 descriptor 和显式工具来源接入；生命周期失败隔离、名称冲突双方拒绝、内置工具优先，真实扩展默认关闭。
 
 ## Provider 用量与 KV Cache 指标
+
+流式请求收到完整 `[DONE]` 后立即结束读取，不等待服务端关闭连接。`timeout=T`
+同时限制首个有效进展及之后的无进展间隔；一次逻辑请求（包含重试和退避）总预算为
+`3T`，默认 30/90 秒。非空文本、reasoning、工具参数增长属于进展，心跳、空 delta
+和单独 usage 不延长空闲预算。取消/超时之后仍需确认连接和后台 worker 已退出；
+清理未确认时停止任务并保留原资源所有权，不能据此释放锁或复用执行资源。
+
+`search_text` 最多扫描 10,000 个条目、读取 16 MiB，扫描与匹配共享
+`min(timeout, 10 秒)`。正则长度 200、单行 4096、最多 200 条匹配的限制继续保留。
+条目/字节/时间耗尽明确返回未完整搜索；正常达到 200 条匹配返回截断标记。
+正则使用固定的隔离 Python helper，文件枚举和读取仍只有合作式预算，不是文件系统硬超时。
+仅该只读 helper 的超时可在确认清理后使用局部预算返回 `TIMEOUT/REPLAN`，不启动任务终止期限；取消、清理未确认、已有终止期限及普通命令仍沿用原有终止与资源所有权规则。
+
+受控 `python -m compileall` 的字节码缓存由宿主写入工作区外的独占临时目录，
+仅改变子进程环境，结束后按资源所有权清理；不改变普通脚本的验证权限，也不忽略
+用户写入工作区的 `__pycache__`。本轮有效检查按当前快照合并覆盖；本轮已确认创建且
+子文件全部验证的结构父目录不再残留 pending，独立目录仍需验证。来源不明的旧目录
+pending 与 `legacy_unknown` 保守保留，无数据库迁移，不恢复跨重启 evidence。
 
 每次 Provider 响应完成后，只有当服务商 `usage` 至少包含一个有效用量字段时，CLI 才显示该轮的输入、缓存和输出 token 用量行；同一任务的累计用量由各轮已返回的指标相加得到。TriCoder 只归一化并展示/审计这些服务商返回的用量数据，不会在本地保存或管理 KV Cache。
 
@@ -129,6 +147,15 @@ Provider 完整响应收集与 round 0 规划位于 `tricoder/engine/provider_re
 
 任务结束也属于显式工具协议：工作完成、无法继续或需要用户补充信息时，模型必须调用 `finish`，并在必填的 `summary` 中说明结果和未完成事项。可选 `outcome` 接受 `completed` 或 `incomplete`，省略时为兼容旧调用按 `completed` 处理；它只表达模型的交付声明，不代表测试通过。普通文本、`finish_reason=stop` 或“任务完成”字样都不会被本地框架当作成功。没有本轮文件修改义务时，检查命令失败会保留在“任务验证”中并显示“检查发现失败”，但不强制把一份已完成的审查报告判成未交付；本轮真实修改、取消、清理失败或 `unknown_effects` 仍由本地可信状态阻止成功。历史待验证修改作为独立 Session 义务展示和保存，不会因只读回顾而消失，也不会单独把回顾任务改判失败。
 
+首次 `finish(completed)` 若缺口是已知修改范围尚缺可信验证，或有能锚定当前完整快照的
+未解决检查，宿主会提示“本轮尚未结束”，给同一任务一次补充机会；所有原因共用一次计数，
+原生与 `legacy_json` 共用这条规则。它发生在任务历史闭合、
+终结记忆候选生成和资源释放之前，继续占用原任务及宿主锁，也继续消耗原 `max_rounds`。
+宿主不会自动运行建议命令或重放同批 `finish` 后已标为 `skipped` 的动作。第二次仍缺证据、
+预算不足，或模型声明 `finish(incomplete)` 时直接按未完成收尾。取消、审批拒绝、未知副作用、
+没有当前可信检查锚点的失败、过期证据、外部变化、扫描/审计/清理失败、已启动的终止期限和
+历史 `legacy_unknown` 不进入这项恢复；新任务重新计数。纠正不会接受完成或清除失败，仍需正常复验。
+
 原生模式对“返回普通文本但没有任何工具调用”采用单任务累计纠错预算：第 1、2 次反馈当前 `1/3`、`2/3`，第 2 次同时提示再次发生会停止；累计第 3 次立即以未完成结束，不再发送第 4 次 Provider 请求。期间成功读取、写入或验证都不会清零，因为它约束的是结束协议错误总数；每个新任务创建新的运行状态并从 0 开始，`legacy_json` 不使用该专项预算。若 `max_rounds` 更早耗尽，仍沿用原有总轮数停止原因。提前停止不会撤销已提交修改或丢弃账本、验证和用量；它不会自动请求摘要，但历史完整时可由后续 `/memory refresh` 形成未完成待办。
 
 需求缺少关键选择时，原生工具协议可调用 `ask_user(question, options?)`。选项只是提示，Console 与 TUI 都允许最多 4000 字符的自由文本；回答只作为下一轮模型输入，不是写文件、运行命令、调用扩展或提升权限的审批。同一批中位于提问之后的工具只记录为 `skipped`，取得回答后必须重新请求模型并重新走原有审批与安全检查。单任务最多提出 2 次有效问题，第三次会以“仍需用户输入”停止。
@@ -186,7 +213,7 @@ python -m tricoder doctor --provider openai --workspace . --no-color
 model = "glm-5.2"
 max_rounds = 10
 max_context_chars = 80000
-timeout = 30
+timeout = 30  # 流式首进展/无进展上限 T；含重试与退避的总预算为 3T
 tool_protocol = "native"
 plan = true
 
@@ -410,6 +437,23 @@ UNKNOWN，不能视为安全语义上的兼容。内置文件工具记录可观�
 已有的 UNKNOWN 不会被稳定脚本清除。非只读 MCP/扩展继续按保守 UNKNOWN 处理。
 这些快照不是进程沙箱，也不覆盖网络、系统其他目录、脱离管理的后代或被排除目录。
 
+工具批次结束后，宿主可追加一条 `verification_feedback`，说明真实命令种类、执行状态、
+本轮验证义务和待验证相对路径。最多列出 20 条路径、2000 字符，并报告省略数；模型或
+工具输出中的同名 JSON 没有修改可信状态的权限。普通脚本即使成功，修改义务仍为 pending。
+反馈另列最多 5 个 `blocking_checks`（检查 ID、类型、固定原因和受控相对目标），并区分历史
+过期数、未解决数及省略数；总消息仍限 2000 字符，不回显命令参数或输出，不授予自动重放权限。
+失败记录被最近 32 条窗口淘汰后仍保留 ID，需查看原工具回合。先修复并以相同检查复验失败，
+再补路径覆盖；仅历史非失败检查过期不要求逐条重跑。
+检查须覆盖本轮已确认的修改范围；目标文件、有效 `cwd`、零测试和范围筛选均参与判断，
+不会根据测试模块的 import 自动推断其覆盖其他源码。`python -m unittest -q` 的隐式发现
+按实际有效 cwd 记录范围。简单文件可使用 `python -m compileall -q <相对路径>` 检查语法；
+已由宿主确认创建的父目录不再要求子文件检查反向覆盖目录；目录的路径边界、身份、账本
+和最终快照检查仍保留，独立目录变更仍维持原有验证要求。同一任务、当前完整快照下的
+有效检查可以合并覆盖，反馈只列出尚未覆盖的目标；修改后失效的旧检查、失败、零测试和
+范围筛选记录不能凑足覆盖。语法通过不代表功能验收，且 `compileall` 会生成
+字节码缓存：在严格限定允许改动的 Eval 中，缓存文件可能导致 `change_out_of_scope`。
+当前原题 `q-nested-create` 的离线恢复对照仍保留这个评分失败，不将 Agent 正常收尾冒称整题通过。
+
 扫描绑定规范工作区、本地 Session 能力和版本化范围规则，覆盖普通文件的相对路径、
 类型、内容、大小、权限及可用身份。固定排除 `.git`、`.venv`、`__pycache__`、
 `.pytest_cache` **目录**以及当前本地审计器持有的精确日志文件；不采用 `.gitignore`
@@ -493,6 +537,9 @@ task ID 和每次任务轮换的独立 authority，模型、旧任务、历史�
 清理失败、超时、输出超限、观察不完整、无关脚本或版本查询不能覆盖失败。过期状态
 按检查签名维护，版本查询不会让编辑前的测试重新有效；SessionRuntime 收尾扫描若
 发现未归属变化或无法证明最终状态，已有检查也会标为 stale。
+`stale_check_ids` 单独保留失效身份：没有未解决失败且存在当前认可的有效检查时，历史
+过期不再将报告强制设为 stale；真正未解决的检查优先报告 failed。Engine 完成、宿主反馈和
+Runtime 义务合并仍分别核验当前 authority、快照、有效执行与目标覆盖，不从历史记录恢复能力。
 每个任务最多展示最近 32 条记录，旧失败即使被记录容量淘汰也仍保持未解决状态。
 Console 与 TUI 会把“执行/退出结果”“文件状态检查”“任务验证”分开，并始终显示
 “需求覆盖未自动确认”。无关测试成功、未识别目标和无检查任务都不会被包装成
@@ -517,6 +564,17 @@ I01–I07 已用七条独立公共流程串联验证：失败补丁的残留与�
 `create_directory` 的 `parents` 与 `exist_ok` 默认都是 `true`，单次最多补 16 层、单任务最多新增 128 个目录。目标已存在且 `exist_ok=true` 时是无审批、无所有权记录的幂等成功；`read_only` 即使面对已有目录仍会拒绝写工具入口。`create_file(create_parents=true)` 会把完整目录清单和文件 diff 合并为一次审批，文件仍使用不可覆盖的原子发布。`apply_patch` 不自动补目录，父目录缺失时应先调用 `create_directory`。实际创建空目录同样属于本轮工作区变化，会建立验证义务；幂等 no-op 不建立义务。相关宿主检查覆盖后可以交付，但不会因此伪造业务验收。
 
 源码快照、目录身份以及本地生成的正向/反向 diff 不会写入 SQLite、JSONL 审计记录或发送给 Provider。`apply_patch` 的补丁文本由 Provider 生成并作为原生工具调用参数进入当前进程的消息上下文；同一任务继续推理时，它可能随后续轮次的消息历史再次发送给 Provider，但不会写入 SQLite 或 JSONL 审计记录。文件内存账本总预算为 2,000,000 个字符，目录上限为 128 个，进程重启后撤销历史和进程内目录状态即消失。MVP 不提供 `/redo`、多级撤销、按历史记录选择撤销、持久化撤销历史，也不依赖 Git；`apply_patch` 同样不支持文件删除或重命名补丁。
+
+`apply_patch` 的工具说明包含完整的受限 unified diff 示例：连续的 `--- a/...`、
+`+++ b/...` 文件头、带行号/计数的 hunk、以空格开头的上下文行和真实换行。
+Markdown 围栏、Begin/End Patch、删除或重命名仍不支持。失败反馈使用固定的
+`patch_*` 子类型区分文件头、hunk、计数、操作、上下文和格式错误；协议与审计只添加
+白名单 `detail_code`，不回显补丁正文或原始异常，也不改变审批、原子预检或恢复主码。
+
+固定 `git_diff` 仅适用于工作区等于 Git 仓库根（包括 worktree）的情况。确认根位于
+工作区外时不会执行 diff，返回 `execution_failed/replan/git_workspace_unavailable`，
+Agent 可继续使用工作区文件验证；该结果没有文件副作用或验证证明。普通 `run_command`
+的父仓库 Git 访问仍被拒绝，取消、清理失败和 UNKNOWN 仍停止任务。
 
 ## 工作区任务锁与代码快照门禁
 
@@ -652,6 +710,18 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 ## Eval
 
+新 [`evals/quality-v3/`](evals/quality-v3/README.md) 提供 **30 道 quality、0 道 contract**
+（原19题优化+新增11题），22 dev / 8 holdout。每 user_turn 16轮、16000上下文字符；
+四份实验清单 planned_trials 为30/90/22/8。旧19题全部归dev，已用于诊断的旧holdout
+不再称为未接触题；新holdout也已由建题作者和离线验收脚本接触。公开测试、隐藏验证、
+120项基础变体及合法替代实现的说明见新套件README；参考解只在tests侧。
+本包未运行真实模型，状态为“实现完成，待独立复审”。新旧benchmark不同，不能将
+分数变化归因为Agent改进；旧quality-v1/v2/v2.2、contract、默认预算与历史成绩均保留。
+
+```powershell
+python -m tricoder eval --experiment evals/quality-v3/experiment-quality-baseline.toml --dry-run --no-color
+```
+
 `tricoder eval` 用版本控制内的 fixture、隔离工作副本和 Agent 结束后才注入的隐藏
 verifier，评测本地 Coding Agent 的确定性完成条件。默认会真实调用 OpenAI Provider；
 可显式选择 Provider 或只运行一个 case，以控制费用：
@@ -676,6 +746,27 @@ python -m tricoder eval --experiment evals/quality-v1/experiment-quality-baselin
 总时间和费用预算。v2 题库按 `execution_kind` 把 quality 与 contract 条件匹配，fake
 工程契约结果不会并入真实模型质量成功率。
 
+`evals/quality-v2/` 保留 v1 的 30 个 ID、split、8 轮预算与全部隐藏 verifier；v1 与旧成绩
+保留原样。19 道质量题通过可选的 `expose_edit_scope=true`，在每个 user_turn 公开来自
+`allowed_changes` 的修改范围，并补足业务边界语义；允许约定的 `tests/` 直接 Python
+子文件，不能修改其他生产源码。该字段默认 False，仅 schema 2 支持；已有提示默认不变。
+多轮 steps 优先于 task，后轮修正不会提前进入首轮；隐藏测试与答案不加入模型消息。
+逐题变化见 [`evals/quality-v2/README.md`](evals/quality-v2/README.md)。
+
+当前该目录的 benchmark_version 为 `quality-v2.1`，suite id 仍为 `quality-v2`。
+仅 19 道质量题显式设置 `path_match_mode="workspace_root"`：allowed 和 required 均按
+根相对路径逐段、同段数、大小写敏感匹配，通配符不跨目录，不支持 `**`，拒绝非法路径。
+schema 2 缺省模式为 `legacy`，旧后缀匹配与提示不变；schema 1 不接受新字段。
+旧冻结 A/B 仍是 quality-v2，成绩不回写，跨 benchmark_version 比较会被拒绝。
+当前评分快照只记录普通文件，本轮文件范围修复不包含空目录或完整目录级审计。
+
+`evals/regression-v1/` 另提供 12 个固定故障回归：6 个真实 Provider quality 题和
+6 个离线 contract 题。新评分把隐藏 verifier、宿主行为断言和期望结果分开；例如
+审批拒绝或重复失败可以满足安全契约，但报告仍保留 `agent_completed=false` 与原始
+失败代码。回读、重启恢复、工作区确认和损坏记录阻断必须有宿主观察，不能由模型文字
+或“隐藏测试通过”替代。完整矩阵和运行命令见
+[`evals/regression-v1/README.md`](evals/regression-v1/README.md)。
+
 实验会在开始时冻结 case/condition/repetition 清单，跨条件轮换执行；每次重复都重建
 工作副本、Provider、Agent 和上下文，只有同一个多轮任务内部保留上下文。预算耗尽、
 取消和未执行条目仍写入分母。每个 trial 完成后原子保存，最终报告分别给出代码正确、
@@ -688,6 +779,14 @@ python -m tricoder eval --experiment evals/quality-v1/experiment-quality-baselin
 shell 插件；Provider 传输重试、工具错误后的重规划和审批拒绝分别记录。Eval 重启会在
 关闭旧 Runtime 前保存完整 Session ID，并在新 Runtime 中显式恢复同一 ID；按名称切换
 若匹配到多条记录会报歧义，必须改用完整 UUID，不能静默选择第一条。
+
+新报告保留每个 user_turn 的状态、轮数、工具调用数和可归因的 STOP_TASK 主错误码，
+以及首个失败 turn；整体完成仍取各 turn 的 AND，后轮成功不会抹掉前轮失败。无法归因
+的终止错误为 null。旧结果缺少这些字段时保持未知，不重算历史得分。实际触发的故障
+另记证据类型：`provider_transient` 是 `counter_only`，工具故障是
+`synthetic_tool_result`；旧记录没有类型时展示“证据类型未知”。retries 包含模拟恢复计数，
+不能称为实际 HTTP 重试次数；这些题只证明收到模拟错误后继续，不代表真实传输、参数
+修复或输出截断机制已验证。memory off/off 只测短多轮行为，不证明持久记忆或压缩质量。
 
 比较两个单条件 v2 结果时，必须显式声明允许变化的实验变量：
 

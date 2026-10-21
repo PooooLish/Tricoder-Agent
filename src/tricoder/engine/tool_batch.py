@@ -772,6 +772,15 @@ class ToolBatchExecutor:
             or effects.directory_paths
         ):
             state.validation.invalidate()
+        if result.ok and effects.state is EffectState.CONFIRMED:
+            state.task_modified_files.extend(
+                path for path in effects.paths if path not in state.task_modified_files
+            )
+            state.task_modified_directories.extend(
+                path
+                for path in effects.directory_paths
+                if path not in state.task_modified_directories
+            )
         check = result.command_check
         if (
             action.tool == "run_command"

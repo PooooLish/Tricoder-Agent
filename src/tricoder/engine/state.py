@@ -66,6 +66,11 @@ class AgentRunState:
     verification_required: bool = False
     verification_obligation: str = "none"
     pending_verification_paths: tuple[str, ...] = ()
+    # 只记录本次任务由宿主确认的写入路径；不从历史会话累计字段恢复。
+    # 收尾纠正和反馈使用这组路径说明本轮义务，不能拿模型自报路径代替。
+    task_modified_files: list[str] = field(default_factory=list)
+    task_modified_directories: list[str] = field(default_factory=list)
+    finish_verification_recoveries: int = 0
     unknown_effects: bool = False
     tool_calls: int = 0
     cleanup_failed: bool = False
@@ -76,6 +81,8 @@ class AgentRunState:
     memory_summary_failed: bool = False
     memory_compacted: bool = False
     memory_warning: str = ""
+    # Read-only capability reference for feedback; ownership remains with ToolContext.
+    verification_scope: Any = field(default=None, repr=False)
     validation: TaskValidationTracker = field(init=False)
     progress: ProgressGuard = field(init=False)
 

@@ -19,9 +19,10 @@ from .report import trial_record_from_dict
 
 
 _ALLOWED_VARIABLES = frozenset({"model", "provider", "memory", "faults", "code"})
-_FINGERPRINT_KEYS = frozenset(
+_LEGACY_FINGERPRINT_KEYS = frozenset(
     {"suite", "verifier", "tasks", "budgets", "approval_policy", "environment", "code"}
 )
+_FINGERPRINT_KEYS = _LEGACY_FINGERPRINT_KEYS | {"scoring"}
 
 
 class ComparisonError(ValueError):
@@ -155,11 +156,14 @@ def _load_comparable(payload: object) -> _ComparableReport:
     if not isinstance(conditions, list) or len(conditions) != 1 or not isinstance(conditions[0], dict):
         raise ComparisonError("strict comparison requires exactly one condition per report")
     condition = _read_condition(conditions[0])
-    if not isinstance(fingerprints, dict) or set(fingerprints) != set(_FINGERPRINT_KEYS):
+    if not isinstance(fingerprints, dict) or set(fingerprints) not in {
+        _LEGACY_FINGERPRINT_KEYS,
+        _FINGERPRINT_KEYS,
+    }:
         raise ComparisonError("experiment fingerprints are incomplete")
     safe_fingerprints: dict[str, str] = {}
     for key in _FINGERPRINT_KEYS:
-        value = fingerprints.get(key)
+        value = fingerprints.get(key, "legacy-v2" if key == "scoring" else None)
         if not isinstance(value, str) or not value or len(value) > 128:
             raise ComparisonError(f"{key} fingerprint is invalid")
         safe_fingerprints[key] = value

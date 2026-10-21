@@ -334,7 +334,10 @@ class EvalServiceTests(unittest.TestCase):
         self.assertEqual("legacy", payload["benchmark_version"])
         self.assertEqual("default", payload["conditions"][0]["id"])
         self.assertEqual(
-            {"suite", "verifier", "tasks", "budgets", "approval_policy", "environment", "code"},
+            {
+                "suite", "verifier", "tasks", "budgets", "approval_policy",
+                "environment", "code", "scoring",
+            },
             set(payload["fingerprints"]),
         )
 
@@ -349,11 +352,9 @@ class EvalServiceTests(unittest.TestCase):
         case_path.write_text(
             'id = "case-one"\ntitle = "case-one"\ntask = "fallback"\n'
             'allowed_changes = ["app.py"]\nrequired_changes = ["app.py"]\n'
-            # 命令白名单说明属于生产请求固定前缀；为本用例保留两轮各一次
-            # 摘要的原验证目标，预算需覆盖扩充后的固定前缀，而不是误测第三次压缩。
-            # ask_user 的完整定义使固定工具前缀增加约 401 字符；按 0.80
-            # trigger_ratio 保留原测试的有效余量，避免误测额外 compaction。
-            'max_rounds = 4\nmax_context_chars = 6500\n'
+            # 本用例断言两次任务收尾摘要；给扩充的验证说明留足固定前缀空间。
+            # 压缩触发由独立用例验证，不能让本用例额外压缩混入 summary_count。
+            'max_rounds = 4\nmax_context_chars = 12000\n'
             'category = "memory"\nsplit = "dev"\nexecution_kind = "quality"\n'
             'scorers = ["hidden_verifier"]\nfaults = ["none"]\n'
             'dimensions = ["artifact_correct", "agent_completed"]\n\n'

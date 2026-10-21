@@ -6,6 +6,8 @@ import asyncio
 import codecs
 import http.client
 import json
+import queue
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -19,6 +21,8 @@ _STREAM_READ_BYTES = 64 * 1024
 from typing import AsyncIterator, Callable, Protocol
 
 from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.process.provider_stream import UrllibStreamOwner, finish_async_operation
+from tricoder.task_cleanup import current_cleanup
 from tricoder.core.events import (
     ProviderCompleted,
     ProviderEvent,
@@ -41,9 +45,10 @@ from tricoder.models import (
 class ProviderError(RuntimeError):
     """统一表示模型请求失败，并标记是否值得重试。"""
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, retryable: bool = False, code: str | None = None) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.code = code
 
 
 class ProviderProtocolError(ProviderError):
@@ -137,6 +142,9 @@ def _stable_json_bytes(payload: dict[str, object]) -> bytes:
 class UrllibTransport:
     """使用 Python 标准库实现的 HTTPS JSON 传输。"""
 
+    def __init__(self) -> None:
+        self._stream_owners: list[UrllibStreamOwner] = []
+
     def post_json(
         self,
         url: str,
@@ -189,7 +197,7 @@ class UrllibTransport:
         timeout: float,
         cancellation: CancellationToken | None = None,
     ) -> AsyncIterator[bytes]:
-        """在线程中执行阻塞 urllib 读取，向异步调用方交付有界字节块。"""
+        """由精确资源所有者管理阻塞线程；迟到连接也必须关闭。"""
 
         request = urllib.request.Request(
             url,
@@ -199,51 +207,52 @@ class UrllibTransport:
         )
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        self._stream_owners = [owner for owner in self._stream_owners
+                               if not owner.cleanup(time.monotonic())]
+        if self._stream_owners:
+            raise ProviderError("模型连接清理尚未确认", code="cleanup_failed")
+        owner = UrllibStreamOwner(request, timeout)
+        self._stream_owners.append(owner)
+        scope = current_cleanup()
+        if scope is not None:
+            scope.retain(owner)
         try:
-            response = await asyncio.to_thread(
-                urllib.request.urlopen,
-                request,
-                timeout=timeout,
-            )
-        except urllib.error.HTTPError as exc:
-            retryable = exc.code == 429 or 500 <= exc.code < 600
-            raise ProviderError(f"模型服务返回 HTTP {exc.code}", retryable=retryable) from exc
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            OSError,
-            http.client.HTTPException,
-        ) as exc:
-            raise ProviderError("模型服务连接或响应读取失败", retryable=True) from exc
-
-        try:
-            read_chunk = getattr(response, "read1", None)
-            if not callable(read_chunk):
-                read_chunk = response.read
+            owner.worker.start()
             while True:
                 if cancellation is not None:
                     cancellation.raise_if_cancelled()
                 try:
-                    chunk = await asyncio.to_thread(read_chunk, _STREAM_READ_BYTES)
-                except (
-                    urllib.error.URLError,
-                    TimeoutError,
-                    OSError,
-                    http.client.HTTPException,
-                ) as exc:
-                    raise ProviderError(
-                        "模型服务连接或响应读取失败",
-                        retryable=True,
-                    ) from exc
+                    chunk = owner.queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(.01)
+                    continue
+                if isinstance(chunk, urllib.error.HTTPError):
+                    raise ProviderError(f"模型服务返回 HTTP {chunk.code}",
+                                        retryable=chunk.code == 429 or 500 <= chunk.code < 600)
+                if isinstance(chunk, Exception):
+                    raise ProviderError("模型服务连接或响应读取失败", retryable=True)
                 if not chunk:
                     break
                 if not isinstance(chunk, bytes):
                     raise ProviderProtocolError("模型服务流返回了无效字节块")
                 yield chunk
         finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                await asyncio.to_thread(close)
+            primary = sys.exc_info()[0] not in (None, GeneratorExit)
+            try:
+                # 可重试的连接失败只结束本次尝试，不能提前消费整个任务的
+                # 终止清理期限；若局部清理失败，owner 仍会保留并启动失败门禁。
+                terminating = isinstance(sys.exc_info()[1], (CancellationError, asyncio.CancelledError))
+                cleaned = await owner.finish(terminal=terminating)
+            except BaseException:
+                # 关闭等待自身被取消，仍不能交出正在 read/close 的线程所有权。
+                if scope is not None:
+                    scope.mark_failed()
+                    scope.retain(owner)
+                raise
+            if cleaned:
+                self._stream_owners.remove(owner)
+            elif not primary:
+                raise ProviderError("模型连接清理尚未确认", code="cleanup_failed")
 
 
 class ModelProvider(Protocol):
@@ -282,6 +291,7 @@ class OpenAICompatibleProvider:
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._sleeper = sleeper
+        self._pending_stream_tasks = []
         if _profile is None:
             try:
                 _profile = _PROVIDER_PROFILES[config.name.casefold()]
@@ -333,13 +343,21 @@ class OpenAICompatibleProvider:
         post_stream = getattr(transport, "post_stream", None)
         if not callable(post_stream):
             raise ProviderError("当前传输层不支持流式响应")
+        self._pending_stream_tasks = [owner for owner in self._pending_stream_tasks
+                                      if not owner.cleanup(time.monotonic())]
+        if self._pending_stream_tasks:
+            raise ProviderError("模型连接清理尚未确认", code="cleanup_failed")
 
+        deadline = time.monotonic() + 3 * self._timeout
         for attempt in range(self._max_attempts):
+            if time.monotonic() >= deadline:
+                raise ProviderError("模型请求总预算耗尽", code="request_deadline_exceeded")
             emitted = False
             try:
                 async for event in self._stream_once(
                     post_stream(url, headers, payload, self._timeout, cancellation),
                     cancellation,
+                    deadline=deadline,
                 ):
                     emitted = True
                     yield event
@@ -347,15 +365,16 @@ class OpenAICompatibleProvider:
             except CancellationError:
                 raise
             except ProviderError as exc:
+                cleanup = current_cleanup()
+                if cleanup is not None and (cleanup.failed or cleanup.has_pending):
+                    raise
                 if emitted or not exc.retryable or attempt == self._max_attempts - 1:
                     raise
-                delay = float(2**attempt)
-                if cancellation is None:
-                    await asyncio.to_thread(self._sleeper, delay)
-                else:
-                    cancellation.raise_if_cancelled()
-                    if await asyncio.to_thread(cancellation.wait, delay):
-                        raise CancellationError("操作已取消")
+                until = min(time.monotonic() + float(2**attempt), deadline)
+                while time.monotonic() < until:
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled()
+                    await asyncio.sleep(min(.02, max(0, until - time.monotonic())))
         raise ProviderError("模型请求重试逻辑异常")
 
     def _build_request(
@@ -396,6 +415,7 @@ class OpenAICompatibleProvider:
         self,
         byte_stream: AsyncIterator[bytes],
         cancellation: CancellationToken | None,
+        *, deadline: float | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """解析单次 SSE 响应；只有完成边界才能发布工具调用。"""
 
@@ -411,6 +431,21 @@ class OpenAICompatibleProvider:
         tools_finalized = False
         pending_tools: dict[int, dict[str, str]] = {}
         started_tools: set[int] = set()
+        deadline = deadline if deadline is not None else time.monotonic() + 3 * self._timeout
+        last_progress = time.monotonic()
+        progress_seen = False
+
+        def progress() -> None:
+            nonlocal last_progress, progress_seen
+            last_progress, progress_seen = time.monotonic(), True
+
+        def check_budget() -> None:
+            now = time.monotonic()
+            if now >= deadline:
+                raise ProviderError("模型请求总预算耗尽", code="request_deadline_exceeded")
+            if now - last_progress >= self._timeout:
+                code = "idle_timeout" if progress_seen else "first_progress_timeout"
+                raise ProviderError("模型响应缺少有效进展", code=code)
 
         def append_data_line(value: str) -> None:
             """增量计算事件大小，避免对大量 data 行反复 join 形成平方开销。"""
@@ -468,6 +503,7 @@ class OpenAICompatibleProvider:
                     raise ProviderProtocolError("模型服务流文本格式不正确")
                 count_output(content)
                 if content:
+                    progress()
                     events.append(TextDelta(content))
             thinking = delta.get("reasoning_content", delta.get("reasoning"))
             if thinking is not None:
@@ -475,6 +511,7 @@ class OpenAICompatibleProvider:
                     raise ProviderProtocolError("模型服务流思考格式不正确")
                 count_output(thinking)
                 if thinking:
+                    progress()
                     events.append(ThinkingDelta(thinking))
 
             raw_calls = delta.get("tool_calls", [])
@@ -511,6 +548,8 @@ class OpenAICompatibleProvider:
                         raise ProviderProtocolError("模型服务流工具调用格式不正确")
                     count_output(arguments)
                     pending["arguments"] += arguments
+                    if arguments:
+                        progress()
                 if pending["id"] and pending["name"] and index not in started_tools:
                     started_tools.add(index)
                     events.append(ToolCallStarted(pending["id"], pending["name"]))
@@ -525,6 +564,7 @@ class OpenAICompatibleProvider:
                 tools_finalized = True
                 finish_seen = True
                 finish_reason_value = finish_reason
+                progress()
             return tuple(events)
 
         def finalize_tools() -> tuple[ToolCallCompleted, ...]:
@@ -546,12 +586,28 @@ class OpenAICompatibleProvider:
             return tuple(completed_calls)
 
         async_iterator = byte_stream.__aiter__()
+        read_finished = True
         try:
             while True:
                 if cancellation is not None:
                     cancellation.raise_if_cancelled()
                 try:
-                    chunk = await anext(async_iterator)
+                    check_budget()
+                    next_chunk = asyncio.create_task(anext(async_iterator))
+                    try:
+                        while not next_chunk.done():
+                            if cancellation is not None:
+                                cancellation.raise_if_cancelled()
+                            check_budget()
+                            await asyncio.wait({next_chunk}, timeout=.01)
+                        chunk = next_chunk.result()
+                    finally:
+                        if not next_chunk.done():
+                            # urllib 的 finally 负责有界关闭；不把 task.cancel 当清理证据。
+                            read_finished = False
+                            read_finished = await finish_async_operation(
+                                next_chunk, self._pending_stream_tasks, cancel=True,
+                            )
                 except StopAsyncIteration:
                     break
                 except CancellationError:
@@ -588,6 +644,8 @@ class OpenAICompatibleProvider:
                             data_bytes = 0
                             for event in parse_data(data):
                                 yield event
+                            if completed:
+                                return
                         continue
                     if line.startswith(":"):
                         continue
@@ -600,8 +658,27 @@ class OpenAICompatibleProvider:
                         )
         finally:
             aclose = getattr(async_iterator, "aclose", None)
-            if callable(aclose):
-                await aclose()
+            if callable(aclose) and read_finished:
+                primary = sys.exc_info()[0] is not None
+                closing = asyncio.create_task(aclose())
+                # 正常结束使用局部预算；异常已启动的任务期限不重新领取。
+                scope = current_cleanup()
+                deadline_close = (scope.started_deadline if scope is not None else None)
+                deadline_close = deadline_close or time.monotonic() + 5
+                try:
+                    await asyncio.wait({closing}, timeout=max(0, deadline_close - time.monotonic()))
+                except asyncio.CancelledError:
+                    await finish_async_operation(closing, self._pending_stream_tasks)
+                    raise
+                if not closing.done():
+                    if scope is not None:
+                        scope.begin_termination(deadline=deadline_close)
+                    await finish_async_operation(closing, self._pending_stream_tasks,
+                                                 cancel=True, deadline=deadline_close)
+                    if not primary:
+                        raise ProviderError("模型连接清理尚未确认", code="cleanup_failed")
+                elif not closing.cancelled():
+                    closing.result()
 
         try:
             text_buffer += decoder.decode(b"", final=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 import os
 from pathlib import Path
 import re
@@ -13,7 +14,9 @@ from typing import Final
 from tricoder.models import TokenUsage
 
 from .metrics import MetricValue, aggregate_trial_metrics
-from .models import ExperimentRunReport, TrialDimensions, TrialKey, TrialRecord
+from .assertions import AssertionResult, SubcaseResult
+from .models import ExperimentRunReport, TrialDimensions, TrialKey, TrialRecord, EvalTurnRecord
+from .faults import FAULT_EVIDENCE_KINDS
 from .output import _is_link_or_reparse_point, validate_run_directory
 from .runner import EvalCaseResult, EvalRunReport, VerificationResult
 
@@ -118,6 +121,12 @@ def normalize_report_payload(payload: object) -> dict[str, object]:
 def trial_record_as_dict(record: TrialRecord) -> dict[str, object]:
     """Serialize one trial using only fixed identifiers, counts and booleans."""
 
+    turns = _read_turn_results([asdict(turn) for turn in record.turn_results])
+    _validate_first_failed(turns, record.first_failed_turn)
+    triggered = _read_fault_ids(list(record.triggered_faults))
+    evidence = _read_fault_evidence([
+        {"fault_id": fault, "kind": kind} for fault, kind in record.fault_evidence
+    ], triggered)
     return {
         "condition_id": _safe_identifier(record.key.condition_id),
         "case_id": _safe_identifier(record.key.case_id),
@@ -138,7 +147,10 @@ def trial_record_as_dict(record: TrialRecord) -> dict[str, object]:
         "retries": _safe_optional_count(record.retries),
         "usage": _usage_as_dict(record.usage),
         "summary_usage": _usage_as_dict(record.summary_usage),
-        "triggered_faults": [_safe_identifier(value) for value in record.triggered_faults],
+        "triggered_faults": list(triggered),
+        "turn_results": [asdict(turn) for turn in turns],
+        "first_failed_turn": record.first_failed_turn,
+        "fault_evidence": [{"fault_id": fault, "kind": kind} for fault, kind in evidence],
         "recovery_path": (
             _safe_identifier(record.recovery_path)
             if record.recovery_path is not None
@@ -151,6 +163,25 @@ def trial_record_as_dict(record: TrialRecord) -> dict[str, object]:
         "safety_bypass_attempts": _safe_optional_count(record.safety_bypass_attempts),
         "legitimate_actions_attempted": _safe_optional_count(record.legitimate_actions_attempted),
         "legitimate_actions_allowed": _safe_optional_count(record.legitimate_actions_allowed),
+        "expectation_met": record.expectation_met,
+        "assertions": [
+            {
+                "id": _safe_identifier(item.id),
+                "passed": item.passed,
+                "reason_code": _safe_identifier(item.reason_code),
+                "evidence_refs": [_safe_identifier(ref) for ref in item.evidence_refs],
+            }
+            for item in record.assertion_results
+        ],
+        "subcases": [
+            {
+                "id": _safe_identifier(item.id),
+                "expectation_met": item.expectation_met,
+                "agent_completed": item.agent_completed,
+                "reason_code": _safe_identifier(item.reason_code),
+            }
+            for item in record.subcase_results
+        ],
     }
 
 
@@ -178,6 +209,53 @@ def trial_record_from_dict(payload: object) -> TrialRecord:
     failure_stage = payload.get("failure_stage")
     if failure_stage is not None and failure_stage not in _FAILURE_STAGES:
         raise ValueError("trial failure stage is invalid")
+    raw_expectation = payload.get("expectation_met")
+    if raw_expectation is not None and not isinstance(raw_expectation, bool):
+        raise ValueError("trial expectation must be boolean or null")
+    raw_assertions = payload.get("assertions", [])
+    if not isinstance(raw_assertions, list):
+        raise ValueError("trial assertions must be a list")
+    assertion_results: list[AssertionResult] = []
+    for item in raw_assertions:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "passed", "reason_code", "evidence_refs"
+        }:
+            raise ValueError("trial assertion is invalid")
+        passed = item["passed"]
+        if passed is not None and not isinstance(passed, bool):
+            raise ValueError("trial assertion result is invalid")
+        assertion_results.append(
+            AssertionResult(
+                _require_safe_identifier(item["id"]),
+                passed,
+                _require_safe_identifier(item["reason_code"]),
+                _read_identifiers(item["evidence_refs"]),
+            )
+        )
+    raw_subcases = payload.get("subcases", [])
+    if not isinstance(raw_subcases, list):
+        raise ValueError("trial subcases must be a list")
+    subcase_results: list[SubcaseResult] = []
+    for item in raw_subcases:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "expectation_met", "agent_completed", "reason_code"
+        }:
+            raise ValueError("trial subcase is invalid")
+        if type(item["expectation_met"]) is not bool or type(item["agent_completed"]) is not bool:
+            raise ValueError("trial subcase booleans are invalid")
+        subcase_results.append(
+            SubcaseResult(
+                _require_safe_identifier(item["id"]),
+                item["expectation_met"],
+                item["agent_completed"],
+                _require_safe_identifier(item["reason_code"]),
+            )
+        )
+    turns = _read_turn_results(payload.get("turn_results", []))
+    first_failed = _read_optional_count(payload.get("first_failed_turn"))
+    _validate_first_failed(turns, first_failed)
+    triggered = _read_fault_ids(payload.get("triggered_faults", []))
+    evidence = _read_fault_evidence(payload.get("fault_evidence", []), triggered)
     return TrialRecord(
         key=TrialKey(condition_id, case_id, repetition),
         execution_kind=execution_kind,  # type: ignore[arg-type]
@@ -191,7 +269,10 @@ def trial_record_from_dict(payload: object) -> TrialRecord:
         retries=_read_optional_count(payload.get("retries")),
         usage=_read_usage(payload.get("usage")),
         summary_usage=_read_usage(payload.get("summary_usage")),
-        triggered_faults=_read_identifiers(payload.get("triggered_faults")),
+        triggered_faults=triggered,
+        turn_results=turns,
+        first_failed_turn=first_failed,
+        fault_evidence=evidence,
         recovery_path=_read_optional_identifier(payload.get("recovery_path")),
         summary_triggered=_read_optional_bool(payload.get("summary_triggered")),
         summary_count=_read_optional_count(payload.get("summary_count")),
@@ -201,7 +282,57 @@ def trial_record_from_dict(payload: object) -> TrialRecord:
         legitimate_actions_attempted=_read_optional_count(payload.get("legitimate_actions_attempted")),
         legitimate_actions_allowed=_read_optional_count(payload.get("legitimate_actions_allowed")),
         category=_read_optional_identifier(payload.get("category")) or "unknown",
+        expectation_met=raw_expectation,
+        assertion_results=tuple(assertion_results),
+        subcase_results=tuple(subcase_results),
     )
+
+
+def _read_turn_results(raw: object) -> tuple[EvalTurnRecord, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("trial turns must be a list")
+    turns = []
+    fields = set(EvalTurnRecord.__dataclass_fields__)
+    optional = {"finish_outcome", "stop_reason", "validation_status", "unresolved_check_count", "verification_required"}
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict) or not fields - optional <= set(item) or not set(item) <= fields:
+            raise ValueError("trial turn fields are invalid")
+        turn = EvalTurnRecord(**item)
+        if turn.turn_index != index:
+            raise ValueError("trial turn order is invalid")
+        turns.append(turn)
+    return tuple(turns)
+
+
+def _validate_first_failed(turns: tuple[EvalTurnRecord, ...], first: int | None) -> None:
+    if first is not None and (type(first) is not int or first < 1):
+        raise ValueError("first failed turn is invalid")
+    if first != next((turn.turn_index for turn in turns if not turn.ok), None):
+        raise ValueError("first failed turn is inconsistent")
+
+
+def _read_fault_ids(raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list) or any(not isinstance(value, str) or value not in FAULT_EVIDENCE_KINDS for value in raw):
+        raise ValueError("trial fault ID is invalid")
+    if len(set(raw)) != len(raw):
+        raise ValueError("trial fault ID is duplicated")
+    return tuple(raw)
+
+
+def _read_fault_evidence(raw: object, triggered: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list):
+        raise ValueError("fault evidence must be a list")
+    evidence = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"fault_id", "kind"}:
+            raise ValueError("fault evidence fields are invalid")
+        fault, kind = item["fault_id"], item["kind"]
+        if (not isinstance(fault, str) or fault not in triggered
+            or FAULT_EVIDENCE_KINDS.get(fault) != kind
+            or any(previous == fault for previous, _ in evidence)):
+            raise ValueError("fault evidence is invalid")
+        evidence.append((fault, kind))
+    return tuple(evidence)
 
 
 def experiment_report_as_dict(report: ExperimentRunReport) -> dict[str, object]:
@@ -278,6 +409,7 @@ def _dimension_metrics(trials: tuple[TrialRecord, ...]) -> dict[str, object]:
         "code_correct_verified": _metric_as_dict(metrics.code_correct_verified),
         "end_to_end": _metric_as_dict(metrics.end_to_end),
         "normal_finish": _metric_as_dict(metrics.normal_finish),
+        "expectation_met": _metric_as_dict(metrics.expectation_met),
         "recovery": _bool_metric(
             tuple(
                 trial.dimensions.recovered
@@ -555,6 +687,8 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
         f"- Planned trials: {payload['planned_trials']}",
         f"- Benchmark: {payload['benchmark_version']}",
         "- Cost per success: unavailable (no complete local price table)",
+        "- retries 包含模拟恢复计数，不代表实际 HTTP 重试次数；未触发故障时 recovered 为 unknown。",
+        "- memory off/off 只测短多轮行为，不证明持久记忆或压缩质量。",
         "",
         "## Conditions",
         "",
@@ -576,8 +710,8 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
         "",
         "## Category metrics",
         "",
-        "| Category | Planned | End-to-end | Normal finish |",
-        "| --- | ---: | --- | --- |",
+        "| Category | Planned | Expectation | Artifact/E2E | Normal finish |",
+        "| --- | ---: | --- | --- | --- |",
     ])
     raw_categories = payload["by_category"]
     if not isinstance(raw_categories, dict):
@@ -589,9 +723,15 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
         assert isinstance(dimensions, dict)
         end_to_end = dimensions["end_to_end"]
         normal_finish = dimensions["normal_finish"]
-        assert isinstance(end_to_end, dict) and isinstance(normal_finish, dict)
+        expectation = dimensions["expectation_met"]
+        assert (
+            isinstance(end_to_end, dict)
+            and isinstance(normal_finish, dict)
+            and isinstance(expectation, dict)
+        )
         lines.append(
             f"| {category} | {group['planned']} | "
+            f"{expectation['numerator']}/{expectation['denominator']} | "
             f"{end_to_end['numerator']}/{end_to_end['denominator']} | "
             f"{normal_finish['numerator']}/{normal_finish['denominator']} |"
         )
@@ -599,8 +739,8 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
         "",
         "## Trials",
         "",
-        "| Condition | Case | Repetition | Kind | Status |",
-        "| --- | --- | ---: | --- | --- |",
+        "| Condition | Case | Repetition | Kind | Status | Expected | Artifact | Agent | Scope | Cleanup | First failed turn |",
+        "| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: |",
     ])
     raw_trials = payload["trials"]
     if not isinstance(raw_trials, list):
@@ -608,10 +748,59 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
     for trial in raw_trials:
         if not isinstance(trial, dict):
             raise ValueError("experiment trial must be an object")
+        safe = trial_record_from_dict(trial)
         lines.append(
             f"| {trial['condition_id']} | {trial['case_id']} | {trial['repetition']} | "
-            f"{trial['execution_kind']} | {trial['status']} |"
+            f"{trial['execution_kind']} | {trial['status']} | {trial['expectation_met']} | "
+            f"{safe.dimensions.artifact_correct} | {safe.dimensions.agent_completed} | "
+            f"{safe.dimensions.scope_compliant} | {safe.dimensions.cleanup_confirmed} | {safe.first_failed_turn} |"
         )
+    lines.extend(["", "## User turns", "", "| Condition | Case | Repetition | Turn | OK | Verification | Rounds | Tools | Terminal tool error |",
+                  "| --- | --- | ---: | ---: | --- | --- | ---: | ---: | --- |"])
+    for trial in raw_trials:
+        safe = trial_record_from_dict(trial)
+        for turn in safe.turn_results:
+            lines.append(f"| {safe.key.condition_id} | {safe.key.case_id} | {safe.key.repetition} | {turn.turn_index} | {turn.ok} | {turn.verification} | {turn.rounds} | {turn.tool_calls} | {turn.terminal_tool_error} |")
+        if not safe.turn_results:
+            lines.append(f"| {safe.key.condition_id} | {safe.key.case_id} | {safe.key.repetition} | - | unknown | unknown | - | - | unknown |")
+    lines.extend(["", "## Delivery diagnostics", "", "| Condition | Case | Repetition | Turn | Finish outcome | OK | Stop reason | Validation status | Unresolved checks | Verification required |",
+                  "| --- | --- | ---: | ---: | --- | --- | --- | --- | ---: | --- |"])
+    for trial in raw_trials:
+        safe = trial_record_from_dict(trial)
+        identity = f"| {safe.key.condition_id} | {safe.key.case_id} | {safe.key.repetition} |"
+        for turn in safe.turn_results:
+            values = (turn.turn_index, turn.finish_outcome, turn.ok, turn.stop_reason,
+                      turn.validation_status, turn.unresolved_check_count, turn.verification_required)
+            lines.append(identity + " " + " | ".join("unknown" if value is None else str(value) for value in values) + " |")
+        if not safe.turn_results:
+            lines.append(identity + " - | unknown | unknown | unknown | unknown | unknown | unknown |")
+    lines.extend(["", "## Fault evidence", "", "| Condition | Case | Repetition | Triggered fault | Evidence kind |", "| --- | --- | ---: | --- | --- |"])
+    for trial in raw_trials:
+        safe = trial_record_from_dict(trial)
+        evidence = dict(safe.fault_evidence)
+        for fault in safe.triggered_faults:
+            lines.append(f"| {safe.key.condition_id} | {safe.key.case_id} | {safe.key.repetition} | {fault} | {evidence.get(fault, '证据类型未知')} |")
+    subcase_rows = [
+        (trial, subcase)
+        for trial in raw_trials
+        if isinstance(trial, dict) and isinstance(trial.get("subcases"), list)
+        for subcase in trial["subcases"]
+        if isinstance(subcase, dict)
+    ]
+    if subcase_rows:
+        lines.extend([
+            "",
+            "## Subcases",
+            "",
+            "| Condition | Case | Repetition | Subcase | Expected | Agent completed | Reason |",
+            "| --- | --- | ---: | --- | --- | --- | --- |",
+        ])
+        for trial, subcase in subcase_rows:
+            lines.append(
+                f"| {trial['condition_id']} | {trial['case_id']} | {trial['repetition']} | "
+                f"{subcase['id']} | {subcase['expectation_met']} | "
+                f"{subcase['agent_completed']} | {subcase['reason_code']} |"
+            )
     return "\n".join(lines) + "\n"
 
 

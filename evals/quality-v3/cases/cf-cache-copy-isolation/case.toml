@@ -1,0 +1,24 @@
+id = "cf-cache-copy-isolation"
+title = "cf-cache-copy-isolation"
+task = "cache.RecordCache.put(key,value)/get(key)和service.load_record(cache,key)：key字符串，value为可嵌套JSON兼容dict/list；put后原值变化不污染缓存，get结果变化不污染下次get，不同key独立；缺失key抛KeyError；service调用get。"
+allowed_changes = ["cache.py", "service.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "cross_file"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+expose_edit_scope = true
+path_match_mode = "workspace_root"
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "cache.RecordCache.put(key,value)/get(key)和service.load_record(cache,key)：key字符串，value为可嵌套JSON兼容dict/list；put后原值变化不污染缓存，get结果变化不污染下次get，不同key独立；缺失key抛KeyError；service调用get。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

@@ -22,6 +22,7 @@ from .models import (
     EvalCondition,
     EvalSuite,
     ExperimentDefinition,
+    PathMatchMode,
     ScenarioStep,
     TrialDimensions,
     VerificationSpec,
@@ -29,6 +30,7 @@ from .models import (
 
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_BENCHMARK_VERSION_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9][a-z0-9_-]*)*")
 _RESERVED_VERIFIER_DIR = ".tricoder_eval_verifier"
 _RESERVED_CONTROL_PARTS = ("runtime", "tricoder-control")
 _SUITE_FIELDS = frozenset({"id", "title", "cases"})
@@ -59,6 +61,7 @@ _CASE_V2_FIELDS = _CASE_FIELDS | frozenset(
         "steps",
     }
 )
+_CASE_V2_OPTIONAL_FIELDS = frozenset({"assertions", "expected_outcome", "expose_edit_scope", "path_match_mode"})
 _EXPERIMENT_FIELDS = frozenset(
     {
         "schema_version",
@@ -151,9 +154,7 @@ def load_suite(path: Path, *, case_id: str | None = None) -> EvalSuite:
         benchmark_version = "legacy"
     elif schema_version == 2:
         _require_exact_fields(suite_data, _SUITE_V2_FIELDS, "suite.toml")
-        benchmark_version = _require_id(
-            suite_data["benchmark_version"], "benchmark_version"
-        )
+        benchmark_version = _require_benchmark_version(suite_data["benchmark_version"])
     else:
         raise EvalDefinitionError("suite schema_version 不受支持")
     suite_id = _require_id(suite_data["id"], "suite ID")
@@ -336,11 +337,15 @@ def _load_case(
         raise EvalDefinitionError(f"case 目录不符合预期：{declared_id}")
 
     case_data = _load_toml(case_dir / "case.toml", boundary=case_dir)
-    _require_exact_fields(
-        case_data,
-        _CASE_FIELDS if schema_version == 1 else _CASE_V2_FIELDS,
-        f"case.toml ({declared_id})",
-    )
+    if schema_version == 1:
+        _require_exact_fields(case_data, _CASE_FIELDS, f"case.toml ({declared_id})")
+    else:
+        _require_fields_with_optional(
+            case_data,
+            _CASE_V2_FIELDS,
+            _CASE_V2_OPTIONAL_FIELDS,
+            f"case.toml ({declared_id})",
+        )
     parsed_id = _require_id(case_data["id"], "case ID")
     if parsed_id != declared_id:
         raise EvalDefinitionError(f"case ID 与目录不一致：{declared_id}")
@@ -375,6 +380,8 @@ def _load_case(
             "artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"
         )
         steps: tuple[ScenarioStep, ...] = ()
+        assertions: tuple[str, ...] = ()
+        expected_outcome = "completed"
     else:
         category = _require_enum(case_data["category"], "category", _CATEGORIES)
         split = _require_enum(case_data["split"], "split", _CASE_SPLITS)
@@ -391,7 +398,29 @@ def _load_case(
             case_data["dimensions"], "dimensions", _DIMENSIONS, allow_empty=False
         )
         steps = _load_scenario_steps(case_data["steps"])
+        # 延迟导入避免 assertion 模块与 models 的类型边界形成加载环。
+        from .assertions import REGISTERED_ASSERTIONS
 
+        assertions = _require_registered_ids(
+            case_data.get("assertions", []),
+            "assertions",
+            REGISTERED_ASSERTIONS,
+            allow_empty=True,
+        )
+        expected_outcome = _require_enum(
+            case_data.get("expected_outcome", "completed"),
+            "expected_outcome",
+            frozenset({"completed", "blocked"}),
+        )
+
+    expose_edit_scope = case_data.get("expose_edit_scope", False)
+    if type(expose_edit_scope) is not bool:
+        raise EvalDefinitionError("expose_edit_scope 必须是布尔值")
+    path_match_mode = _require_enum(
+        case_data.get("path_match_mode", "legacy"),
+        "path_match_mode",
+        frozenset({"legacy", "workspace_root"}),
+    )
     return EvalCase(
         id=parsed_id,
         title=_require_text(case_data["title"], "case title"),
@@ -407,11 +436,13 @@ def _load_case(
             case_data["allowed_changes"],
             "allowed_changes",
             allow_empty=schema_version == 2,
+            mode=path_match_mode,  # type: ignore[arg-type]
         ),
         required_changes=_require_patterns(
             case_data["required_changes"],
             "required_changes",
             allow_empty=schema_version == 2,
+            mode=path_match_mode,  # type: ignore[arg-type]
         ),
         max_rounds=_require_positive_int(
             case_data["max_rounds"],
@@ -431,6 +462,10 @@ def _load_case(
         faults=faults,
         dimensions=dimensions,
         steps=steps,
+        assertions=assertions,
+        expected_outcome=expected_outcome,  # type: ignore[arg-type]
+        expose_edit_scope=expose_edit_scope,
+        path_match_mode=path_match_mode,  # type: ignore[arg-type]
     )
 
 
@@ -644,9 +679,34 @@ def _require_exact_fields(data: dict[str, Any], expected: frozenset[str], label:
         raise EvalDefinitionError(f"{label} 包含未知字段：{', '.join(sorted(unknown))}")
 
 
+def _require_fields_with_optional(
+    data: dict[str, Any],
+    required: frozenset[str],
+    optional: frozenset[str],
+    label: str,
+) -> None:
+    actual = set(data)
+    missing = required - actual
+    unknown = actual - required - optional
+    if missing:
+        raise EvalDefinitionError(f"{label} 缺少字段：{', '.join(sorted(missing))}")
+    if unknown:
+        raise EvalDefinitionError(f"{label} 包含未知字段：{', '.join(sorted(unknown))}")
+
+
 def _require_id(value: Any, label: str) -> str:
     if not isinstance(value, str) or not _ID_PATTERN.fullmatch(value):
         raise EvalDefinitionError(f"{label} 格式无效")
+    return value
+
+
+def _require_benchmark_version(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or not _BENCHMARK_VERSION_PATTERN.fullmatch(value)
+    ):
+        raise EvalDefinitionError("benchmark_version 格式无效")
     return value
 
 
@@ -703,13 +763,29 @@ def _require_patterns(
     label: str,
     *,
     allow_empty: bool = False,
+    mode: PathMatchMode = "legacy",
 ) -> tuple[str, ...]:
     if not isinstance(value, list) or (not value and not allow_empty):
         requirement = "数组" if allow_empty else "非空数组"
         raise EvalDefinitionError(f"{label} 必须是{requirement}")
     if len(value) > MAX_CHANGE_PATTERNS:
         _raise_resource_limit(f"{label} 数量")
-    return tuple(_require_pattern(item, label) for item in value)
+    patterns = tuple(_require_pattern(item, label) for item in value)
+    if mode == "workspace_root" and any(
+        not is_workspace_relative_path(pattern) or "**" in pattern
+        for pattern in patterns
+    ):
+        raise EvalDefinitionError(f"{label} 必须是规范相对 POSIX 路径，workspace_root 不支持 **")
+    return patterns
+
+
+def is_workspace_relative_path(value: str) -> bool:
+    """Check raw segments without normalizing away invalid path components."""
+    return (
+        isinstance(value, str)
+        and not any(char in value for char in ("\\", ":", "\0"))
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+    )
 
 
 def _require_pattern(value: Any, label: str) -> str:

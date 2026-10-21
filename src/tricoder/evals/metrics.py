@@ -53,6 +53,7 @@ class TrialMetrics:
     code_correct_verified: MetricValue
     end_to_end: MetricValue
     normal_finish: MetricValue
+    expectation_met: MetricValue
     infrastructure_errors: int
     unverified: int
     not_run: int
@@ -71,6 +72,7 @@ def aggregate_trial_metrics(trials: tuple[TrialRecord, ...]) -> TrialMetrics:
     finish_values = tuple(trial.dimensions.agent_completed for trial in trials)
     observed_finish = tuple(value for value in finish_values if value is not None)
     end_to_end_values = tuple(_end_to_end(trial) for trial in trials)
+    expectation_values = tuple(trial.expectation_met for trial in trials)
     return TrialMetrics(
         code_correct_planned=MetricValue.from_values(code_values),
         code_correct_verified=MetricValue(
@@ -94,6 +96,7 @@ def aggregate_trial_metrics(trials: tuple[TrialRecord, ...]) -> TrialMetrics:
                 else None
             ),
         ),
+        expectation_met=MetricValue.from_values(expectation_values),
         infrastructure_errors=sum(
             trial.failure_stage in _INFRASTRUCTURE_STAGES for trial in trials
         ),

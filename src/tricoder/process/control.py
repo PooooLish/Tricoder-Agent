@@ -32,6 +32,7 @@ class BoundedProcessResult:
     cleanup_failed: bool = False
     # 仅失败时保留 exact 资源；非 Runtime 调用方也不会失去后续清理归属。
     cleanup_resource: object | None = field(default=None, repr=False, compare=False)
+    input_failed: bool = False
 
 
 class ProcessExecutionUncertain(OSError):
@@ -65,7 +66,7 @@ class _ProcessResources:
                 okay = False
         # 活读线程可能持有 BufferedReader 锁，不能在调用线程强行 close 而无界等待。
         if not any(reader.is_alive() for reader in self.readers):
-            for stream in (self.process.stdout, self.process.stderr):
+            for stream in (self.process.stdout, self.process.stderr, self.process.stdin):
                 if stream is not None:
                     try:
                         stream.close()
@@ -79,7 +80,7 @@ class _ProcessResources:
         if scope is not None and (terminal or scope.started_deadline is not None):
             self.deadline = scope.begin_termination(deadline=self.deadline)
         if self.deadline is None:
-            # 成功命令的例行收尾是局部资源预算，不限制仍正常运行的长任务。
+            # 正常收尾及显式可恢复超时使用局部预算，不限制仍在运行的任务。
             self.deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
         okay = self.cleanup(self.deadline)
         if not okay and scope is not None:
@@ -98,11 +99,15 @@ def run_bounded_process(
     timeout: float,
     max_output_bytes: int,
     cancellation: CancellationToken | None = None,
+    stdin_bytes: bytes | None = None,
+    recoverable_timeout: bool = False,
 ) -> BoundedProcessResult:
-    """Run without a shell while retaining at most ``max_output_bytes`` total."""
+    """Run bounded capture; only trusted read-only helpers may opt into timeout recovery."""
 
     if max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be positive")
+    if stdin_bytes is not None and (not isinstance(stdin_bytes, bytes) or len(stdin_bytes) > 32*1024*1024):
+        raise ValueError("内部标准输入必须是至多 32 MiB 的 bytes")
     if cancellation is not None:
         cancellation.raise_if_cancelled()
     popen_options: dict[str, object] = {}
@@ -118,7 +123,7 @@ def run_bounded_process(
         list(args),
         cwd=cwd,
         env=dict(env),
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL if stdin_bytes is None else subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=False,
@@ -139,6 +144,8 @@ def run_bounded_process(
             windows_job=windows_job,
             cancellation=cancellation,
             resources=resources,
+            stdin_bytes=stdin_bytes,
+            recoverable_timeout=recoverable_timeout,
         )
     except BaseException as primary:
         if getattr(primary, "cleanup_resource", None) is resources:
@@ -171,6 +178,8 @@ def _collect_bounded_process(
     windows_job: "_WindowsJob | None",
     cancellation: CancellationToken | None = None,
     resources: _ProcessResources | None = None,
+    stdin_bytes: bytes | None = None,
+    recoverable_timeout: bool = False,
 ) -> BoundedProcessResult:
     assert process.stdout is not None
     assert process.stderr is not None
@@ -181,6 +190,20 @@ def _collect_bounded_process(
     captured_bytes = [0]
     stdout = bytearray()
     stderr = bytearray()
+    input_failed = threading.Event()
+
+    def write_input():
+        # 源码只进入匿名管道，不进入 argv；writer 与 reader 同属一个清理期限。
+        try:
+            process.stdin.write(stdin_bytes)
+            process.stdin.flush()
+        except (OSError, ValueError):
+            input_failed.set()
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                input_failed.set()
 
     def drain(stream, target: bytearray) -> None:  # type: ignore[no-untyped-def]
         try:
@@ -207,6 +230,8 @@ def _collect_bounded_process(
         threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
     )
+    if stdin_bytes is not None:
+        readers = (*readers, threading.Thread(target=write_input, daemon=True))
     resources.readers = readers
     for reader in readers:
         reader.start()
@@ -232,10 +257,15 @@ def _collect_bounded_process(
     if not exceeded.is_set() and not timed_out and not cancelled:
         process.wait()
     cleanup_failed = not resources.finish(
-        cancellation, terminal=cancelled or timed_out or exceeded.is_set(),
+        cancellation,
+        terminal=cancelled or (timed_out and not recoverable_timeout) or exceeded.is_set(),
     )
 
-    if cancelled:
+    if cancelled or (cancellation is not None and cancellation.is_cancelled):
+        # 取消也可能在局部清理期间到达；不能发布 TIMEOUT/REPLAN，或重领清理预算。
+        scope = current_cleanup()
+        if scope is not None:
+            scope.begin_termination(deadline=resources.deadline)
         error = CancellationError("操作已取消", cleanup_failed=cleanup_failed)
         error.cleanup_resource = resources
         raise error
@@ -248,6 +278,7 @@ def _collect_bounded_process(
         output_exceeded=exceeded.is_set(),
         cleanup_failed=cleanup_failed,
         cleanup_resource=resources if cleanup_failed else None,
+        input_failed=input_failed.is_set(),
     )
 
 

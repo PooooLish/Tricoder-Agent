@@ -222,7 +222,11 @@ def audit_arguments(tools: object, action: ToolAction, result: ToolResult) -> di
         return metadata
     if action.tool == "finish":
         summary = arguments.get("summary", "")
-        return {"summary_chars": len(summary) if isinstance(summary, str) else 0}
+        metadata = {"summary_chars": len(summary) if isinstance(summary, str) else 0}
+        outcome = arguments.get("outcome", "completed")
+        if isinstance(outcome, str) and outcome in {"completed", "incomplete"}:
+            metadata["outcome"] = outcome
+        return metadata
     return {"argument_count": len(arguments)}
 
 

@@ -1,0 +1,34 @@
+id = "q-memory-restart"
+title = "Persist a prefix constraint and use it after restart"
+task = "记住前缀约束 tri_，保存记忆并在重启后创建符合约束的函数。"
+allowed_changes = ["memory_target.py"]
+required_changes = ["memory_target.py"]
+max_rounds = 10
+max_context_chars = 40000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier", "behavior_assertions"]
+faults = ["none"]
+dimensions = ["artifact_correct", "behavior_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_constraint_preserved"]
+assertions = ["runtime_restarted", "session_id_preserved", "memory_restored", "provider_called"]
+expected_outcome = "completed"
+
+[[steps]]
+kind = "user_turn"
+content = "本会话后续新增函数名必须以 tri_ 开头。只确认并记住该约束，调用 finish，不修改文件。"
+
+[[steps]]
+kind = "memory_save"
+
+[[steps]]
+kind = "restart_session"
+
+[[steps]]
+kind = "user_turn"
+content = "创建 memory_target.py，包含一个返回 42 的新函数；不要让我重述此前前缀，运行验证并调用 finish。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

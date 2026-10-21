@@ -1,0 +1,22 @@
+id = "dl-code-without-finish"
+title = "dl-code-without-finish"
+task = "修复 add；评测会分别记录代码正确与是否正常 finish。"
+allowed_changes = ["math_ops.py"]
+required_changes = ["math_ops.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "delivery"
+split = "dev"
+execution_kind = "contract"
+scorers = ["behavior_assertions"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 add；评测会分别记录代码正确与是否正常 finish。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

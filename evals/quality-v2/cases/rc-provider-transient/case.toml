@@ -1,0 +1,24 @@
+path_match_mode = "workspace_root"
+expose_edit_scope = true
+id = "rc-provider-transient"
+title = "rc-provider-transient"
+task = "修复 increment，使任意输入整数增加 1。Provider 首次请求会记录一次模拟透明重试计数，此计数不是实际网络重试。"
+allowed_changes = ["counter.py", "tests", "tests/*.py"]
+required_changes = ["counter.py"]
+max_rounds = 8
+max_context_chars = 16000
+category = "recovery"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["provider_transient"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "fault_triggered", "recovered"]
+
+[[steps]]
+kind = "user_turn"
+content = "修复 increment，使任意输入整数增加 1。Provider 首次请求会记录一次模拟透明重试计数，此计数不是实际网络重试。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

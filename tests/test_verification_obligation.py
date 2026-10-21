@@ -56,6 +56,16 @@ def _finish(call_id: str, summary: str = "已完成只读回顾") -> ProviderRes
     )
 
 
+def _finish_incomplete(call_id: str) -> ProviderResponse:
+    """在一次验证纠正后明确停止，保持原测试的未验证结论。"""
+
+    return _call(
+        call_id,
+        "finish",
+        {"summary": "未补充可信验证", "outcome": "incomplete"},
+    )
+
+
 class VerificationObligationRecoveryTests(unittest.TestCase):
     """R0：实际恢复入口不得把历史展示状态变成本轮修改义务。"""
 
@@ -166,6 +176,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("first-finish", "文件已修改"),
+            _finish_incomplete("first-stop"),
         ])
         try:
             changed = first.run_task("把 app.py 中的值改为 2")
@@ -206,6 +217,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 2", "new_text": "x = 1"},
             ),
             _finish("finish-net-zero", "已恢复原内容"),
+            _finish_incomplete("finish-net-zero-stop"),
         ])
         try:
             result = runtime.run_task("修改后再恢复 app.py")
@@ -225,6 +237,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
             _finish("finish-review", "已回顾未验证修改"),
         ])
         try:
@@ -241,6 +254,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
         runtime = self._runtime([
             _call("create-dir", "create_directory", {"path": "generated"}),
             _finish("finish-dir", "目录已创建"),
+            _finish_incomplete("finish-dir-stop"),
         ])
         try:
             result = runtime.run_task("创建 generated 目录")
@@ -259,6 +273,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改 app.py").ok)
@@ -289,6 +304,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改 app.py").ok)
@@ -325,6 +341,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改 app.py").ok)
@@ -378,6 +395,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "sub/fine.py", "old_text": "x = 0", "new_text": "x = 3"},
             ),
             _finish("finish-edit", "两个文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改根目录与子目录文件").ok)
@@ -414,6 +432,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "def broken(:"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改 app.py").ok)
@@ -466,6 +485,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"command": "python -m unittest discover -v"},
             ),
             _finish("finish-edit", "修改和测试已执行"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             result = runtime.run_task("修改 app.py 并运行测试")
@@ -490,6 +510,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"path": "app.py", "old_text": "x = 1", "new_text": "x = 2"},
             ),
             _finish("finish-edit", "文件已修改"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             self.assertFalse(first.run_task("修改 app.py").ok)
@@ -608,6 +629,7 @@ class VerificationObligationRecoveryTests(unittest.TestCase):
                 {"command": "python -m compileall -q -r 0 ."},
             ),
             _finish("finish-edit", "子目录修改和检查已执行"),
+            _finish_incomplete("finish-edit-stop"),
         ])
         try:
             result = runtime.run_task("修改子目录文件并运行深度受限检查")

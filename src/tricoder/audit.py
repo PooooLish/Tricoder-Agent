@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from tricoder.execution_state import TaskStopReason
 
 
 _SECRET_MARKERS = ("api_key", "apikey", "token", "password", "authorization", "secret")
@@ -27,7 +28,10 @@ _SAFE_REASON_CODES = {
     "repeated_failure",
     "repeated_observation",
     "repair_oscillation",
-}
+    "missing_relevant_verification",
+    "unresolved_verification",
+    "recovery_limit_reached",
+} | {reason.value for reason in TaskStopReason} | {"unknown"}
 
 
 class AuditError(OSError):

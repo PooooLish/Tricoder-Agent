@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError
+from tricoder.execution_state import ErrorCode, FileEffects, RecoveryAction, ToolError, TaskStopReason
 
 if TYPE_CHECKING:
     from tricoder.core.clarification import ClarificationResult
@@ -334,6 +334,7 @@ class ToolResult:
 
 def tool_failure(
     code: ErrorCode, output: str, *, recovery: RecoveryAction | None = None,
+    detail_code: str | None = None,
     **metadata: Any,
 ) -> ToolResult:
     """由本地错误产生点选择类别；可重新规划不等于允许自动重试。"""
@@ -341,7 +342,7 @@ def tool_failure(
         recovery = (RecoveryAction.REPLAN if code in {
             ErrorCode.UNKNOWN_TOOL, ErrorCode.INVALID_ARGUMENT, ErrorCode.EXECUTION_FAILED,
         } else RecoveryAction.STOP_TASK)
-    return ToolResult(False, output, error=ToolError(code, recovery), **metadata)
+    return ToolResult(False, output, error=ToolError(code, recovery, detail_code=detail_code), **metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,8 +398,11 @@ class RunResult:
     current_verification_required: bool = False
     verification_obligation: Literal["none", "pending", "legacy_unknown"] = "none"
     pending_verification_paths: tuple[str, ...] = ()
+    stop_reason: TaskStopReason | None = None
 
     def __post_init__(self) -> None:
+        if self.stop_reason is not None and not isinstance(self.stop_reason, TaskStopReason):
+            raise ValueError("invalid task stop reason")
         if self.cleanup_failed:
             object.__setattr__(self, "ok", False)
 

@@ -10,6 +10,7 @@ import threading
 import time
 import secrets
 import unicodedata
+from tricoder.execution_state import TaskStopReason
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import wraps
@@ -18,6 +19,10 @@ from typing import Callable, Concatenate, Mapping, ParamSpec, Protocol, TypeVar
 
 from tricoder.agent import AgentObserver, CodingAgent
 from tricoder.execution_state import EffectState, FileEffects
+from tricoder.workspace.check_coverage import (
+    normalize_target as normalize_check_target, target_covers_path,
+    uncovered_paths, covered_structural_directories,
+)
 from tricoder.audit import AuditLogger
 from tricoder.changes import (
     ChangeJournal,
@@ -359,6 +364,9 @@ def _normalized_check_target(
 ) -> str | None:
     """将检查目标按命令 cwd 解析为工作区相对坐标；无法证明时返回 None。"""
 
+    normalized = normalize_check_target(record.cwd, target)
+    if normalized is None:
+        return None
     try:
         resolved = workspace_policy.resolve_path(
             Path(record.cwd) / Path(target),
@@ -374,12 +382,7 @@ def _normalized_check_target(
 def _check_target_covers_path(normalized_target: str, path: str) -> bool:
     """保守判断已规范化的宿主检查范围是否覆盖待验证相对路径。"""
 
-    normalized_path = os.path.normcase(path).replace("\\", "/").rstrip("/")
-    if normalized_target == ".":
-        return True
-    return normalized_path == normalized_target or normalized_path.startswith(
-        normalized_target + "/"
-    )
+    return target_covers_path(normalized_target, path)
 
 
 def _merge_verification_obligation(
@@ -401,10 +404,16 @@ def _merge_verification_obligation(
             pending.append(path)
 
     successful_targets: list[str] = []
-    if trusted_pass and workspace_policy is not None:
-        for record in result.task_validation.records:
+    report = result.task_validation
+    # 旧报告未提供失效身份且整体 stale 时不能重建能力；新报告逐条排除。
+    legacy_stale = report.status == "stale" and not report.stale_check_ids
+    if trusted_pass and workspace_policy is not None and not report.unresolved_check_ids and not legacy_stale:
+        # 与单任务 tracker 一样，同签名仅保留最后一条，旧成功不能复活。
+        latest = {record.signature: record for record in result.task_validation.records}
+        for record in latest.values():
             if (
-                record.kind != "information"
+                record.kind in {"tests", "syntax", "static"}
+                and record.check_id not in report.stale_check_ids
                 and has_effective_success_result(record)
                 and record.workspace_stable
                 and verification_scope is not None
@@ -423,14 +432,15 @@ def _merge_verification_obligation(
                     is not None
                 )
         if successful_targets:
-            pending = [
-                path
-                for path in pending
-                if not any(
-                    _check_target_covers_path(target, path)
-                    for target in successful_targets
+            pending = list(uncovered_paths(pending, successful_targets))
+            if effects.state is EffectState.CONFIRMED and not result.unknown_effects and not result.cleanup_failed:
+                structural = covered_structural_directories(
+                    effects.paths, effects.directory_paths, successful_targets,
                 )
-            ]
+                # 旧数据只有路径，无来源信息；同名历史义务也不能借本轮父目录清除。
+                historical = {normalize_check_target(".", path) for path in memory.pending_verification_paths}
+                pending = [path for path in pending if path not in structural
+                           or normalize_check_target(".", path) in historical]
 
     if has_legacy_unknown:
         # 旧数据只有完整工作区检查才足以消除来源不明状态。
@@ -1115,7 +1125,7 @@ class SessionRuntime:
                 )
             except WorkspaceScanError as exc:
                 if exc.reason == "cancelled":
-                    return RunResult(False, "任务已取消", 0)
+                    return RunResult(False, "任务已取消", 0, stop_reason=TaskStopReason.CANCELLED)
                 if session_before_gate is not None:
                     self._workspace_baseline_blocked[
                         session_before_gate.record.id
@@ -1151,7 +1161,7 @@ class SessionRuntime:
                     "已拒绝工作区变化；已取消本次操作，会话保留"
                 ) from exc
             except WorkspaceGateCancelled as exc:
-                return RunResult(False, "任务已取消", 0)
+                return RunResult(False, "任务已取消", 0, stop_reason=TaskStopReason.CANCELLED)
             except WorkspaceGateError as exc:
                 self._set_workspace_baseline_status(
                     "error", "工作区基线检查未完成，旧基线未改变"
@@ -1193,6 +1203,7 @@ class SessionRuntime:
                         unknown_effects=active.context.unknown_effects,
                         verification_obligation=active.memory.verification_obligation,
                         pending_verification_paths=active.memory.pending_verification_paths,
+                        stop_reason=TaskStopReason.CANCELLED,
                     )
                 with cleanup_scope(cleanup), task_observation_scope():
                     self._task_sealed_change_set = None
@@ -1202,7 +1213,10 @@ class SessionRuntime:
                         self._finalize_workspace_exception(active)
                         self._clear_workspace_change_notice()
                         raise
+                    agent_result = result
                     result = self._finalize_workspace_task(active, result)
+                    if agent_result.ok and not result.ok:
+                        result = replace(result, stop_reason=TaskStopReason.RUNTIME_REJECTED)
                     return self._synchronize_runtime_final_outcome(result)
             finally:
                 current = self._require_active_session()
@@ -1384,7 +1398,7 @@ class SessionRuntime:
                     "失败" if context.verification_failure is not None else "待验证"
                 ),
             )
-        result = replace(result, ok=False, verification=context.verification,
+        result = replace(result, ok=False, stop_reason=TaskStopReason.CANCELLED, verification=context.verification,
                          summary="任务已取消" if result.ok else result.summary)
         verification = _normalized_verification(result.verification)
         summary = _persisted_run_summary(result, verification)
@@ -1640,10 +1654,18 @@ class SessionRuntime:
         self._workspace_baseline_unresolved.add(session_id)
         self._invalidate_current_after_workspace_finish_failure()
         self._clear_workspace_change_notice()
+        if result.unknown_effects or result.cleanup_failed:
+            notice = "收尾仍有未知文件影响或资源清理问题，需下次任务前确认工作区"
+        elif not attributable:
+            notice = "收尾发现未归属的工作区变化，需下次任务前确认"
+        elif tainted:
+            notice = "收尾存在未确认的文件效果，需下次任务前确认工作区"
+        else:
+            notice = "任务尚未完整交付；已记录本轮修改，下次任务前需确认工作区"
         return replace(
             self._with_stale_task_validation(result),
             ok=False,
-            summary=f"{result.summary}；收尾发现未归属的工作区变化，需下次任务前确认",
+            summary=f"{result.summary}；{notice}",
             verification="待验证",
         )
 
@@ -1694,8 +1716,13 @@ class SessionRuntime:
             result,
             task_validation=replace(
                 report,
-                status="stale" if report.records else report.status,
+                status=("failed" if report.unresolved_check_ids else
+                        "stale" if report.records else report.status),
                 limitations=limitations,
+                stale_check_ids=tuple(dict.fromkeys((
+                    *report.stale_check_ids,
+                    *(record.check_id for record in report.records if record.kind != "information"),
+                ))),
             ),
         )
 
@@ -1810,6 +1837,7 @@ class SessionRuntime:
                 modified_directories=original.context.modified_directories,
                 verification_obligation=original.memory.verification_obligation,
                 pending_verification_paths=original.memory.pending_verification_paths,
+                stop_reason=TaskStopReason.UNKNOWN_EFFECTS,
             )
         original.journal.begin_task(
             tuple(original.context.modified_files),
@@ -2009,6 +2037,7 @@ class SessionRuntime:
             evidence_is_current
             and reconciled.verification_failure is None
             and reconciled.verification in {"通过", "passed"}
+            and not turn.result.task_validation.unresolved_check_ids
         )
         if evidence is not None and not evidence_is_current:
             # 稳定失败检查本身没有 evidence，不会进入这里；只有过期、
@@ -2047,6 +2076,13 @@ class SessionRuntime:
             ok=(turn.result.ok and not cancelled and not reconciled.unknown_effects
                 and (not required or trusted_pass)),
         )
+        result = replace(result, stop_reason=(
+            TaskStopReason.CANCELLED if cancelled else
+            TaskStopReason.CLEANUP_FAILED if result.cleanup_failed else
+            TaskStopReason.UNKNOWN_EFFECTS if result.unknown_effects else
+            TaskStopReason.RUNTIME_REJECTED if turn.result.ok and not result.ok else
+            result.stop_reason
+        ))
         if result.unknown_effects:
             unknown_notice = "文件影响未确认；请检查实际文件并通过 /clear 明确确认"
             # UNKNOWN 是独立的文件状态事实，不能覆盖用户发起取消这一主终态。

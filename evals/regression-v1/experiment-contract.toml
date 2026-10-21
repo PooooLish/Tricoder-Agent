@@ -1,0 +1,18 @@
+schema_version = 1
+experiment_id = "regression-v1-contract"
+suite = "."
+repetitions = 1
+split = "all"
+max_trials = 6
+time_budget_seconds = 1800
+seed = 1008
+
+[[conditions]]
+id = "contract-offline"
+provider = "fake"
+model = "tricoder-regression-script-v1"
+execution_kind = "contract"
+memory_compaction = "off"
+memory_persistence = "off"
+scorers = ["hidden_verifier", "behavior_assertions"]
+faults = ["none"]

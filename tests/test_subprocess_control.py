@@ -14,9 +14,30 @@ from types import SimpleNamespace
 
 from tricoder.core.cancellation import CancellationError, CancellationToken
 from tricoder.process.control import run_bounded_process
+from tricoder.task_cleanup import TaskCleanup, cleanup_scope
 
 
 class BoundedProcessTests(unittest.TestCase):
+    def test_readonly_timeout_opt_in_is_local_but_default_still_terminates(self):
+        for options in ({}, {"recoverable_timeout": True}):
+            with self.subTest(options=options):
+                scope = TaskCleanup()
+                with cleanup_scope(scope):
+                    result = run_bounded_process(
+                        [sys.executable, "-I", "-S", "-c", "import time;time.sleep(10)"],
+                        cwd=self.root, env=dict(os.environ), timeout=.2,
+                        max_output_bytes=100, stdin_bytes=b"x" * 1000000, **options,
+                    )
+                self.assertTrue(result.timed_out)
+                self.assertFalse(result.cleanup_failed)
+                self.assertIsNone(result.cleanup_resource)
+                self.assertFalse(scope.has_pending)
+                self.assertFalse(scope.failed)
+                if options:
+                    self.assertIsNone(scope.started_deadline)
+                else:
+                    self.assertIsNotNone(scope.started_deadline)
+
     def test_cleanup_exception_does_not_replace_original_business_exception(self):
         from tricoder.process import control
         primary = ValueError("primary synthetic")
@@ -258,6 +279,130 @@ class BoundedProcessTests(unittest.TestCase):
                 self.assertFalse(result.timed_out)
                 self.assertLess(elapsed, 2.0)
                 self.assertFalse(marker.exists())
+
+
+class RecoverableCleanupBudgetTests(unittest.TestCase):
+    """用受控时钟与清理回调核验期限，避免调度速度决定安全断言。"""
+
+    def setUp(self):
+        from tricoder.process import control
+        self.control = control
+        self.clock = 100.0
+        self.scope = TaskCleanup()
+        self.token = CancellationToken()
+        self.process = mock.Mock(returncode=None)
+        self.process.poll.return_value = None
+        self.resources = control._ProcessResources(self.process, {})
+        reader = SimpleNamespace(start=lambda: None, join=lambda timeout: None,
+                                 is_alive=lambda: False)
+        for target in (mock.patch.object(control.time, "monotonic", side_effect=lambda: self.clock),
+                       mock.patch.object(control.threading, "Thread", return_value=reader)):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def collect(self, *, recoverable_timeout=True):
+        with cleanup_scope(self.scope):
+            return self.control._collect_bounded_process(
+                self.process, env={}, timeout=0, max_output_bytes=100, windows_job=None,
+                cancellation=self.token, resources=self.resources,
+                recoverable_timeout=recoverable_timeout,
+            )
+
+    def test_local_timeout_cleanup_has_bounded_budget_without_task_deadline(self):
+        deadlines = []
+        with mock.patch.object(self.control, "_terminate_process_tree",
+                               side_effect=lambda *a, **kw: deadlines.append(kw["deadline"]) or True):
+            result = self.collect()
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.cleanup_failed)
+        self.assertEqual([105.0], deadlines)
+        self.assertIsNone(self.scope.started_deadline)
+        self.assertFalse(self.scope.has_pending)
+
+    def test_local_failure_promotes_consumed_deadline_and_retains_exact_owner(self):
+        def unconfirmed(*args, **kwargs):
+            self.assertEqual(105.0, kwargs["deadline"])
+            self.clock = 104.0
+            return False
+
+        with mock.patch.object(self.control, "_terminate_process_tree", side_effect=unconfirmed):
+            result = self.collect()
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.cleanup_failed)
+        self.assertIs(self.resources, result.cleanup_resource)
+        self.assertEqual(105.0, self.scope.started_deadline)
+        self.assertTrue(self.scope.failed)
+        self.assertTrue(self.scope.has_pending)
+        owner = TaskCleanup()
+        self.scope.handoff_to(owner)
+        self.assertTrue(owner.blocks(self.scope))
+        with mock.patch.object(self.resources, "cleanup", return_value=True) as retry:
+            self.assertTrue(self.scope.retry(110.0))
+        retry.assert_called_once_with(110.0)
+        self.assertFalse(self.scope.has_pending)
+        self.assertFalse(owner.has_pending)
+        self.assertTrue(self.scope.failed)
+        self.assertEqual(105.0, self.scope.started_deadline)
+
+    def test_existing_termination_deadline_is_inherited_even_when_expired(self):
+        for deadline in (101.0, 99.0):
+            with self.subTest(deadline=deadline):
+                self.scope = TaskCleanup()
+                self.resources = self.control._ProcessResources(self.process, {})
+                self.scope.begin_termination(deadline=deadline)
+                with mock.patch.object(self.control, "_terminate_process_tree", return_value=True) as terminate:
+                    self.collect()
+                self.assertEqual(deadline, terminate.call_args.kwargs["deadline"])
+                self.assertEqual(deadline, self.scope.started_deadline)
+
+    def test_opt_in_does_not_clear_existing_failed_or_pending_facts(self):
+        previous = mock.Mock()
+        self.scope.mark_failed()
+        self.scope.retain(previous)
+        with mock.patch.object(self.control, "_terminate_process_tree", return_value=True):
+            self.collect()
+        self.assertTrue(self.scope.failed)
+        self.assertTrue(self.scope.has_pending)
+        previous.cleanup.return_value = True
+        self.assertTrue(self.scope.retry(105.0))
+        previous.cleanup.assert_called_once_with(105.0)
+        self.assertTrue(self.scope.failed)
+
+    def test_execution_cancel_still_terminates_when_timeout_is_recoverable(self):
+        self.token.cancel()
+        with mock.patch.object(self.control, "_terminate_process_tree", return_value=True):
+            with self.assertRaises(CancellationError) as caught:
+                self.collect()
+        self.assertFalse(caught.exception.cleanup_failed)
+        self.assertEqual(105.0, self.scope.started_deadline)
+        self.assertFalse(self.scope.has_pending)
+
+    def test_cancellation_during_cleanup_wins_over_timeout_and_keeps_consumed_budget(self):
+        for recoverable in (False, True):
+            for cleanup_ok in (False, True):
+                with self.subTest(recoverable=recoverable, cleanup_ok=cleanup_ok):
+                    self.scope = TaskCleanup()
+                    self.token = CancellationToken()
+                    self.resources = self.control._ProcessResources(self.process, {})
+                    self.clock = 100.0
+
+                    def cancel_during_cleanup(*args, **kwargs):
+                        self.clock = 102.0
+                        self.token.cancel()
+                        return cleanup_ok
+
+                    try:
+                        with mock.patch.object(self.control, "_terminate_process_tree", side_effect=cancel_during_cleanup):
+                            with self.assertRaises(CancellationError) as caught:
+                                self.collect(recoverable_timeout=recoverable)
+                        self.assertEqual(not cleanup_ok, caught.exception.cleanup_failed)
+                        self.assertIs(self.resources, caught.exception.cleanup_resource)
+                        self.assertEqual(105.0, self.scope.started_deadline)
+                        self.assertEqual(not cleanup_ok, self.scope.has_pending)
+                        self.assertEqual(not cleanup_ok, self.scope.failed)
+                    finally:
+                        with mock.patch.object(self.resources, "cleanup", return_value=True):
+                            self.assertTrue(self.scope.retry(110.0))
 
 
 if __name__ == "__main__":

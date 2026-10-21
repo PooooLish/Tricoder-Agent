@@ -67,6 +67,39 @@ def check_record(
 
 
 class TaskValidationTrackerTests(unittest.TestCase):
+    def test_history_is_not_revived_when_digest_returns(self):
+        tracker = TaskValidationTracker("task-a")
+        tracker.observe(check_record("old"))
+        tracker.invalidate()
+        tracker.observe(check_record("new", argv=("python", "-m", "compileall", "."),
+                                     kind="syntax", snapshot_id="state-b"))
+        self.assertEqual("observed", tracker.report().status)
+        self.assertIn("old", tracker.report().stale_check_ids)
+        tracker.reconcile_snapshot("state-a")
+        self.assertEqual((), tracker.current_records("state-a"))
+        self.assertEqual("stale", tracker.report().status)
+
+    def test_ineffective_check_cannot_replace_stale_current_view(self):
+        for changes in ({"kind": "script"}, {"kind": "information"},
+                        {"diagnostics": ("zero_tests_reported",)},
+                        {"diagnostics": ("scope_filtered",)}, {"workspace_stable": False}):
+            with self.subTest(changes=changes):
+                tracker = TaskValidationTracker("task-a")
+                tracker.observe(check_record("old"))
+                tracker.invalidate()
+                tracker.observe(check_record("new", argv=("python", "other"), **changes))
+                self.assertEqual("stale", tracker.report().status)
+
+    def test_filtered_or_unstable_retest_does_not_resolve_failure(self):
+        for changes in ({"diagnostics": ("scope_filtered",)}, {"workspace_stable": False}):
+            with self.subTest(changes=changes):
+                tracker = TaskValidationTracker("task-a")
+                tracker.observe(check_record("failed", returncode=1))
+                tracker.invalidate()
+                tracker.observe(check_record("new", **changes))
+                self.assertEqual(("failed",), tracker.report().unresolved_check_ids)
+                self.assertEqual("failed", tracker.report().status)
+
     def test_modified_state_makes_current_check_stale(self) -> None:
         """若写入后仍显示 observed，旧检查会被误当作当前代码证据。"""
 
@@ -90,7 +123,7 @@ class TaskValidationTrackerTests(unittest.TestCase):
         self.assertEqual("failed", tracker.report().status)
 
         tracker.invalidate()
-        self.assertEqual("stale", tracker.report().status)
+        self.assertEqual("failed", tracker.report().status)
         tracker.observe(
             check_record(
                 "unrelated",
@@ -99,7 +132,7 @@ class TaskValidationTrackerTests(unittest.TestCase):
                 output="Hello",
             )
         )
-        self.assertEqual("stale", tracker.report().status)
+        self.assertEqual("failed", tracker.report().status)
         self.assertEqual(("failed",), tracker.report().unresolved_check_ids)
 
         tracker.observe(check_record("fixed", snapshot_id="state-b"))
@@ -248,6 +281,21 @@ class TaskValidationIntegrationTests(unittest.TestCase):
             )
         )
 
+    def test_read_only_failed_check_then_external_change_still_stops(self) -> None:
+        (self.workspace / "calculator.py").write_text("def add(a, b):\n    return 0\n", encoding="utf8")
+        workspace = self.workspace
+        class Provider(SequenceProvider):
+            def complete(self, messages, tools=()):
+                response = super().complete(messages, tools)
+                if response.tool_calls[0].name == "finish":
+                    (workspace / "external.py").write_text("x=1\n", encoding="utf8")
+                return response
+        provider = Provider((("run_command", {"command": "python -m unittest -v test_calculator"}),
+                             ("finish", {"summary": "审查发现失败"})))
+        result = CodingAgent(provider, self.registry(), plan_enabled=False).run("只读检查")
+        self.assertFalse(result.ok)
+        self.assertTrue(result.task_validation.unresolved_check_ids)
+
     def test_final_snapshot_mismatch_marks_agent_report_stale(self) -> None:
         """一次性 Agent 的最终快照变化也必须使命令检查过期。"""
 
@@ -345,6 +393,10 @@ class TaskValidationIntegrationTests(unittest.TestCase):
                     {"command": "python -m unittest -v test_calculator"},
                 ),
                 ("finish", {"summary": "已完成"}),
+                (
+                    "finish",
+                    {"summary": "无相关验证可补充", "outcome": "incomplete"},
+                ),
             )
         )
 
@@ -352,10 +404,11 @@ class TaskValidationIntegrationTests(unittest.TestCase):
             provider,
             self.registry(),
             plan_enabled=False,
-            max_rounds=4,
+            max_rounds=5,
         ).run_with_context("修改 test1/main.py", SessionContext())
 
-        self.assertTrue(turn.result.ok, turn.result.summary)
+        self.assertFalse(turn.result.ok)
+        self.assertEqual("待验证", turn.result.verification)
         report = turn.result.task_validation
         self.assertEqual("observed", report.status)
         self.assertFalse(report.requirements_coverage_confirmed)

@@ -25,6 +25,7 @@ class RuntimeScenarioObservation:
     results: tuple[RunResult, ...]
     runtime_instances: int
     approval_decisions: tuple[bool, ...]
+    session_ids: tuple[str, ...] = ()
 
 
 def run_agent_turns(
@@ -66,6 +67,7 @@ def run_runtime_scenario(
     runtime_factory: Callable[[str | None], SessionRuntime],
     *,
     approval_decision_sink: Callable[[bool], None] | None = None,
+    on_user_turn_completed: Callable[[int, RunResult], None] | None = None,
 ) -> RuntimeScenarioObservation:
     """Execute only registered control actions through SessionRuntime public APIs."""
 
@@ -75,11 +77,16 @@ def run_runtime_scenario(
     instances = 1
     results: list[RunResult] = []
     approval_decisions: list[bool] = []
+    session_ids: list[str] = []
     try:
         for step in steps:
             if step.kind == "user_turn":
                 assert step.content is not None
                 results.append(runtime.run_task(step.content))
+                if on_user_turn_completed is not None:
+                    on_user_turn_completed(len(results), results[-1])
+                if runtime.current is not None:
+                    session_ids.append(runtime.current.record.id)
             elif step.kind == "memory_refresh":
                 runtime.refresh_memory()
             elif step.kind == "memory_save":
@@ -94,6 +101,8 @@ def run_runtime_scenario(
                     raise RuntimeError("runtime scenario could not close the previous session")
                 runtime = runtime_factory(session_id)
                 instances += 1
+                if runtime.current is not None:
+                    session_ids.append(runtime.current.record.id)
             elif step.kind == "switch_session":
                 assert step.target is not None
                 records = runtime.store.list_all()
@@ -131,6 +140,7 @@ def run_runtime_scenario(
             results=tuple(results),
             runtime_instances=instances,
             approval_decisions=tuple(approval_decisions),
+            session_ids=tuple(session_ids),
         )
     except BaseException as exc:
         if not runtime.close():

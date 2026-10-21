@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.core.cancellation import CancellationError, CancellationToken, check_current_cancellation
 from tricoder.task_cleanup import run_in_cleanup_thread
 from tricoder.models import ToolResult, tool_failure
 from tricoder.execution_state import EffectState, ErrorCode, FileEffects, RecoveryAction, ToolError
@@ -21,6 +21,7 @@ from tricoder.policy import (
 )
 from tricoder.process.control import ProcessExecutionUncertain, run_bounded_process
 from tricoder.process.env import filtered_subprocess_env
+from tricoder.process.cache import CacheCreationUncertain, run_with_compile_cache
 
 from tricoder.tools.handlers import InvalidToolArgument, ToolHandler
 
@@ -67,7 +68,6 @@ def _check_kind_and_targets(
     tokens = args[3:]
     if module == "unittest":
         targets: list[str] = []
-        discover = bool(tokens and tokens[0].lower() == "discover")
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -86,7 +86,9 @@ def _check_kind_and_targets(
             if token != "discover":
                 targets.append(_test_target(token))
             index += 1
-        if discover and not targets:
+        # unittest 无测试位置参数时也会执行默认发现（如 -m unittest -q），
+        # 与显式 discover 一样从有效 cwd 开始；零测试/筛选仍由独立诊断拒绝。
+        if not targets:
             targets.append(".")
         return "tests", tuple(dict.fromkeys(targets))
     if module == "pytest":
@@ -225,7 +227,9 @@ class RunCommandTool(ToolHandler):
     description = (
         "经审批后在工作区内运行白名单命令；Python 别名统一使用会话解释器，"
         "标准测试形式为 `python -m unittest discover -v`，版本查询仅用于诊断。"
-        "请按当前任务选择相关检查；不要为了结束任务重复执行无关测试。"
+        "普通 Python 脚本成功只记录运行事实，不能解除文件修改后的验证义务；"
+        "请按当前任务选择覆盖修改文件的测试、语法或静态检查。简单 Python 文件可用"
+        " `python -m compileall -q <相对路径>` 检查语法，但这不代表功能验收通过。"
     )
     parameters = ToolHandler._schema(
         {"command": {"type": "string"}, "cwd": {"type": "string"}},
@@ -385,16 +389,20 @@ class RunCommandTool(ToolHandler):
         previous_unknown = scope.unknown_effects
         scope.unknown_effects = True
         try:
-            completed = run_bounded_process(
-                args,
-                cwd=cwd,
-                env=subprocess_env,
-                timeout=self.context.timeout,
-                max_output_bytes=self.context.max_output_chars,
-                cancellation=cancellation,
-            )
+            process_options = dict(cwd=cwd, env=subprocess_env, timeout=self.context.timeout,
+                                   max_output_bytes=self.context.max_output_chars, cancellation=cancellation)
+            if CommandPolicy._is_python_executable(args[0]) and args[1:3] == ["-m", "compileall"]:
+                completed = run_with_compile_cache(
+                    run_bounded_process, args,
+                    workspace=self.context.workspace_policy.workspace, **process_options,
+                )
+            else:
+                completed = run_bounded_process(args, **process_options)
         except CancellationError:
             raise
+        except CacheCreationUncertain:
+            scope.unknown_effects = previous_unknown
+            return tool_failure(ErrorCode.CLEANUP_FAILED, "编译缓存身份无法确认，清理归属已保留")
         except ProcessExecutionUncertain as exc:
             return tool_failure(
                 (
@@ -578,15 +586,20 @@ class GitDiffTool(ToolHandler):
     """只读展示工作区未提交变更的 diff 统计，无需审批（策略已限只读）。"""
 
     name = "git_diff"
-    description = "显示工作区未提交变更的只读 diff 统计。"
+    description = "仅当工作区是独立 Git 仓库根（含 worktree）时，显示未提交变更的只读 diff 统计；父仓库场景返回不可用，不执行 diff。"
     parameters = ToolHandler._schema({})
 
     def run(self, arguments: dict[str, Any]) -> ToolResult:
         workspace = self.context.workspace_policy.workspace
-        if _git_command_escapes_workspace(workspace, self.context.command_policy):
+        escapes = _git_command_escapes_workspace(workspace, self.context.command_policy)
+        # 根探测可能同步等待；返回能力缺失之前仍必须服从已接受的取消。
+        check_current_cancellation()
+        if escapes:
             return tool_failure(
-                ErrorCode.POLICY_DENIED,
-                "git 仓库根超出工作区，拒绝执行（防止读取工作区外仓库内容）",
+                ErrorCode.EXECUTION_FAILED,
+                "当前工作区不是独立仓库根，git_diff 不可用；未执行 diff。请使用当前工作区文件与已有变更记录继续验证，不要通过命令读取父仓库。",
+                recovery=RecoveryAction.REPLAN,
+                detail_code="git_workspace_unavailable",
             )
         try:
             args = self.context.command_policy.validate("git --no-pager diff --stat")
@@ -625,6 +638,8 @@ class FinishTool(ToolHandler):
         "结束本轮任务并提交文字总结；完成、无法继续或需要用户补充信息时必须调用。"
         "outcome=completed 表示模型声明请求已交付，outcome=incomplete 表示仍未完成；"
         "省略 outcome 兼容为 completed。本工具只请求结束，本地验证、检查事实和最终安全状态仍由宿主决定。"
+        "首次 completed 若唯一缺少可补充的可信验证，宿主最多反馈一次且任务继续；"
+        "无法继续时应使用 incomplete，宿主不会强制补跑命令。"
     )
     parameters = ToolHandler._schema(
         {

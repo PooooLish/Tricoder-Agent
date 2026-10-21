@@ -5,6 +5,23 @@ from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 
 
+class TaskStopReason(str, Enum):
+    """Host-observed terminal reason; not a completion capability."""
+
+    COMPLETED = "completed"
+    MODEL_INCOMPLETE = "model_incomplete"
+    ROUND_BUDGET_EXHAUSTED = "round_budget_exhausted"
+    NEEDS_INPUT = "needs_input"
+    TOOL_STOP = "tool_stop"
+    VERIFICATION_BLOCKED = "verification_blocked"
+    CANCELLED = "cancelled"
+    CLEANUP_FAILED = "cleanup_failed"
+    UNKNOWN_EFFECTS = "unknown_effects"
+    PROGRESS_STOPPED = "progress_stopped"
+    PROVIDER_FAILED = "provider_failed"
+    RUNTIME_REJECTED = "runtime_rejected"
+
+
 class ErrorCode(str, Enum):
     UNKNOWN_TOOL = "unknown_tool"
     INVALID_ARGUMENT = "invalid_argument"
@@ -26,22 +43,39 @@ class RecoveryAction(str, Enum):
     STOP_TASK = "stop_task"
 
 
+PATCH_ERROR_DETAILS = frozenset({
+    "patch_invalid_header", "patch_invalid_hunk", "patch_count_mismatch",
+    "patch_unsupported_operation", "patch_context_mismatch", "patch_invalid_format",
+})
+TOOL_ERROR_DETAILS = PATCH_ERROR_DETAILS | {"git_workspace_unavailable", "file_already_exists"}
+
+
 @dataclass(frozen=True, slots=True)
 class ToolError:
     code: ErrorCode
     recovery: RecoveryAction
     retryable: bool = False
+    detail_code: str | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.code, ErrorCode)
                 or not isinstance(self.recovery, RecoveryAction)
                 or self.retryable is not False):
             raise ValueError("工具错误契约无效；尚不支持自动重试")
+        if self.detail_code is not None and (
+            not isinstance(self.detail_code, str) or self.detail_code not in TOOL_ERROR_DETAILS
+        ):
+            raise ValueError("工具错误子类型无效")
 
     def public_fields(self) -> dict[str, str | bool]:
         """协议、展示和审计仅消费本地产生的稳定字段，不附带异常正文。"""
-        return {"code": self.code.value, "recovery": self.recovery.value,
-                "retryable": self.retryable}
+        fields: dict[str, str | bool] = {
+            "code": self.code.value, "recovery": self.recovery.value,
+            "retryable": self.retryable,
+        }
+        if self.detail_code is not None:
+            fields["detail_code"] = self.detail_code
+        return fields
 
 
 class EffectState(str, Enum):

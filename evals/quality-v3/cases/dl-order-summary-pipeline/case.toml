@@ -1,0 +1,24 @@
+id = "dl-order-summary-pipeline"
+title = "dl-order-summary-pipeline"
+task = "reader.read_orders(text)按CSV读取固定表头customer,amount,status为dict列表；totals.summarize(rows)及pipeline.build_report(text)只统计status恰为paid，amount是可带负号的整数字符串，按customer累加整数分；重复客户合并、空数据{}、其他状态忽略，customer按CSV原样保留（包括引号内逗号）；不涉及浮点货币、日期或网络。"
+allowed_changes = ["reader.py", "totals.py", "pipeline.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "delivery"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+expose_edit_scope = true
+path_match_mode = "workspace_root"
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "reader.read_orders(text)按CSV读取固定表头customer,amount,status为dict列表；totals.summarize(rows)及pipeline.build_report(text)只统计status恰为paid，amount是可带负号的整数字符串，按customer累加整数分；重复客户合并、空数据{}、其他状态忽略，customer按CSV原样保留（包括引号内逗号）；不涉及浮点货币、日期或网络。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

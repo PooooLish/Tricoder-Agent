@@ -22,6 +22,7 @@ from .models import (
     TrialKey,
     TrialRecord,
 )
+from .assertions import REGISTERED_ASSERTIONS
 from .output import _is_link_or_reparse_point, validate_run_directory
 from .report import (
     trial_record_as_dict,
@@ -54,7 +55,9 @@ def plan_trials(definition: ExperimentDefinition) -> tuple[PlannedTrial, ...]:
                 )
             ]
             if not conditions:
-                raise ValueError("v2 case has no matching execution_kind condition")
+                # 混合 suite 的 quality/contract 实验只冻结匹配当前 condition
+                # 的题目；loader 已经保证整个矩阵至少有一行。
+                continue
             offset = (case_index + repetition - 1) % len(conditions)
             conditions = conditions[offset:] + conditions[:offset]
             for condition in conditions:
@@ -231,6 +234,8 @@ def _experiment_fingerprints(
                         {"kind": step.kind, "content": step.content, "target": step.target}
                         for step in case.steps
                     ],
+                    "assertions": list(case.assertions),
+                    "expected_outcome": case.expected_outcome,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -260,6 +265,19 @@ def _experiment_fingerprints(
             ]
         ),
         "code": _digest(_tree_parts(code_root, suffix=".py")),
+        "scoring": _digest(
+            [
+                b"regression-expectation-v1",
+                b"assertions.py",
+                Path(__file__).with_name("assertions.py").read_bytes(),
+                b"regression_controls.py",
+                Path(__file__).with_name("regression_controls.py").read_bytes(),
+                *(
+                    assertion_id.encode("ascii")
+                    for assertion_id in sorted(REGISTERED_ASSERTIONS)
+                ),
+            ]
+        ),
     }
     return tuple(sorted(fingerprints.items()))
 

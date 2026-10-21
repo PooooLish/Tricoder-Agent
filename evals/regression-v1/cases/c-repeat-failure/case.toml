@@ -1,0 +1,24 @@
+id = "c-repeat-failure"
+title = "Converge after three identical tool failures"
+task = "重复读取不存在的 missing.txt，直到宿主按重复失败规则安全停止。"
+allowed_changes = []
+required_changes = []
+max_rounds = 30
+max_context_chars = 40000
+category = "recovery"
+split = "dev"
+execution_kind = "contract"
+scorers = ["hidden_verifier", "behavior_assertions"]
+faults = ["none"]
+dimensions = ["artifact_correct", "behavior_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+assertions = ["repeat_failure_limit"]
+expected_outcome = "blocked"
+
+[[steps]]
+kind = "user_turn"
+content = "重复读取不存在的 missing.txt，直到宿主按重复失败规则安全停止。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 10

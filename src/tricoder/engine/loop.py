@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from tricoder.audit import AuditLogger
+from tricoder.execution_state import TaskStopReason
 from tricoder.context.coordinator import (
     MemoryAuditFailure,
     MemoryCoordinator,
@@ -39,6 +40,7 @@ from tricoder.core.events import (
     RuntimeFailed,
 )
 from tricoder.engine.finalization import TaskFinalizer
+from tricoder.engine.completion import FinishAssessment, assess_finish
 from tricoder.engine.progress import ProgressReason
 from tricoder.engine.provider_request import PlanningPhase, ProviderResponseCollector
 from tricoder.engine.state import AgentRunState, ToolBatchStop
@@ -53,10 +55,16 @@ from tricoder.engine.telemetry import (
     notify_provider_usage,
 )
 from tricoder.engine.tool_batch import ToolBatchExecutor
+from tricoder.engine.verification_feedback import (
+    build_batch_feedback,
+    checkpoint as verification_feedback_checkpoint,
+    controlled_pending_paths,
+    finish_recovery_feedback,
+)
 from tricoder.models import MemoryConfig, RunResult, SessionContext, SessionTurnResult, TokenUsage
 from tricoder.providers import ModelProvider, ProviderError, ProviderProtocolError
 from tricoder.protocols import ActionProtocol, PROTOCOL_FEEDBACK
-from tricoder.task_cleanup import run_in_cleanup_thread
+from tricoder.task_cleanup import current_cleanup, run_in_cleanup_thread
 from tricoder.task_observation import current_task_observation
 from tricoder.workspace.verification import VerificationScope, proves_new_file_version
 
@@ -201,7 +209,7 @@ class AgentRunner:
                 )
             except CancellationError:
                 return finalizer.finish(
-                    self._result(state, False, "任务已取消", 0),
+                    self._result(state, False, "任务已取消", 0, TaskStopReason.CANCELLED),
                     rollback_task=True,
                 )
             if planning.audit_failed:
@@ -214,7 +222,7 @@ class AgentRunner:
         for round_number in range(1, self.max_rounds + 1):
             if cancellation.is_cancelled:
                 return finalizer.finish(
-                    self._result(state, False, "任务已取消", round_number - 1),
+                    self._result(state, False, "任务已取消", round_number - 1, TaskStopReason.CANCELLED),
                     rollback_task=True,
                 )
             self.observer.on_round_start(round_number, self.max_rounds)
@@ -269,7 +277,7 @@ class AgentRunner:
                 )
             except CancellationError:
                 return finalizer.finish(
-                    self._result(state, False, "任务已取消", round_number),
+                    self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED),
                     rollback_task=True,
                 )
             except ProviderProtocolError as exc:
@@ -311,6 +319,7 @@ class AgentRunner:
                         False,
                         PROVIDER_FAILURE_MESSAGE,
                         round_number,
+                        TaskStopReason.PROVIDER_FAILED,
                     ),
                     rollback_task=True,
                 )
@@ -403,7 +412,7 @@ class AgentRunner:
                 # 审计成功后必须重新读取令牌，不能使用上方仅用于反馈的旧快照。
                 if cancellation.is_cancelled:
                     return finalizer.finish(
-                        self._result(state, False, "任务已取消", round_number),
+                        self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED),
                         rollback_task=True,
                     )
                 if will_stop:
@@ -419,6 +428,7 @@ class AgentRunner:
                             False,
                             NATIVE_TERMINATION_FAILURE,
                             round_number,
+                            TaskStopReason.PROGRESS_STOPPED,
                         )
                     )
                 continue
@@ -441,6 +451,7 @@ class AgentRunner:
                     result,
                 ),
             )
+            feedback_checkpoint = verification_feedback_checkpoint(state)
             outcome = await batch.execute(resolved, round_number)
             if outcome.stop is ToolBatchStop.AUDIT_FAILED:
                 return finalizer.finish(self._audit_failure(state, round_number))
@@ -448,6 +459,18 @@ class AgentRunner:
                 state.messages.append(
                     self._feedback_message(feedback, "protocol_feedback")
                 )
+            if outcome.stop in {ToolBatchStop.CONTINUE, ToolBatchStop.REPLAN}:
+                verification_feedback = build_batch_feedback(
+                    state,
+                    feedback_checkpoint,
+                )
+                if verification_feedback is not None:
+                    state.messages.append(
+                        self._feedback_message(
+                            verification_feedback,
+                            "verification_feedback",
+                        )
+                    )
             if outcome.stop is ToolBatchStop.UNKNOWN_EFFECTS:
                 return finalizer.finish(
                     self._result(
@@ -466,7 +489,7 @@ class AgentRunner:
                         )
                     )
                 return finalizer.finish(
-                    self._result(state, False, "任务已取消", round_number)
+                    self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED)
                 )
             if outcome.stop is ToolBatchStop.CLARIFIED:
                 # 回答已经作为真实工具结果进入历史；下一轮必须重新请求模型。
@@ -485,12 +508,13 @@ class AgentRunner:
                         False,
                         outcome.result.output,
                         round_number,
+                        TaskStopReason.NEEDS_INPUT,
                     )
                 )
             if outcome.stop is ToolBatchStop.PROGRESS_STOP:
                 if cancellation.is_cancelled:
                     return finalizer.finish(
-                        self._result(state, False, "任务已取消", round_number)
+                        self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED)
                     )
                 if outcome.progress is None or outcome.progress.reason is None:
                     return finalizer.finish(
@@ -499,6 +523,7 @@ class AgentRunner:
                             False,
                             "进展守卫状态无效，任务已安全停止",
                             round_number,
+                            TaskStopReason.PROGRESS_STOPPED,
                         )
                     )
                 notice, summary = self._progress_termination(outcome.progress.reason)
@@ -506,7 +531,7 @@ class AgentRunner:
                     self._feedback_message(notice, TASK_TERMINATION_KIND)
                 )
                 return finalizer.finish(
-                    self._result(state, False, summary, round_number)
+                    self._result(state, False, summary, round_number, TaskStopReason.PROGRESS_STOPPED)
                 )
             if outcome.stop is ToolBatchStop.FATAL:
                 assert outcome.result is not None
@@ -516,18 +541,113 @@ class AgentRunner:
                         False,
                         outcome.result.output,
                         round_number,
+                        TaskStopReason.TOOL_STOP,
                     )
                 )
             if outcome.stop is ToolBatchStop.FINISH:
                 assert outcome.result is not None
                 assert outcome.finish_outcome in {"completed", "incomplete"}
-                return await self._finish_success(
+                assessment = await self._assess_finish(
                     state,
                     outcome.result.output,
                     outcome.finish_outcome,
-                    round_number,
                     scope,
                     policy,
+                    cancellation,
+                )
+                if not self._log({
+                    "round": round_number,
+                    "status": "finish_assessment",
+                    "declared_outcome": outcome.finish_outcome,
+                    "accepted": assessment.completed,
+                    "validation_status": assessment.validation_report.status,
+                    "unresolved_check_count": len(assessment.validation_report.unresolved_check_ids),
+                    "pending_path_count": len(assessment.pending_paths),
+                    "reason": assessment.stop_reason.value if assessment.stop_reason else "unknown",
+                }):
+                    return finalizer.finish(self._audit_failure(state, round_number))
+                if (
+                    assessment.recoverable_reason is not None
+                    and state.finish_verification_recoveries < 1
+                    and round_number < self.max_rounds
+                ):
+                    state.finish_verification_recoveries += 1
+                    feedback = finish_recovery_feedback(
+                        state, pending_paths=assessment.pending_paths,
+                        reason=assessment.recoverable_reason,
+                    )
+                    audit_paths = controlled_pending_paths(state, assessment.pending_paths)
+                    if not self._log(
+                        {
+                            "round": round_number,
+                            "status": "finish_verification_recovery",
+                            "reason": assessment.recoverable_reason,
+                            "count": state.finish_verification_recoveries,
+                            "limit": 1,
+                            "pending_paths": list(audit_paths[:20]),
+                            "omitted_count": max(
+                                0,
+                                len(audit_paths) - 20,
+                            ),
+                        }
+                    ):
+                        return finalizer.finish(
+                            self._audit_failure(state, round_number)
+                        )
+                    if cancellation.is_cancelled:
+                        return finalizer.finish(
+                            self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED)
+                        )
+                    # 审计回调期间也可能进入终止状态；不能发布恢复反馈或再请求 Provider。
+                    cleanup = current_cleanup()
+                    if cleanup is not None and cleanup.failed:
+                        state.cleanup_failed = True
+                        return finalizer.finish(self._result(
+                            state, False, "资源清理未确认，任务停止", round_number, TaskStopReason.CLEANUP_FAILED,
+                        ))
+                    if isinstance(scope, VerificationScope) and scope.unknown_effects:
+                        state.unknown_effects = True
+                        return finalizer.finish(self._result(
+                            state, False, "文件影响未确认，任务停止", round_number, TaskStopReason.UNKNOWN_EFFECTS,
+                        ))
+                    if cleanup is not None and cleanup.started_deadline is not None:
+                        return finalizer.finish(self._result(
+                            state, False, "已进入终止清理，不能继续验证", round_number, TaskStopReason.VERIFICATION_BLOCKED,
+                        ))
+                    state.messages.append(
+                        self._feedback_message(
+                            feedback,
+                            "verification_feedback",
+                        )
+                    )
+                    # 复用 Console/TUI 的纠错通知通道，不发布终态卡片。
+                    self.observer.on_error(
+                        "本轮尚未结束：验证义务仍未解除，"
+                        "已提供一次补充机会（1/1）；无法继续时可声明 incomplete。"
+                    )
+                    continue
+                if assessment.recoverable_reason is not None:
+                    rejection_reason = (
+                        "round_budget_exhausted"
+                        if round_number >= self.max_rounds
+                        else "recovery_limit_reached"
+                    )
+                    if not self._log(
+                        {
+                            "round": round_number,
+                            "status": "finish_verification_recovery_rejected",
+                            "reason": rejection_reason,
+                            "count": state.finish_verification_recoveries,
+                            "limit": 1,
+                        }
+                    ):
+                        return finalizer.finish(
+                            self._audit_failure(state, round_number)
+                        )
+                return await self._finish_success(
+                    state,
+                    assessment,
+                    round_number,
                     cancellation,
                     coordinator,
                     finalizer,
@@ -537,7 +657,7 @@ class AgentRunner:
         summary = f"达到最大轮数 {self.max_rounds}，任务已安全停止"
         self.observer.on_error(summary)
         return finalizer.finish(
-            self._result(state, False, summary, self.max_rounds)
+            self._result(state, False, summary, self.max_rounds, TaskStopReason.ROUND_BUDGET_EXHAUSTED)
         )
 
     async def _initialize_verification(
@@ -552,6 +672,7 @@ class AgentRunner:
             state.verification_required or state.unknown_effects
         )
         if isinstance(scope, VerificationScope):
+            state.verification_scope = scope
             scope.begin_task(state.current_task_id)
             if isinstance(self.audit, AuditLogger):
                 scope.audit_files = (self.audit.path.absolute(),)
@@ -608,7 +729,7 @@ class AgentRunner:
                     self._apply_memory_step(state, progress.result)
         except CancellationError:
             return finalizer.finish(
-                self._result(state, False, "任务已取消", completed_rounds),
+                self._result(state, False, "任务已取消", completed_rounds, TaskStopReason.CANCELLED),
                 rollback_task=rollback_task,
             )
         except MemoryAuditFailure:
@@ -628,19 +749,20 @@ class AgentRunner:
             )
         return None
 
-    async def _finish_success(
+    async def _assess_finish(
         self,
         state: AgentRunState,
         summary: str,
         finish_outcome: str,
-        round_number: int,
         scope: object | None,
         policy: object | None,
         cancellation: CancellationToken,
-        coordinator: MemoryCoordinator,
-        finalizer: TaskFinalizer,
-    ) -> SessionTurnResult:
-        valid = False
+    ) -> FinishAssessment:
+        """取得必要快照并执行唯一的 finish 资格判定。"""
+
+        cleanup = current_cleanup()
+        state.cleanup_failed = state.cleanup_failed or bool(cleanup and cleanup.failed)
+        current = None
         needs_final_snapshot = (
             state.verification_required or state.validation.has_workspace_checks
         )
@@ -649,48 +771,28 @@ class AgentRunner:
             state.validation.reconcile_snapshot(
                 current.digest if current.complete else None
             )
-            if state.verification_required:
-                valid = (
-                    scope.owns(state.evidence)
-                    and state.evidence.is_valid_for(current)
-                )
-                if state.failed_snapshot is not None and proves_new_file_version(
-                    state.failed_snapshot,
-                    current,
-                ):
-                    state.failed_snapshot = None
-                if not valid:
-                    state.evidence = None
-                    state.verification = (
-                        "失败" if state.failed_snapshot is not None else "待验证"
-                    )
-        validation_report = state.validation.report()
-        if validation_report.status == "stale":
-            state.evidence = None
-            state.verification_required = True
-            state.verification = "待验证"
-        completed = (
-            finish_outcome == "completed"
-            and
-            not cancellation.is_cancelled
-            and not state.cleanup_failed
-            and validation_report.status != "stale"
-            and (
-                not state.verification_required
-                or (valid and state.failed_snapshot is None)
-            )
+        return assess_finish(
+            state,
+            summary=summary,
+            finish_outcome=finish_outcome,
+            cancellation_requested=cancellation.is_cancelled,
+            scope=scope,
+            current=current,
+            termination_started=bool(cleanup and cleanup.started_deadline is not None),
         )
-        if state.verification_required and state.verification == "待验证":
-            summary = (
-                f"{summary}；文件修改后尚未运行验证命令，或受覆盖文件状态证据已失效"
-            )
-        elif state.verification_required and state.verification == "失败":
-            summary = f"{summary}；文件修改后的验证失败"
-        elif validation_report.status == "stale":
-            summary = f"{summary}；检查后工作区状态已变化，旧记录已过期"
-        elif validation_report.status == "failed":
-            summary = f"{summary}；检查发现失败，见检查记录"
-        provisional = self._result(state, completed, summary, round_number)
+
+    async def _finish_success(
+        self,
+        state: AgentRunState,
+        assessment: FinishAssessment,
+        round_number: int,
+        cancellation: CancellationToken,
+        coordinator: MemoryCoordinator,
+        finalizer: TaskFinalizer,
+    ) -> SessionTurnResult:
+        completed = assessment.completed
+        summary = assessment.summary
+        provisional = self._result(state, completed, summary, round_number, assessment.stop_reason if completed or not assessment.completed else None)
         history_closed = finalizer.close_task(provisional)
         if not history_closed:
             completed = False
@@ -715,14 +817,14 @@ class AgentRunner:
                         self._apply_memory_step(state, progress.result)
             except CancellationError:
                 return finalizer.finish(
-                    self._result(state, False, "任务已取消", round_number)
+                    self._result(state, False, "任务已取消", round_number, TaskStopReason.CANCELLED)
                 )
             except MemoryAuditFailure:
                 return finalizer.finish(self._audit_failure(state, round_number))
             if state.memory_warning:
                 summary = f"{summary}；{state.memory_warning}"
         return finalizer.finish(
-            self._result(state, completed, summary, round_number)
+            self._result(state, completed, summary, round_number, assessment.stop_reason if completed or not assessment.completed else None)
         )
 
     def _memory_coordinator(self) -> MemoryCoordinator:
@@ -829,6 +931,7 @@ class AgentRunner:
         ok: bool,
         summary: str,
         rounds: int,
+        stop_reason: TaskStopReason | None = None,
     ) -> RunResult:
         return RunResult(
             ok,
@@ -838,6 +941,7 @@ class AgentRunner:
             tuple(state.modified_files),
             state.verification,
             modified_directories=tuple(state.modified_directories),
+            stop_reason=stop_reason,
         )
 
     @staticmethod
