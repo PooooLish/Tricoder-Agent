@@ -819,7 +819,7 @@ Agent 效果已提升。真实运行会使用本机配置并可能产生费用�
 
 ### 无密钥自动化测试
 
-GitHub Actions 当前在 Windows 的 Python 3.11/3.12 上运行，暂不运行 Linux 环境检查；这不代表已经保证其他平台兼容。CI 会先安装项目和测试依赖。需要在新环境中运行测试时，先执行（安装步骤需要网络）：
+GitHub Actions 当前仅在 Windows 的 Python 3.11 上运行；Python 3.12及其他平台不在当前CI验证范围内。CI 会先安装项目和测试依赖，并创建被Git忽略的测试运行目录。题库由`.gitattributes`保持检出字节，避免自动换行破坏来源哈希。需要在新环境中运行测试时，先执行（安装步骤需要网络）：
 
 ```powershell
 python -m pip install -e ".[test]"
@@ -828,6 +828,7 @@ python -m pip install -e ".[test]"
 `test` 可选依赖包含包发现测试使用的 setuptools；构建隔离环境中的 setuptools 不代表测试解释器也已安装它。依赖就绪后，以下检查不联网，也不需要真实 API Key：
 
 ```powershell
+python -c "from pathlib import Path; Path('runtime').mkdir(exist_ok=True)"
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```

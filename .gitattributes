@@ -1,0 +1,2 @@
+# Evaluation manifests verify exact fixture bytes across versions and platforms.
+evals/** -text

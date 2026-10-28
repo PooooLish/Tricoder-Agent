@@ -22,7 +22,7 @@ class GitDiffAvailabilityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         (self.workspace / "app.py").write_text("value = 1\n", encoding="utf8")

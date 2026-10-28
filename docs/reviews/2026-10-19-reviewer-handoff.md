@@ -1,5 +1,13 @@
 # TriCoder Reviewer 会话交接
 
+## 2026-10-28 集成CI修复：按用户要求仅验证Python 3.11
+
+- PR #1首轮CI未通过，main尚未合入。3.11有428项FileNotFoundError，来自干净检出缺少runtime；另4项题库哈希失败来自Git自动LF→CRLF转换，2项Git helper测试模拟了非规范路径。3.12首轮也失败；用户明确表示不再需要3.12，故移除该CI矩阵项，不将其失败记为已修复。
+- 最小修复仅涉及CI/属性/测试与文档：CI创建runtime；`.gitattributes`对evals/**关闭文本换行转换；GitDiffAvailabilityTests的临时根路径resolve；README同步3.11范围及干净环境测试准备。Agent生产代码和题库内容未改。
+- 独立复现：autocrlf=true检出时766份eval文件中641份字节变化，示例哈希与CI错误完全一致；加入属性后766份全部保持。两个模拟非规范临时路径的既有测试RED为2失败、GREEN为2通过。干净检出准备runtime后，4项原哈希失败及Git/交付/创建文件专项共22项通过（1项本机符号链接权限skip），无失败。
+- 初轮CI日志与新增复现单独保存在runtime/mg28；修复后的PR CI仍须全量通过才合并。最终提交、CI与main同步结果以runtime/mg28/integration-result.json及PR https://github.com/PooooLish/Tricoder-Agent/pull/1 为准。原真实86/90完整交付结论不变；以下历史记录保留。
+
+
 ## 2026-10-28 main 集成记录：量化指标与交付指引
 
 - 用户明确授权合入main。集成分支`codex/eval-metrics-delivery-guidance`；按“评测量化指标”和“交付指引及quality-v3.1”两个逻辑提交打包，经PR的Windows/Python 3.11、3.12 CI验证后合入。实际PR、CI、提交与合入状态保存在`runtime/mg28/integration-result.json`；该收据及Git历史为执行结果依据。
