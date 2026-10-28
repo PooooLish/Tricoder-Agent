@@ -15,7 +15,8 @@ from tricoder.models import TokenUsage
 
 from .metrics import MetricValue, aggregate_trial_metrics
 from .assertions import AssertionResult, SubcaseResult
-from .models import ExperimentRunReport, TrialDimensions, TrialKey, TrialRecord, EvalTurnRecord
+from .models import ExperimentRunReport, TrialDimensions, TrialKey, TrialRecord, EvalTurnRecord, TrialPlanEntry, TrialTimings
+from .quantification import quantify_trials
 from .faults import FAULT_EVIDENCE_KINDS
 from .output import _is_link_or_reparse_point, validate_run_directory
 from .runner import EvalCaseResult, EvalRunReport, VerificationResult
@@ -121,6 +122,7 @@ def normalize_report_payload(payload: object) -> dict[str, object]:
 def trial_record_as_dict(record: TrialRecord) -> dict[str, object]:
     """Serialize one trial using only fixed identifiers, counts and booleans."""
 
+    TrialPlanEntry(record.key, record.execution_kind, record.category, record.split)
     turns = _read_turn_results([asdict(turn) for turn in record.turn_results])
     _validate_first_failed(turns, record.first_failed_turn)
     triggered = _read_fault_ids(list(record.triggered_faults))
@@ -133,6 +135,8 @@ def trial_record_as_dict(record: TrialRecord) -> dict[str, object]:
         "repetition": record.key.repetition,
         "execution_kind": record.execution_kind,
         "category": _safe_identifier(record.category),
+        "split": record.split,
+        "timings": asdict(record.timings) if record.timings is not None else None,
         "status": record.status if record.status in _TRIAL_STATUSES else "error",
         "dimensions": {
             field: getattr(record.dimensions, field) for field in _DIMENSION_FIELDS
@@ -256,6 +260,15 @@ def trial_record_from_dict(payload: object) -> TrialRecord:
     _validate_first_failed(turns, first_failed)
     triggered = _read_fault_ids(payload.get("triggered_faults", []))
     evidence = _read_fault_evidence(payload.get("fault_evidence", []), triggered)
+    split = payload.get("split", "unknown")
+    TrialPlanEntry(TrialKey(condition_id, case_id, repetition), execution_kind,
+                   _read_optional_identifier(payload.get("category")) or "unknown", split)
+    timing_payload = payload.get("timings")
+    timings = None
+    if timing_payload is not None:
+        if not isinstance(timing_payload, dict) or set(timing_payload) != set(TrialTimings.__dataclass_fields__):
+            raise ValueError("invalid trial timings")
+        timings = TrialTimings(**timing_payload)
     return TrialRecord(
         key=TrialKey(condition_id, case_id, repetition),
         execution_kind=execution_kind,  # type: ignore[arg-type]
@@ -285,6 +298,8 @@ def trial_record_from_dict(payload: object) -> TrialRecord:
         expectation_met=raw_expectation,
         assertion_results=tuple(assertion_results),
         subcase_results=tuple(subcase_results),
+        split=split,
+        timings=timings,
     )
 
 
@@ -386,7 +401,16 @@ def experiment_report_as_dict(report: ExperimentRunReport) -> dict[str, object]:
         "summary_usage": _usage_as_dict(metrics.total_summary_usage),
         "cost_per_success": metrics.cost_per_success,
         "trials": [trial_record_as_dict(record) for record in report.trials],
+        "trial_plan": [trial_plan_as_dict(entry) for entry in report.trial_plan],
+        "quantification": quantify_trials(report.trials, plan=report.trial_plan or None,
+                                           report_complete=report.complete),
     }
+
+
+def trial_plan_as_dict(entry: TrialPlanEntry) -> dict[str, object]:
+    return {"condition_id": entry.key.condition_id, "case_id": entry.key.case_id,
+            "repetition": entry.key.repetition, "execution_kind": entry.execution_kind,
+            "category": entry.category, "split": entry.split}
 
 
 def _condition_as_dict(condition: object) -> dict[str, object]:
@@ -801,7 +825,48 @@ def _render_experiment_markdown(payload: dict[str, object]) -> str:
                 f"{subcase['id']} | {subcase['expectation_met']} | "
                 f"{subcase['agent_completed']} | {subcase['reason_code']} |"
             )
+    if "quantification" in payload:
+        lines.append(render_quantification_markdown(payload["quantification"]))
     return "\n".join(lines) + "\n"
+
+
+def render_quantification_markdown(q: dict[str, object]) -> str:
+    lines = ["", "## Whole-task quantification", "",
+             "token_accounting=provider_reported; billing_completeness=unknown. Tokens are not monetary costs.",
+             "legacy stable_cases = observed-all-success, not pass^k. legacy_eval_duration_ms is not Agent latency.",
+             "Agent time includes Session, tools, waits and cleanup; multi-turn rounds may exceed per-turn budgets.",
+             "error samples count as conservative end-to-end failures; unknown outcomes remain unavailable."]
+    for condition, block in q['by_condition'].items():
+        groups = [('all_quality', block['all_quality'])]
+        groups += [('split/'+k,v) for k,v in block['by_split'].items()]
+        groups += [('category/'+k,v) for k,v in block['by_category'].items()]
+        for name, group in groups:
+            lines += ['', f"### {condition} / {name}", '',
+                      f"Coverage: {json.dumps(group['coverage'], sort_keys=True)}", '',
+                      '| Metric | k | Value | Eligible / tasks | Reason |',
+                      '| --- | ---: | ---: | ---: | --- |']
+            for key,label in (('artifact_pass_at_k','artifact pass@'),('delivery_pass_at_k','delivery pass@'),('delivery_pass_power_k','delivery pass^')):
+                for k,v in group[key].items():
+                    value = 'unavailable' if v['value'] is None else f"{v['value']:.6f}"
+                    lines.append(f"| {label}{k} | {k} | {value} | {v['tasks_eligible']}/{v['tasks_total']} | {v['reason'] or '-'} |")
+            lines += ['', '| Case | n planned | n started | Artifact successes | Delivery successes | Unknown artifact / delivery |',
+                      '| --- | ---: | ---: | ---: | ---: | --- |']
+            for c in group['case_results']:
+                lines.append(f"| {c['case_id']} | {c['n_planned']} | {c['n_started']} | {c['c_artifact']} | {c['c_delivery']} | {c['unknown_artifact']}/{c['unknown_delivery']} |")
+            lines += ['', 'Success histograms: '+json.dumps(group['success_histograms'],sort_keys=True), '',
+                      '| Subset | Channel / field | observed / missing | Strict sum | Mean | Median | P90 | P95 | Max |',
+                      '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+            for subset in ('all_started','successful','unsuccessful','unknown_outcome'):
+                e=group['efficiency'][subset]
+                fields=[(f'{channel}/{field}',v) for channel in ('main','summary') for field,v in e[channel].items() if field!='cache_ratio']
+                fields += [('timings/'+field,v) for field,v in e['timings'].items()]
+                fields += [(field,e[field]) for field in ('legacy_eval_duration_ms','rounds','tool_calls','retries')]
+                for field,v in fields:
+                    cells=['unavailable' if v[f] is None else str(v[f]) for f in ('strict_sum','mean','median','p90','p95','max')]
+                    lines.append(f"| {subset} | {field} | {v['observed']}/{v['missing']} | "+' | '.join(cells)+' |')
+            lines += ['', 'Main reported tokens per delivery success: '+json.dumps(group['efficiency']['main_reported_tokens_per_delivery_success']),
+                      'Main cache coverage: '+json.dumps(group['efficiency']['all_started']['main']['cache_ratio'])]
+    return '\n'.join(lines)+'\n'
 
 
 def _safe_optional_count(value: int | None) -> int | None:

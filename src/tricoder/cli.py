@@ -158,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="声明允许变化的实验变量，可重复指定",
     )
     eval_compare.add_argument("--no-color", action="store_true", help="关闭颜色")
+    eval_analyze = subparsers.add_parser("eval-analyze", help="离线重算 Eval 量化指标")
+    eval_analyze.add_argument("--result", type=Path, required=True)
+    eval_analyze.add_argument("--plan", type=Path)
+    eval_analyze.add_argument("--ks", nargs="+", default=[1, 2, 3])
+    eval_analyze.add_argument("--no-color", action="store_true", help="关闭颜色")
     run.add_argument("--max-rounds", type=int, help="最大模型调用轮数")
     run.add_argument("--max-context-chars", type=int, help="模型消息上下文最大字符数")
     run.add_argument("--timeout", type=float, help="API 与命令超时秒数")
@@ -246,6 +251,10 @@ def main(
         from tricoder.evals.compare import run_compare_command
 
         return run_compare_command(args, output=output)
+    if args.command == "eval-analyze":
+        from tricoder.evals.analysis import run_analyze_command
+
+        return run_analyze_command(args, output=output)
     if args.command is None or args.command == "chat":
         return _run_chat(
             args,

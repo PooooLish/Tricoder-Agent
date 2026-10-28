@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
@@ -15,7 +16,7 @@ from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.process.control import run_bounded_process
 
 from .loader import is_reserved_eval_path, is_workspace_relative_path
-from .models import EvalCase, EvalSuite, PathMatchMode, VerificationSpec
+from .models import EvalCase, EvalSuite, PathMatchMode, VerificationSpec, TrialTimings
 from .output import validate_run_directory
 from .workspace import (
     FileFingerprint,
@@ -57,6 +58,7 @@ class EvalCaseResult:
     verifications: tuple[VerificationResult, ...]
     agent_verification: str
     usage: TokenUsage | None
+    timings: TrialTimings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +132,41 @@ def _run_case(
     audit_root: Path,
     agent_executor: AgentExecutor,
 ) -> EvalCaseResult:
+    observation = _TimingObservation()
+    result = _run_case_observed(case, workspaces_root, audit_root, agent_executor, observation)
+    return replace(result, timings=observation.finish())
+
+
+class _TimingObservation:
+    """Monotonic observations only; never a resource owner or deadline."""
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter_ns()
+        self.agent_ns = 0
+        self.verifier_ns = 0
+
+    @contextmanager
+    def phase(self, field: str):
+        started = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            setattr(self, field, getattr(self, field) + time.perf_counter_ns() - started)
+
+    def finish(self) -> TrialTimings:
+        total = (time.perf_counter_ns() - self.started) // 1_000_000
+        agent = self.agent_ns // 1_000_000
+        verifier = self.verifier_ns // 1_000_000
+        return TrialTimings(total, agent, verifier, total-agent-verifier)
+
+
+def _run_case_observed(
+    case: EvalCase,
+    workspaces_root: Path,
+    audit_root: Path,
+    agent_executor: AgentExecutor,
+    observation: _TimingObservation,
+) -> EvalCaseResult:
     started = time.perf_counter()
     workspace: Path | None = None
     run_result: RunResult | None = None
@@ -158,6 +195,7 @@ def _run_case(
             before=before,
             audit_root=audit_root,
             agent_executor=agent_executor,
+            observation=observation,
         )
     finally:
         try:
@@ -184,17 +222,19 @@ def _run_prepared_case(
     before: dict[str, FileFingerprint],
     audit_root: Path,
     agent_executor: AgentExecutor,
+    observation: _TimingObservation,
 ) -> EvalCaseResult:
     run_result: RunResult | None = None
     modified_files: tuple[str, ...] = ()
     verifications: tuple[VerificationResult, ...] = ()
 
     try:
-        run_result = agent_executor(
-            case,
-            workspace,
-            audit_root / f"{case.id}.jsonl",
-        )
+        with observation.phase("agent_ns"):
+            run_result = agent_executor(
+                case,
+                workspace,
+                audit_root / f"{case.id}.jsonl",
+            )
     except Exception:
         return _case_result(
             case,
@@ -229,10 +269,11 @@ def _run_prepared_case(
         )
 
     try:
-        install_verifier(case, workspace)
-        verifications = tuple(
-            _run_verification(spec, workspace) for spec in case.verifications
-        )
+        with observation.phase("verifier_ns"):
+            install_verifier(case, workspace)
+            verifications = tuple(
+                _run_verification(spec, workspace) for spec in case.verifications
+            )
     except (OSError, WorkspaceSafetyError):
         return _case_result(
             case,

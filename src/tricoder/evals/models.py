@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from tricoder.models import TokenUsage
@@ -136,6 +137,36 @@ class TrialKey:
 
 
 @dataclass(frozen=True, slots=True)
+class TrialTimings:
+    total_ms: int
+    agent_ms: int
+    verifier_ms: int
+    harness_ms: int
+
+    def __post_init__(self) -> None:
+        values = (self.total_ms, self.agent_ms, self.verifier_ms, self.harness_ms)
+        if any(type(v) is not int or v < 0 for v in values) or self.total_ms != sum(values[1:]):
+            raise ValueError("invalid trial timings")
+
+
+@dataclass(frozen=True, slots=True)
+class TrialPlanEntry:
+    key: TrialKey
+    execution_kind: ExecutionKind
+    category: str
+    split: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.key, TrialKey)
+            or any(type(v) is not str or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", v) is None
+                   for v in (self.key.condition_id, self.key.case_id, self.category))
+            or type(self.key.repetition) is not int or self.key.repetition < 1
+            or self.execution_kind not in ("quality", "contract")
+            or self.split not in ("dev", "holdout", "unknown")):
+            raise ValueError("invalid trial plan entry")
+
+
+@dataclass(frozen=True, slots=True)
 class TrialDimensions:
     """Trusted facts; ``None`` means not evaluated or not applicable."""
 
@@ -228,6 +259,8 @@ class TrialRecord:
     turn_results: tuple[EvalTurnRecord, ...] = ()
     first_failed_turn: int | None = None
     fault_evidence: tuple[tuple[str, str], ...] = ()
+    split: str = "unknown"
+    timings: TrialTimings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,3 +315,4 @@ class ExperimentRunReport:
     benchmark_version: str = "unknown"
     conditions: tuple[EvalCondition, ...] = ()
     fingerprints: tuple[tuple[str, str], ...] = ()
+    trial_plan: tuple[TrialPlanEntry, ...] = ()

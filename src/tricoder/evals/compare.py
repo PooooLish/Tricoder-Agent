@@ -16,6 +16,7 @@ from typing import Any
 from .models import TrialRecord
 from .output import reserve_run_directory, validate_run_directory
 from .report import trial_record_from_dict
+from .analysis import analyze_report_payload, parse_analysis_input
 
 
 _ALLOWED_VARIABLES = frozenset({"model", "provider", "memory", "faults", "code"})
@@ -141,7 +142,59 @@ def compare_report_payloads(
         "candidate_cost_per_success": None,
         "baseline_failure_distribution": _failure_distribution(baseline.trials),
         "candidate_failure_distribution": _failure_distribution(candidate.trials),
+        "quantification_comparison": _quantification_comparison(baseline_payload, candidate_payload),
     }
+
+
+def _quantification_comparison(left: dict, right: dict) -> dict[str, object]:
+    """Never compare selected successes or trust serialized precomputed scores."""
+    baseline = analyze_report_payload(left)
+    candidate = analyze_report_payload(right)
+    left_rows, left_plan, left_unresolved = parse_analysis_input(left)
+    right_rows, right_plan, right_unresolved = parse_analysis_input(right)
+    def schedule(plan):
+        return {(p.key.case_id, p.key.repetition): (p.execution_kind,p.category,p.split) for p in plan}
+    reason = ('incomplete_plan' if left_unresolved or right_unresolved
+              else 'missing_plan' if left_plan is None or right_plan is None
+              else 'unpaired_plan' if schedule(left_plan) != schedule(right_plan)
+              or {(r.key.case_id,r.key.repetition) for r in left_rows} != {(r.key.case_id,r.key.repetition) for r in right_rows}
+              else None)
+    lq, rq = baseline['quantification'], candidate['quantification']
+    lg = next(iter(lq['by_condition'].values()), None)
+    rg = next(iter(rq['by_condition'].values()), None)
+    deltas = {}
+    def difference(lv,rv,why=None,*,scale=1):
+        why=reason or why
+        return {'value':(rv-lv)*scale if why is None and lv is not None and rv is not None else None,
+                'reason':why or ('missing_observation' if lv is None or rv is None else None)}
+    for metric in ('artifact_pass_at_k','delivery_pass_at_k','delivery_pass_power_k'):
+        deltas[metric]={}
+        for k in lq['ks']:
+            l = lg['all_quality'][metric][str(k)] if lg else {'value':None,'reason':'not_applicable'}
+            r = rg['all_quality'][metric][str(k)] if rg else {'value':None,'reason':'not_applicable'}
+            deltas[metric][str(k)]=difference(l['value'],r['value'],l['reason'] or r['reason'],scale=100)
+    le = lg['all_quality']['efficiency'] if lg else None
+    re = rg['all_quality']['efficiency'] if rg else None
+    # Resource differences also require a completed, fully paired plan.
+    resource_reason = ('not_applicable' if lg is None or rg is None else 'incomplete_plan'
+                       if lg['all_quality']['coverage']['incomplete'] or rg['all_quality']['coverage']['incomplete'] else None)
+    for channel in ('main','summary','timings'):
+        fields = ('total_ms','agent_ms','verifier_ms','harness_ms') if channel=='timings' else (
+            'input_tokens','output_tokens','cached_tokens','cache_miss_tokens','reported_total_tokens')
+        deltas[channel]={}
+        for field in fields:
+            lv=le['all_started'][channel][field]['strict_sum'] if le else None
+            rv=re['all_started'][channel][field]['strict_sum'] if re else None
+            invalid_usage = channel in ('main','summary') and any(
+                e and e['all_started'][channel]['cache_ratio']['invalid'] for e in (le,re))
+            deltas[channel][field]=difference(lv,rv,resource_reason or ('invalid_usage' if invalid_usage else None))
+    for field in ('legacy_eval_duration_ms','rounds','tool_calls','retries'):
+        lv=le['all_started'][field]['strict_sum'] if le else None
+        rv=re['all_started'][field]['strict_sum'] if re else None
+        deltas[field]=difference(lv,rv,resource_reason)
+    return {'method':lq['method'],'baseline':lq,'candidate':rq,'reason':reason,'deltas':deltas,
+            'token_accounting':'provider_reported','billing_completeness':'unknown',
+            'token_comparison':'tokens_are_not_cross_model_monetary_costs'}
 
 
 def _load_comparable(payload: object) -> _ComparableReport:
@@ -171,6 +224,8 @@ def _load_comparable(payload: object) -> _ComparableReport:
         raise ComparisonError("trials are missing")
     try:
         parsed = tuple(trial_record_from_dict(item) for item in trials)
+        if any(row.key.condition_id != condition['id'] for row in parsed):
+            raise ValueError("trial condition identity mismatch")
     except ValueError as exc:
         raise ComparisonError("trial row is invalid") from exc
     return _ComparableReport(condition, safe_fingerprints, benchmark, parsed)
@@ -329,7 +384,7 @@ def _comparison_markdown(comparison: dict[str, object]) -> str:
     candidate = comparison["candidate_end_to_end"]
     if not isinstance(baseline, dict) or not isinstance(candidate, dict):
         raise ComparisonError("comparison metric is invalid")
-    return (
+    legacy = (
         "# Eval comparison\n\n"
         f"- Benchmark: {comparison['benchmark_version']}\n"
         f"- Paired: {comparison['paired']}\n"
@@ -340,6 +395,15 @@ def _comparison_markdown(comparison: dict[str, object]) -> str:
         f"- Percentage-point delta: {comparison['end_to_end_percentage_point_delta']}\n"
         f"- Improvements: {comparison['improvements']}\n"
         f"- Regressions: {comparison['regressions']}\n"
+    )
+    quantitative = comparison.get('quantification_comparison')
+    if quantitative is None:
+        return legacy
+    return legacy + '\n## Paired quantification\n\n' + (
+        'Pass deltas are percentage points. New timings and legacy_eval_duration_ms remain separate.\n'
+        'token_accounting=provider_reported; billing_completeness=unknown; tokens are not cross-model costs.\n\n'
+        'Unavailable values are null with a reason; descriptive distributions are in comparison.json.\n\n'
+        '```json\n' + json.dumps({'reason':quantitative['reason'],'deltas':quantitative['deltas']},indent=2) + '\n```\n'
     )
 
 
