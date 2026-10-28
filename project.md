@@ -1,5 +1,14 @@
 # Project: tricoder-cli
 
+## 2026-10-29 main集成阻塞：3.11两次CI失败及eval清理资源交接
+
+- Python3.12已按用户要求从CI移除。PR #1已推送三个提交，候选cca5535；main本地与远端仍为a81ec24，尚未合并。
+- 干净检出修复后，两次完整3.11 CI分别出现1失败（公开验证verification_error）与1错误（输出超限测试tearDown的WinError32目录占用）；均2259项、4跳过，编译步骤未执行。第一项本地连续50次通过，两个CI失败根因仍未证实。
+- 独立确认P2：evals/runner.py在无cleanup scope时丢弃返回值/异常携带的cleanup_resource；两路径注入均无人持有、cleanup调用0。该代码早于本轮，尚不能证明它就是CI目录占用根因。停止合并，不刷CI直至绿色；由coding session修复及补充诊断后再复审。
+- 详细报告、代码位置、验收要求和coding提示词：`docs/reviews/2026-10-29-main-integration-blockers.md`。全部新增证据位于runtime/mg28，最终integration-result.json状态为blocked。此次报告/交接更新仅本地文档提交，不推送触发额外无代码变更CI。
+- 原搜索共享期限P2不重新打开；本轮没有生产代码改动、题库改动或真实模型调用。以下历史记录完整保留，旧合入计划不代表执行成功。
+
+
 ## 2026-10-28 集成CI修复：按用户要求仅验证Python 3.11
 
 - PR #1首轮CI未通过，main尚未合入。3.11有428项FileNotFoundError，来自干净检出缺少runtime；另4项题库哈希失败来自Git自动LF→CRLF转换，2项Git helper测试模拟了非规范路径。3.12首轮也失败；用户明确表示不再需要3.12，故移除该CI矩阵项，不将其失败记为已修复。
