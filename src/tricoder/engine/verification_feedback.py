@@ -97,6 +97,7 @@ def build_batch_feedback(
     _add_blocking_checks(payload, state, check_coverage(
         state, state.evidence.after if state.evidence is not None else None,
     ).pending_paths)
+    _add_next_step_hint(payload, state)
     return _bounded_json(payload)
 
 
@@ -131,7 +132,44 @@ def finish_recovery_feedback(
     _add_blocking_checks(payload, state, pending_paths if pending_paths is not None else check_coverage(
         state, state.evidence.after if state.evidence is not None else None,
     ).pending_paths)
+    _add_next_step_hint(payload, state)
     return _bounded_json(payload)
+
+
+def _add_next_step_hint(payload: dict[str, object], state: AgentRunState) -> None:
+    """只补充受控建议，不创建证据、修改台账或重建命令。"""
+    if state.unknown_effects or state.cleanup_failed or state.verification_obligation == "legacy_unknown":
+        return
+    report = state.validation.report()
+    if state.verification_required and report.unresolved_check_ids:
+        payload["next_step_hint"] = "repair_blocking_checks"
+        return  # 保留失败检查 ID、同检查复验指引及优先级。
+    if payload.get("reason_code") == "zero_tests_reported":
+        payload["message"] = "零测试不等于验证通过；请修正测试发现方式或补充必要测试，再执行有效检查。"
+        return
+    if report.status == "stale" or state.failed_snapshot is not None:
+        return
+    if payload.get("verification_obligation") == "satisfied":
+        payload["next_step_hint"] = "finish_if_task_complete"
+        payload["message"] = "当前验证义务已满足；若用户任务也已完成，请显式调用 finish。"
+        return
+    scope, evidence = state.verification_scope, state.evidence
+    trusted_success = bool(
+        isinstance(scope, VerificationScope) and scope.owns(evidence)
+        and evidence.after.complete and evidence.is_valid_for(evidence.after)
+        and all(scope.owns_check(r) for r in state.validation.current_records(evidence.after.digest))
+    )
+    # 收尾纠正已经由 assess_finish 核验；普通批次只对当前可信成功检查提示覆盖。
+    if (payload.get("verification_obligation") == "pending"
+            and (payload.get("reason_code") == "missing_relevant_verification"
+                 or (trusted_success and payload.get("reason_code") == "verification_obligation_pending"))):
+        payload["next_step_hint"] = "verify_pending_paths"
+        payload["message"] = (
+            "当前验证覆盖仍不足，任务尚未结束；读文件不能解除 pending_paths。"
+            "若项目使用 unittest，可从工作区根目录运行 python -m unittest discover -v；"
+            "或在必要业务测试通过后补相关路径的语法/静态检查。语法检查不替代业务测试。"
+            "以上仅为条件示例，不是证据或自动执行；检查后再改文件需重新检查，最后显式 finish。"
+        )
 
 
 def _add_blocking_checks(

@@ -1,0 +1,24 @@
+id = "sf-csv-records"
+title = "sf-csv-records"
+task = "csv_records.parse_records(text)解析合法CSV，默认excel方言（与csv.reader一致），逗号分隔、双引号引用及双写转义，CRLF/LF及引号内换行、空字段；空文档[]；不要求非法CSV容错。"
+allowed_changes = ["csv_records.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "single_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+expose_edit_scope = true
+path_match_mode = "workspace_root"
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "csv_records.parse_records(text)解析合法CSV，默认excel方言（与csv.reader一致），逗号分隔、双引号引用及双写转义，CRLF/LF及引号内换行、空字段；空文档[]；不要求非法CSV容错。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

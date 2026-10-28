@@ -710,6 +710,14 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 ## Eval
 
+Eval 新增按 condition/case/repetition 统计的产物/完整交付 pass@k、完整交付 pass^k、
+token 分布与失败摊销、Eval 阶段耗时。`eval-analyze --result <result.json> [--plan <plan.json>]`
+可离线重算旧结果，不加载配置或调用模型；默认 k=1/2/3，缺计划、缺测或样本不足会明确
+显示不可用。口径、兼容与使用方法见 [量化指标说明](docs/eval-quantitative-metrics.md)。
+旧指标及评分不变，token 不等同费用，新阶段时间不从历史 duration 推断。
+
+新增 [`evals/quality-v3.1/`](evals/quality-v3.1/README.md) 作为公开验证指引版本：30题首选根目录 `python -m unittest discover -v`，再按宿主 pending/blocking 反馈补检查并显式 finish。业务定义、公私测试、16/16000、split 与四维AND不变；旧V3及历史成绩保留。2026-10-28真实30题×3次复测：产物88/90、完整交付86/90，仍有两次范围违规及两次Provider请求中断；详见[复测报告](docs/reviews/2026-10-28-quality-v31-repeat3-real-rerun.md)。跨版本结果不能直接归因为Agent改进。
+
 新 [`evals/quality-v3/`](evals/quality-v3/README.md) 提供 **30 道 quality、0 道 contract**
 （原19题优化+新增11题），22 dev / 8 holdout。每 user_turn 16轮、16000上下文字符；
 四份实验清单 planned_trials 为30/90/22/8。旧19题全部归dev，已用于诊断的旧holdout

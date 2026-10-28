@@ -1,5 +1,94 @@
 # TriCoder Reviewer 会话交接
 
+## 2026-10-28 main 集成记录：量化指标与交付指引
+
+- 用户明确授权合入main。集成分支`codex/eval-metrics-delivery-guidance`；按“评测量化指标”和“交付指引及quality-v3.1”两个逻辑提交打包，经PR的Windows/Python 3.11、3.12 CI验证后合入。实际PR、CI、提交与合入状态保存在`runtime/mg28/integration-result.json`；该收据及Git历史为执行结果依据。
+- 合入前重新独立运行全量2259项：2244通过、15跳过、0失败，unittest632.117秒、进程639.078秒；compileall退出0。日志单独保存在`runtime/mg28/`，未覆盖旧验证记录。生产/测试/题库1030文件仍与已复审、已真实复测版本一致。
+- 明确选择249个项目文件，包含23个已有修改及226个新增文件；不纳入凭据、数据库、runtime日志和缓存。定向高置信凭据模式扫描无命中，但不是穷尽安全审计。CRLF及56份从旧V3字节继承的fixture末尾空行保留，没有尾随空格或Tab；不为格式告警破坏题库来源哈希。
+- 真实质量结论仍为产物88/90、完整86/90；两次范围违规与两次Provider失败没有在本次集成中修复，不声明整体质量或速度提高。README同步最新真实结论。后续优先处理任务范围遵守与安全Provider错误分类；不放宽权限、判题范围或自动推进Replan。
+- 本次集成不新增真实模型调用、不安装本机依赖、不读取真实凭据或用户数据库，不删除既有工作树和证据；以下历史记录保留。
+
+
+## 2026-10-28 quality-v3.1 真实30×3复测完成：86/90完整交付
+
+- 用户授权后一次性运行30题×3，无选择性补跑。DeepSeek deepseek-v4-flash，16轮/user_turn、16000、memory off/off；run `20261028t131121.505118z`，complete=true、90/90执行，原生exit1因4条失败。报告：`docs/reviews/2026-10-28-quality-v31-repeat3-real-rerun.md`；证据：`runtime/quality-v31-repeat3-real-20261028/`。
+- 产物88/90、完整交付86/90、范围88/90、清理90/90。完整pass@1/2/3=95.5556%/98.8889%/100%；pass^1/2/3=95.5556%/92.2222%/90%。27题3/3，cf-price-discount与dl-regression各2/3，sf-unique-stable为1/3。
+- 已报告输入3,006,833、输出162,055，总3,168,888 token；平均35,209.87/次，成功摊销36,847.53。整批62.6977分钟，单次平均41.793秒、P95 73.232秒。796条Provider用量（101条规划）与90trial求和一致，但失败请求账单完整性仍未知。
+- 失败#43：主动创建范围外collection_ops.py.new（placeholder）；#67：给只读checkout.py增加docstring。独立范围匹配与原生一致，原/反事实副本业务测试通过，原分数不改。#54、#73：ProviderError导致未成功修改；工作区hash等于初始fixture，独立副本公开/隐藏检查仍失败，无题目故障注入。审计缺code/retryable/请求阶段，不能确定超时、网络或清理等具体细类；不得把消息长度作为根因证据。
+- 旧失败题sf-aware-time-order为11/9/11轮、rc-search-truncated为7/7/10轮，本轮6/6通过。finish验证恢复47→0，轮数908→697，工具调用1290→1016。相比旧V3，token减少30.78%，耗时增加30.54%，完整率87/90→86/90；同时改变Agent与公开指引，仅作描述性对照，未跑V3 Agent-only，不宣称因果收益。
+- 独立组合枚举/资源统计/耗时守恒与原生一致，离线eval-analyze一致。90工作区/90审计Session隔离；1030源码/测试/脚本/题库、325冻结文件、21,436历史证据hash未变。四个失败均单独留证，不读用户库/手动读取凭据，不安装/提交/推送，无生产代码/测试/题库修改。
+- 下一步建议针对任务范围遵守、交付前变更核对和安全Provider错误分类补齐诊断；四个失败均不支持放宽默认权限。具体修复待用户交coding session；不自动修改评分、复跑或推进Replan。原搜索P2维持此前关闭结论。保留以下所有历史原文。
+
+
+## 2026-10-28 交付效率与验证指引：独立复审通过
+
+- 本轮约定范围通过，未发现新增阻塞问题。报告：`docs/reviews/2026-10-28-quality-delivery-guidance-fixes-rereview.md`；独立证据：`runtime/dgr28/`。真实质量收益尚未验证，旧90次仍artifact90/90、delivery87/90。
+- 928 actual before/1138 after/当前核对一致，210新增+16修改，0删除；before中821源码文件与reviewer旧hash吻合。5生产文件增量符合范围；旧测试的位置/序号适配保留安全/配对/失败语义。
+- reviewer独立全量2259项：2244通过、15skip、0失败/错误、exit0，828.778秒，含全部Eval577项。V3.1 30Runtime/34turn/31非零公共发现及151变体（50接受/101拒绝）收据独立核对；额外8,256预算时点、四组逐轮provider锚、before/current各9组生命周期差分通过；八dry-run仍旧/新各30/90/22/8。
+- 1030源码/测试/脚本/题库、561旧eval（V3 204）、1061指定历史与19,961早期历史hash保持；原搜索P2延迟恢复/owner回归随全量通过，维持关闭。其他平台与15项skip未覆盖，真实模型未跑，不宣称收益。
+- 下一步：用户若另行授权，分别保留V3 Agent-only与V3.1指引变化的真实结果；当前不自动调用。reviewer未改生产/测试/题库、不读凭据或用户库、不安装/提交/推送，不推进Replan。保留以下历史原文。
+
+
+
+## 2026-10-28 交付效率与验证指引修复：实现完成，待独立复审
+
+- 按A→B→C→D完成：四类补丁结构/计数错误的精确read/edit替代建议、已有文件按需回读、追加式执行预算消息（16轮1/14/15/16，kind=protocol_feedback）及当前可信覆盖不足下一步提示。未改解析/审批、默认权限/预算、完成门禁、台账、owner或清理语义。
+- 新quality-v3.1继承30quality/0contract、22dev/8holdout、16/16000及四维AND；30README首选根目录unittest discovery。旧V3的204文件及全部旧eval561文件字节保留。
+- 新套件专项183项通过，30真实Runtime链路共34 user_turn、31次公共检查；125+26变体与八例重放预期一致。原27专项本轮重跑通过，新增预算/交付专项16项通过；全部Eval577项575通过+2skip。最终全量2259项2244通过+15skip、0失败/错误、exit0。首轮全量20失败断言+1索引错误均为新增预算后的旧位置/序号假设，按保留原断言语义适配后重跑；首次长cwd基础设施错误和其他中间失败日志完整保留。
+- 八dry-run为旧/新各30/90/22/8；git diff --check与actual before/after/hash/delta见证据。证据根runtime/quality-delivery-guidance-fixes-20261027/implementation-c1c5dafe99/，报告docs/reviews/2026-10-27-quality-delivery-guidance-fixes-implementation.md。历史1061份普通证据hash未变，180个运行锁文件未读取/未hash。
+- 旧真实结果仍产物90/90、完整87/90；本轮无模型调用，不宣称收益，不追认oracle为交付。Windows平台skip和其他平台/真实模型收益未验证。未读凭据/用户库、安装、提交推送或派生Agent。下一步仅交独立reviewer；保留以下所有历史结论，不自动复测或推进Replan。
+
+
+## 2026-10-27 交付效率与验证指引修复方案已交付（尚未实施）
+
+- 用户要求针对30×3真实复测问题，提供结合代码的修复文档与coding提示词。方案：`docs/superpowers/plans/2026-10-27-quality-delivery-guidance-fixes.md`；提示词：`docs/superpowers/plans/2026-10-27-quality-delivery-guidance-fixes-coding-prompt.md`。
+- 基线不改：产物90/90、完整87/90，三个失败均16轮耗尽。拟增强写入错误替代建议、首轮及剩余≤3轮的追加式预算提示、覆盖不足的下一步反馈，并新建quality-v3.1公开指引版本。保持旧V3、16/16000、权限、验证台账/覆盖/finish上限、hidden及四维AND不变。
+- 特别约束：预算JSON type=execution_budget，但message.kind复用protocol_feedback，防止ContextManager过滤并沿用摘要排除规则；不重写固定system/历史消息或破坏usage锚。独立builder check两个草稿缺口已修订并复核。
+- 当前代码核查：821份源码/测试/脚本/题库与真实复测版本相同；30题README首选定向tests。4组专项共27项通过、0失败/错误；命令覆盖与消息kind探针符合预期。证据：`runtime/quality-delivery-guidance-plan-20261027/`。这些是实施前基线，不是未来GREEN或真实收益证明。
+- 下一步：用户将提示词交coding session按A/B/C/D实施；actual before快照、RED/GREEN、真实工具/Runtime离线链路、新旧题库保全、全量检查后交独立reviewer。此次仅文档/证据/交接更新，生产和题库无修改，不调用真实模型、不读凭据/用户库、不安装/提交/推送。不自动推进Replan；后续真实实验需另行授权。
+
+
+
+## 2026-10-27 Quality V3真实30×3复测完成
+
+- 用户明确授权后，以冻结且复审通过版本执行DeepSeek deepseek-v4-flash、30题各3次、16轮/user_turn、off/off、seed23。90个唯一试次完成，无取消/未跑，产物90/90、完整87/90，scope/cleanup见报告；不选择性补跑。
+- 完整交付pass@1/2/3：96.6667% / 98.8889% / 100.0000%；pass^1/2/3：96.6667% / 94.4444% / 93.3333%。main token 4,577,776，整批48.03分钟；独立枚举/资源重算与原生指标一致。
+- 报告：`docs/reviews/2026-10-27-quality-v3-repeat3-real-rerun.md`；证据：`runtime/quality-v3-repeat3-real-20261027/`；原生run `20261027t055018.826595z`。821源码/测试/脚本/题库、323冻结文件、19,961旧证据hash保持，90独立工作区与Session隔离核对。
+- 已分析失败为sf-aware-time-order第2/3次及rc-search-truncated第3次：产物通过但16轮耗尽；工具协议纠错和较晚满足验证覆盖消耗交付预算。独立副本9项、12项×2及11项×2测试通过，不追认交付。README的-s tests命令与宿主按路径覆盖衔接不足已通过生产分类/覆盖函数复现；准确历史argv仍未知，不声称完整Runtime因果重放。
+- 后续建议改善工具策略/预算分配及评测公开验证指引，保持隐藏验收/四维AND；本轮不实施，不提高默认权限，不自动推进Replan。指标复审与原搜索P2等历史关闭结论保留。有限3次单模型观测不宣称统计显著收益或无缺陷。
+- 本轮授权已完成；未新增生产/题库修改、读取凭据正文/用户数据库、安装、提交/推送。无需自动继续真实调用；未来实验由用户另行指定。
+
+
+
+## 2026-10-27 Eval量化指标：独立复审通过
+
+- 本包约定范围通过，无新增阻塞发现；报告 `docs/reviews/2026-10-27-eval-quantitative-metrics-rereview.md`。以916份actual before对924份after/当前核对，18文件增量符合范围；821份源码/测试/脚本/题库与19,739份历史证据hash未变。
+- reviewer本轮独立全量2060项：2045通过、15skip、0失败/错误、exit0，799.824秒；全部Eval 394项包含其中。另9项独立探针（1,456次枚举公式对照及三值/缺样本/usage/输入边界）、before/current各7组生命周期回放、25项旧比较字段差分均通过；新证据 `runtime/eval-metrics-20261027/review-20261027/`。
+- 四dry-run仍30/90/22/8；历史30题离线oracle与CLI一致：产物29/30、完整27/30、main token1,414,748，高阶指标因n=1不可用，旧split/阶段时间保持unknown/null。没有真实调用或新增质量收益证据。
+- 实施方首次全量Runtime前置检查/Windows锁清理偶发失败未在本轮独立全量复现，根因仍未确认，不称已修复。平台skip、其他环境、真实重复/费用/账单完整性均未验证。
+- Q3-R1/R2/R3及原搜索P2维持关闭，5.2秒延迟恢复、取消/清理/已有期限/普通命令/owner回归随全量通过。本reviewer未改生产/测试/题库、权限或预算，未读凭据/用户数据库、安装或提交推送。
+- 本轮复审完成；真实90次重复仍需用户另行授权，不自动推进Replan或历史Agent交付修复。下面“待独立复审”等条目是历史记录，原文保留。
+
+
+
+## 2026-10-27 Eval量化指标：实现完成，待独立复审
+
+- 按Task1→5单会话离线完成quality整题pass@k/pass^k、条件隔离与严格计划分母、token分布/失败摊销、Eval阶段观测、兼容计划/报告、eval-analyze与严格配对比较。未改题库、Agent门禁/权限/预算，未运行真实模型、安装、读取真实凭据/用户数据库或提交推送。
+- 新专项33+9+17项通过；全部Eval394项=392通过+2skip。全量首轮2060项有1失败+2清理错误（同一Runtime测试）、15skip；定向1项及模块80项（79通过+1skip）通过后，同代码全量复跑2060项=2045通过+15skip，0失败/错误，exit0，483.069秒。首轮Runtime前置检查失败/Windows临时锁占用未稳定复现，原stop_reason未记录，根因未确认，保留供reviewer关注。
+- 四dry-run30/90/22/8；合成90行公式通过。旧2026-10-21原生结果只读重算为产物29/30、完整27/30、main token1,414,748；高阶指标因n=1不可用，split unknown、阶段时间null。没有新增真实样本或收益声明。
+- 证据：runtime/eval-metrics-20261027/implementation-1cefa5ed1d/；含916份actual before、全文件索引/hash、增量、RED/GREEN、独占日志、561题库文件与19,739历史证据保全。报告：docs/reviews/2026-10-27-eval-quantitative-metrics-implementation.md；口径：docs/eval-quantitative-metrics.md。
+- 原Q3-R1/R2/R3和搜索P2历史结论保留；本轮搜索5.2秒延迟恢复、清理失败停止/owner相关回归通过。下一步交独立reviewer，本记录不代替验收；90次真实重复需用户另行授权。Replan和真实交付遗留问题不在本包。
+
+
+## 2026-10-27 Eval量化指标方案已交付，待coding实施
+
+- 用户要求结合当前代码交付修改文档与coding提示词。已交付 `docs/superpowers/plans/2026-10-27-eval-quantitative-metrics.md` 与同名前缀 `-coding-prompt.md`，本reviewer仅写文档。
+- 范围：quality按condition/case/repetition的产物/完整pass@k及完整pass^k、未知/未跑严格口径、token分布与失败摊销、Eval阶段耗时、离线eval-analyze、兼容旧报告及严格配对比较。保留现有评分/权限/预算/题库；本期不做金额、置信区间或Agent修复。
+- 设计检查补齐未知交付时摊销分母不可用、status与四维合法差异、跨条件名称的case/repetition配对。纯公式与2026-10-21历史结果重新核算一致；815份源码/测试/脚本/题库hash仍与上轮独立复审一致，无生产实施。
+- 文档验证证据：`runtime/eval-metrics-20261027/planning/verification.json`。没有真实模型调用或依赖安装，没有读取凭据/用户数据库、提交/推送；不把历史2001测试当本轮新测试。
+- 下一步coding按Task1→5离线实施、保留before与旧证据、完整验收后交独立reviewer。30×3清单只dry-run；历史30题调用授权已执行，后续90次真实重复基线须用户另行授权。Q3-R1/R2/R3和旧搜索P2关闭结论维持，Replan继续搁置。
+
+
 ## 2026-10-21 Quality V3真实30题基线完成
 
 - Q3-R1/R2/R3独立复审通过后执行此前条件授权。DeepSeek deepseek-v4-flash、30quality各1次、16轮、memory off/off、seed23，complete=true。产物29/30、完整27/30、范围30/30、清理30/30；失败turn原因{'verification_blocked': 1, 'model_incomplete': 1}。

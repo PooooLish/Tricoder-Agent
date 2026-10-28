@@ -249,8 +249,13 @@ class NativeTerminationRecoveryTests(unittest.TestCase):
         ).run("检查纠错反馈")
 
         self.assertTrue(result.ok)
-        first_feedback = provider.histories[1][-1]
-        second_feedback = provider.histories[2][-1]
+        for round_number, history in enumerate(provider.histories[1:], start=2):
+            self.assertEqual("protocol_feedback", history[-1].kind)
+            budget = json.loads(history[-1].content)
+            self.assertEqual("execution_budget", budget["type"])
+            self.assertEqual(round_number, budget["round_number"])
+        first_feedback = provider.histories[1][-2]
+        second_feedback = provider.histories[2][-2]
         self.assertIn("1/3", getattr(first_feedback, "content", "") or "")
         self.assertIn("2/3", getattr(second_feedback, "content", "") or "")
         self.assertIn("再次", getattr(second_feedback, "content", "") or "")

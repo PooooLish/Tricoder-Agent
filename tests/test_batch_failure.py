@@ -258,7 +258,9 @@ class BatchFailureTests(unittest.TestCase):
         self.assertTrue(turn.result.ok)
         self.assertEqual(2, len(provider.histories))
         messages = turn.context.messages
-        for index in (1, 3):
+        self.assertEqual("protocol_feedback", messages[1].kind)
+        self.assertEqual("execution_budget", json.loads(messages[1].content)["type"])
+        for index in (2, 4):
             self.assertTrue(LegacyJsonProtocol().complete_round(messages[index], messages[index + 1]))
 
     def test_b07_skipped_has_no_execution_or_observer_or_unsafe_audit(self):

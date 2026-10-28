@@ -412,8 +412,10 @@ class MemoryAgentIntegrationTests(unittest.TestCase):
         failed = hard_agent.run_with_context("继续", context)
         self.assertFalse(failed.result.ok)
         self.assertEqual(0, hard_provider.calls)
-        self.assertEqual(context.messages, failed.context.messages[:-2])
-        self.assertEqual("task", failed.context.messages[-2].kind)
+        self.assertEqual(context.messages, failed.context.messages[:-3])
+        self.assertEqual("task", failed.context.messages[-3].kind)
+        self.assertEqual("protocol_feedback", failed.context.messages[-2].kind)
+        self.assertEqual("execution_budget", json.loads(failed.context.messages[-2].content)["type"])
         self.assertEqual("task_termination", failed.context.messages[-1].kind)
 
     def test_business_failure_after_successful_compaction_does_not_restore_covered_history(self) -> None:

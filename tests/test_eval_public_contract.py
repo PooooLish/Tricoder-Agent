@@ -101,7 +101,7 @@ class EvalPublicContractTests(unittest.TestCase):
             self.assertEqual(2, len(histories))
             for index, history in enumerate(histories):
                 users = [m.content for m in history if m.role == "user"]
-                current = users[-1]
+                current = [m.content for m in history if m.kind == "task"][-1]
                 self.assertIn("tests/*.py", current)
                 self.assertNotIn("NEVER_INSERT_LATER", "\n".join(users))
                 if index == 0:

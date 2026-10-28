@@ -43,7 +43,7 @@ def write_files(workspace, files):
         path.write_text(content, encoding="utf8", newline="\n")
 
 
-def isolated(case, label, files, *, ok=True, executor=None, public=False):
+def isolated(case, label, files, *, ok=True, executor=None, public=False, workspace_prefix=None):
     """Capture real subprocess receipts, including counts discarded by score API."""
     receipts = []
     real = runner.run_bounded_process
@@ -74,7 +74,8 @@ def isolated(case, label, files, *, ok=True, executor=None, public=False):
     target = os.environ.get("TRICODER_V3_EVIDENCE")
     if target:
         root=Path(target); root.mkdir(parents=True,exist_ok=True)
-        temporary=tempfile.TemporaryDirectory(prefix=case.id+"-"+label+"-",dir=root)
+        temporary=tempfile.TemporaryDirectory(
+            prefix=workspace_prefix if workspace_prefix is not None else case.id+"-"+label+"-", dir=root)
     else:
         temporary=tempfile.TemporaryDirectory(prefix="tricoder-v3-",dir=ROOT/"runtime")
     with temporary as directory, patch.object(runner,"run_bounded_process",side_effect=record):

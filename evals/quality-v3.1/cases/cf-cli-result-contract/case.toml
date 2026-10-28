@@ -1,0 +1,24 @@
+id = "cf-cli-result-contract"
+title = "cf-cli-result-contract"
+task = "cli.main(argv)->int及python cli.py入口：恰好两个必需整数参数，成功stdout一行十进制和、stderr空、退出0；缺失/非法参数返回及退出2、stdout空、stderr非空诊断；支持负整数。main应返回码而非抛SystemExit，模块入口负责退出。arithmetic.add已经正确且只读。"
+allowed_changes = ["cli.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "cross_file"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+expose_edit_scope = true
+path_match_mode = "workspace_root"
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "cli.main(argv)->int及python cli.py入口：恰好两个必需整数参数，成功stdout一行十进制和、stderr空、退出0；缺失/非法参数返回及退出2、stdout空、stderr非空诊断；支持负整数。main应返回码而非抛SystemExit，模块入口负责退出。arithmetic.add已经正确且只读。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

@@ -246,7 +246,7 @@ class EditFileTool(_FileWriteTool):
 
 class CreateFileTool(_FileWriteTool):
     name = "create_file"
-    description = "仅创建新的 UTF-8 文件；已存在文件先 read_file 再 edit_file/apply_patch。缺父目录时用 create_parents=true 或先 create_directory。"
+    description = "仅创建新的 UTF-8 文件；已存在且当前内容已知时用 edit_file/apply_patch，仅在内容未知或已变化时 read_file。缺父目录时用 create_parents=true 或先 create_directory。"
     parameters = ToolHandler._schema(
         {
             "path": {"type": "string"},
@@ -299,8 +299,8 @@ class CreateFileTool(_FileWriteTool):
             if ordinary_file:
                 return tool_failure(
                     ErrorCode.INVALID_ARGUMENT,
-                    "create_file 仅创建新文件；目标普通文件已存在。请先 read_file，"
-                    "再使用 edit_file 或 apply_patch 修改。",
+                    "create_file 仅创建新文件；目标普通文件已存在。当前内容已知时可直接使用 edit_file"
+                    "（old_text 非空、精确且唯一）或 apply_patch；仅在内容未知或已变化时 read_file。",
                     detail_code="file_already_exists",
                 )
             return tool_failure(ErrorCode.POLICY_DENIED, "create_file 的目标文件已存在，拒绝覆盖")
@@ -522,6 +522,14 @@ def _patch_feedback(error: PatchError) -> str:
     message = _PATCH_FEEDBACK[error.detail_code]
     if error.diagnostics:
         message += " 确定的计数：" + "，".join(f"{key}={value}" for key, value in error.diagnostics)
+    if error.detail_code in {
+        "patch_invalid_header", "patch_invalid_hunk", "patch_count_mismatch", "patch_invalid_format",
+    }:
+        message += (
+            " 不要原样重复失败补丁。单文件小范围修改且已知当前已读内容时，改用 edit_file，"
+            "old_text 必须非空、精确且唯一；仅在内容未知或已变化时 read_file。"
+            "确需多文件原子修改时可修正格式和计数后继续 apply_patch。"
+        )
     return message
 
 

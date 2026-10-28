@@ -1,0 +1,722 @@
+[
+  {
+    "id": "sf-subtract",
+    "source_case": "evals/quality-v2.2/cases/sf-subtract",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "sf-subtract",
+    "requirements": {
+      "business_contract": "math_ops.subtract(a,b) 返回整数 a-b；覆盖正数、负数、零、相同值和大整数。",
+      "public_baseline": "math_ops.subtract(a,b) 返回整数 a-b；覆盖正数、负数、零、相同值和大整数。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-tail-boundary",
+    "source_case": "evals/quality-v2.2/cases/sf-tail-boundary",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "sf-tail-boundary",
+    "requirements": {
+      "business_contract": "sequence_ops.tail(values,count)：count是非负整数；末尾count项保序，0返回[]，超过长度返回全部，不修改输入；负count不评分。",
+      "public_baseline": "sequence_ops.tail(values,count)：count是非负整数；末尾count项保序，0返回[]，超过长度返回全部，不修改输入；负count不评分。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-empty-input",
+    "source_case": "evals/quality-v2.2/cases/sf-empty-input",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "sf-empty-input",
+    "requirements": {
+      "business_contract": "stats_ops.mean：数字列表空时0.0，否则真实平均值；支持混合正负、小数和单元素，不修改输入。",
+      "public_baseline": "stats_ops.mean：数字列表空时0.0，否则真实平均值；支持混合正负、小数和单元素，不修改输入。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-unique-stable",
+    "source_case": "evals/quality-v2.2/cases/sf-unique-stable",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "sf-unique-stable",
+    "requirements": {
+      "business_contract": "collection_ops.unique_stable：整数列表按首次出现顺序去重；支持空、全重复、非排序输入，不修改输入。",
+      "public_baseline": "collection_ops.unique_stable：整数列表按首次出现顺序去重；支持空、全重复、非排序输入，不修改输入。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-negative-boundary",
+    "source_case": "evals/quality-v2.2/cases/sf-negative-boundary",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "sf-negative-boundary",
+    "requirements": {
+      "business_contract": "limits.non_negative：整数负数返回0，0及正数原值。",
+      "public_baseline": "limits.non_negative：整数负数返回0，0及正数原值。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-price-discount",
+    "source_case": "evals/quality-v2.2/cases/cf-price-discount",
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "cf-price-discount",
+    "requirements": {
+      "business_contract": "pricing.final_price和checkout.total：非负price，discount_percent为0—100，返回price乘以剩余百分比；包括小数，不要求额外舍入。",
+      "public_baseline": "pricing.final_price和checkout.total：非负price，discount_percent为0—100，返回price乘以剩余百分比；包括小数，不要求额外舍入。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-parameter-validation",
+    "source_case": "evals/quality-v2.2/cases/cf-parameter-validation",
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "cf-parameter-validation",
+    "requirements": {
+      "business_contract": "validator.valid_quantity：输入为整数且不含bool；仅1—100有效。service.accept同步返回ok或invalid，不要求字符串转换。",
+      "public_baseline": "validator.valid_quantity：输入为整数且不含bool；仅1—100有效。service.accept同步返回ok或invalid，不要求字符串转换。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-module-interface",
+    "source_case": "evals/quality-v2.2/cases/cf-module-interface",
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "cf-module-interface",
+    "requirements": {
+      "business_contract": "api.display(first,last)按单空格连接并title；修复formatter与api实际调用契约，可修改其中一个或两个文件，不得以同名class冒充模块。",
+      "public_baseline": "api.display(first,last)按单空格连接并title；修复formatter与api实际调用契约，可修改其中一个或两个文件，不得以同名class冒充模块。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-update-caller",
+    "source_case": "evals/quality-v2.2/cases/cf-update-caller",
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "cf-update-caller",
+    "requirements": {
+      "business_contract": "calculator.multiply已正确且只读；只修report.product_line调用，返回product=<a*b>，支持负数和零。",
+      "public_baseline": "calculator.multiply已正确且只读；只修report.product_line调用，返回product=<a*b>，支持负数和零。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-backward-api",
+    "source_case": "evals/quality-v2.2/cases/cf-backward-api",
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "cf-backward-api",
+    "requirements": {
+      "business_contract": "converter.to_slug及旧slugify都保留：转小写并将连续空白分隔为单连字符，空字符串为空；client.route返回/docs/+slug。允许包装或别名。",
+      "public_baseline": "converter.to_slug及旧slugify都保留：转小写并将连续空白分隔为单连字符，空字符串为空；client.route返回/docs/+slug。允许包装或别名。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "rc-read-once",
+    "source_case": "evals/quality-v2.2/cases/rc-read-once",
+    "category": "recovery",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "rc-read-once",
+    "requirements": {
+      "business_contract": "parser.parse_number解析合法有符号十进制整数文本，支持首尾空白。模拟首次read_file失败属于工具信号，继续完成业务修复；不评分非法文本。",
+      "public_baseline": "parser.parse_number解析合法有符号十进制整数文本，支持首尾空白。模拟首次read_file失败属于工具信号，继续完成业务修复；不评分非法文本。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "synthetic_tool_result",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "rc-invalid-args",
+    "source_case": "evals/quality-v2.2/cases/rc-invalid-args",
+    "category": "recovery",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "rc-invalid-args",
+    "requirements": {
+      "business_contract": "normalize.normalize字符串首尾去空白并小写，内部空白保留，空白串为空。首次写操作错误为模拟注入信号，不表示实际参数有误；修复业务即可。",
+      "public_baseline": "normalize.normalize字符串首尾去空白并小写，内部空白保留，空白串为空。首次写操作错误为模拟注入信号，不表示实际参数有误；修复业务即可。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "synthetic_tool_result",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "rc-provider-transient",
+    "source_case": "evals/quality-v2.2/cases/rc-provider-transient",
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "rc-provider-transient",
+    "requirements": {
+      "business_contract": "counter.increment：任何整数加1，包括负数、零、大整数。本题无故障注入，仅评分业务正确性；保留题ID用于追溯。",
+      "public_baseline": "counter.increment：任何整数加1，包括负数、零、大整数。本题无故障注入，仅评分业务正确性；保留题ID用于追溯。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "rc-search-truncated",
+    "source_case": "evals/quality-v2.2/cases/rc-search-truncated",
+    "category": "recovery",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "rc-search-truncated",
+    "requirements": {
+      "business_contract": "searcher.find_prefix(values,prefix)：ASCII前缀忽略大小写，保留原拼写、顺序及重复项；空前缀返回全部，空列表为空。首次匹配read_file/search_text/glob工具可能返回模拟OUTPUT_LIMIT，请根据工具反馈继续读取/搜索；不要在业务代码实现截断或第一次少返回。",
+      "public_baseline": "searcher.find_prefix(values,prefix)：ASCII前缀忽略大小写，保留原拼写、顺序及重复项；空前缀返回全部，空列表为空。首次匹配read_file/search_text/glob工具可能返回模拟OUTPUT_LIMIT，请根据工具反馈继续读取/搜索；不要在业务代码实现截断或第一次少返回。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "synthetic_tool_result",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "rc-patch-conflict",
+    "source_case": "evals/quality-v2.2/cases/rc-patch-conflict",
+    "category": "recovery",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "rc-patch-conflict",
+    "requirements": {
+      "business_contract": "tags.replace_tag(text,old,new)替换所有出现；old非空，new可为空，无匹配不变。首次写失败是模拟工具冲突，业务不包含重试计数。",
+      "public_baseline": "tags.replace_tag(text,old,new)替换所有出现；old非空，new可为空，无匹配不变。首次写失败是模拟工具冲突，业务不包含重试计数。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "synthetic_tool_result",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "mm-early-constraint",
+    "source_case": "evals/quality-v2.2/cases/mm-early-constraint",
+    "category": "memory",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "mm-early-constraint",
+    "requirements": {
+      "business_contract": "实现renderer.render(text,color)，输出[color]text[/color]；使用传入颜色，保留text原样。遵守前轮约束。",
+      "public_baseline": "记住约束：渲染器必须使用调用者传入的颜色，保留文本。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "mm-latest-correction",
+    "source_case": "evals/quality-v2.2/cases/mm-latest-correction",
+    "category": "memory",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "mm-latest-correction",
+    "requirements": {
+      "business_contract": "修正决定：config.select(initial,latest)始终选择latest，包含空字符串，不因假值回退initial。",
+      "public_baseline": "初始决定使用 red。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "mm-todo-once",
+    "source_case": "evals/quality-v2.2/cases/mm-todo-once",
+    "category": "memory",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "mm-todo-once",
+    "requirements": {
+      "business_contract": "tasks.pending_once(items,completed)：字符串列表排除completed并稳定去重；空集、全完成、非相邻重复；不修改输入列表和completed集合。",
+      "public_baseline": "记住已完成事项 a；后续任务不要将已完成事项当作待办。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "dl-regression",
+    "source_case": "evals/quality-v2.2/cases/dl-regression",
+    "category": "delivery",
+    "split": "dev",
+    "difficulty": "micro/regression",
+    "task_family": "dl-regression",
+    "requirements": {
+      "business_contract": "divide.divide(a,b)：b为0时None，否则真实除法a/b；保留正常除法、负数和0分子行为。",
+      "public_baseline": "divide.divide(a,b)：b为0时None，否则真实除法a/b；保留正常除法、负数和0分子行为。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-csv-records",
+    "source_case": null,
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "basic",
+    "task_family": "sf-csv-records",
+    "requirements": {
+      "business_contract": "csv_records.parse_records(text)解析合法CSV，默认excel方言（与csv.reader一致），逗号分隔、双引号引用及双写转义，CRLF/LF及引号内换行、空字段；空文档[]；不要求非法CSV容错。",
+      "public_baseline": "csv_records.parse_records(text)解析合法CSV，默认excel方言（与csv.reader一致），逗号分隔、双引号引用及双写转义，CRLF/LF及引号内换行、空字段；空文档[]；不要求非法CSV容错。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "sf-aware-time-order",
+    "source_case": null,
+    "category": "single_file",
+    "split": "dev",
+    "difficulty": "basic",
+    "task_family": "sf-aware-time-order",
+    "requirements": {
+      "business_contract": "time_order.sort_events(events)：记录timestamp为带Z或±HH:MM偏移的合法ISO8601时间；按UTC时刻升序，相同时稳定，空列表可用；不修改输入列表或记录内容。",
+      "public_baseline": "time_order.sort_events(events)：记录timestamp为带Z或±HH:MM偏移的合法ISO8601时间；按UTC时刻升序，相同时稳定，空列表可用；不修改输入列表或记录内容。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-config-precedence",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "dev",
+    "difficulty": "advanced",
+    "task_family": "cf-config-precedence",
+    "requirements": {
+      "business_contract": "settings.resolve(defaults,file_values,cli_values)合并为新dict：defaults < file < cli，只有缺键才回退，0/False/空串/None均是显式值，不修改任何输入；app.build_settings使用公开默认值port=8000,debug=False,label='app',token=None。",
+      "public_baseline": "settings.resolve(defaults,file_values,cli_values)合并为新dict：defaults < file < cli，只有缺键才回退，0/False/空串/None均是显式值，不修改任何输入；app.build_settings使用公开默认值port=8000,debug=False,label='app',token=None。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-cli-result-contract",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "cf-cli-result-contract",
+    "requirements": {
+      "business_contract": "cli.main(argv)->int及python cli.py入口：恰好两个必需整数参数，成功stdout一行十进制和、stderr空、退出0；缺失/非法参数返回及退出2、stdout空、stderr非空诊断；支持负整数。main应返回码而非抛SystemExit，模块入口负责退出。arithmetic.add已经正确且只读。",
+      "public_baseline": "cli.main(argv)->int及python cli.py入口：恰好两个必需整数参数，成功stdout一行十进制和、stderr空、退出0；缺失/非法参数返回及退出2、stdout空、stderr非空诊断；支持负整数。main应返回码而非抛SystemExit，模块入口负责退出。arithmetic.add已经正确且只读。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-record-schema-compat",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "cf-record-schema-compat",
+    "requirements": {
+      "business_contract": "records.normalize(record)及loader.load_records(text)：JSON列表，字段为字符串，v1 id/full_name、v2 id/name；输出只保留id/name；name存在时优先（包括空串）；缺两者抛ValueError，保留id、丢弃额外字段、不修改输入。",
+      "public_baseline": "records.normalize(record)及loader.load_records(text)：JSON列表，字段为字符串，v1 id/full_name、v2 id/name；输出只保留id/name；name存在时优先（包括空串）；缺两者抛ValueError，保留id、丢弃额外字段、不修改输入。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-page-merge",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "cf-page-merge",
+    "requirements": {
+      "business_contract": "pagination.merge_pages及service.collect：按页与页内顺序以整数id稳定去重，第一条完整记录胜出，空页不终止，空输入[]；不修改输入页或记录，无HTTP/cursor服务。",
+      "public_baseline": "pagination.merge_pages及service.collect：按页与页内顺序以整数id稳定去重，第一条完整记录胜出，空页不终止，空输入[]；不修改输入页或记录，无HTTP/cursor服务。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-package-api-migration",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "cf-package-api-migration",
+    "requirements": {
+      "business_contract": "textkit.core.normalize_label已实现strip+lower且只读；包textkit同时导出新normalize_label及旧clean_label，report.label_line使用新导出输出label=<结果>；修实际导入链，空串可用。",
+      "public_baseline": "textkit.core.normalize_label已实现strip+lower且只读；包textkit同时导出新normalize_label及旧clean_label，report.label_line使用新导出输出label=<结果>；修实际导入链，空串可用。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "dl-jsonl-line-diagnostics",
+    "source_case": null,
+    "category": "delivery",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "dl-jsonl-line-diagnostics",
+    "requirements": {
+      "business_contract": "jsonl_reader.parse_lines(text)->(records,error_lines)：空白物理行跳过但占行号；合法JSON对象保序，无效JSON及非对象JSON记1基行号并继续。cli.main(argv)及模块入口读取一个UTF-8文件，stdout单行JSON对象{records,error_lines}，有错误返回/退出1，否则0；不修改输入；不评分不存在文件等额外策略。",
+      "public_baseline": "jsonl_reader.parse_lines(text)->(records,error_lines)：空白物理行跳过但占行号；合法JSON对象保序，无效JSON及非对象JSON记1基行号并继续。cli.main(argv)及模块入口读取一个UTF-8文件，stdout单行JSON对象{records,error_lines}，有错误返回/退出1，否则0；不修改输入；不评分不存在文件等额外策略。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "mm-partial-revision",
+    "source_case": null,
+    "category": "memory",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "mm-partial-revision",
+    "requirements": {
+      "business_contract": "修正formatter.render(text,prefix)：正文strip后再lower；撤回prefix功能并忽略其值，但保留prefix参数签名和strip行为。完成并验证本轮修改。",
+      "public_baseline": "实现formatter.render(text,prefix)：返回prefix+text.strip()，正文保留大小写；本轮需要实际修改、验证并finish。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "cf-cache-copy-isolation",
+    "source_case": null,
+    "category": "cross_file",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "cf-cache-copy-isolation",
+    "requirements": {
+      "business_contract": "cache.RecordCache.put(key,value)/get(key)和service.load_record(cache,key)：key字符串，value为可嵌套JSON兼容dict/list；put后原值变化不污染缓存，get结果变化不污染下次get，不同key独立；缺失key抛KeyError；service调用get。",
+      "public_baseline": "cache.RecordCache.put(key,value)/get(key)和service.load_record(cache,key)：key字符串，value为可嵌套JSON兼容dict/list；put后原值变化不污染缓存，get结果变化不污染下次get，不同key独立；缺失key抛KeyError；service调用get。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  },
+  {
+    "id": "dl-order-summary-pipeline",
+    "source_case": null,
+    "category": "delivery",
+    "split": "holdout",
+    "difficulty": "advanced",
+    "task_family": "dl-order-summary-pipeline",
+    "requirements": {
+      "business_contract": "reader.read_orders(text)按CSV读取固定表头customer,amount,status为dict列表；totals.summarize(rows)及pipeline.build_report(text)只统计status恰为paid，amount是可带负号的整数字符串，按customer累加整数分；重复客户合并、空数据{}、其他状态忽略，customer按CSV原样保留（包括引号内逗号）；不涉及浮点货币、日期或网络。",
+      "public_baseline": "reader.read_orders(text)按CSV读取固定表头customer,amount,status为dict列表；totals.summarize(rows)及pipeline.build_report(text)只统计status恰为paid，amount是可带负号的整数字符串，按customer累加整数分；重复客户合并、空数据{}、其他状态忽略，customer按CSV原样保留（包括引号内逗号）；不涉及浮点货币、日期或网络。"
+    },
+    "verification_map": {
+      "business_contract": [
+        "Behavior.test_normal",
+        "Behavior.test_boundary",
+        "Behavior.test_regression"
+      ],
+      "public_baseline": [
+        "Behavior.test_public"
+      ]
+    },
+    "fault_evidence": "none",
+    "limitations": "合成小仓库；隐藏仅测公开输入域。多轮不证明长期记忆；模拟故障不等同真实传输故障。"
+  }
+]

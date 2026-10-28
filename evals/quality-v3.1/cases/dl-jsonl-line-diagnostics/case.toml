@@ -1,0 +1,24 @@
+id = "dl-jsonl-line-diagnostics"
+title = "dl-jsonl-line-diagnostics"
+task = "jsonl_reader.parse_lines(text)->(records,error_lines)：空白物理行跳过但占行号；合法JSON对象保序，无效JSON及非对象JSON记1基行号并继续。cli.main(argv)及模块入口读取一个UTF-8文件，stdout单行JSON对象{records,error_lines}，有错误返回/退出1，否则0；不修改输入；不评分不存在文件等额外策略。"
+allowed_changes = ["jsonl_reader.py", "cli.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "delivery"
+split = "holdout"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+expose_edit_scope = true
+path_match_mode = "workspace_root"
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "jsonl_reader.parse_lines(text)->(records,error_lines)：空白物理行跳过但占行号；合法JSON对象保序，无效JSON及非对象JSON记1基行号并继续。cli.main(argv)及模块入口读取一个UTF-8文件，stdout单行JSON对象{records,error_lines}，有错误返回/退出1，否则0；不修改输入；不评分不存在文件等额外策略。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

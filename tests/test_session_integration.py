@@ -370,9 +370,17 @@ class SessionIntegrationTests(unittest.TestCase):
                 )
             )
             self.assertEqual("system", histories[0][0].role)
-            self.assertEqual("task", histories[0][-1].kind)
-            for history in histories[1:]:
+            self.assertEqual("task", histories[0][-2].kind)
+            self.assertEqual("protocol_feedback", histories[0][-1].kind)
+            self.assertEqual("execution_budget", json.loads(histories[0][-1].content)["type"])
+            for round_number, history in enumerate(histories[1:], start=2):
                 with self.subTest(request_length=len(history)):
+                    if round_number >= 3:  # max_rounds=5: appended at 1/3/4/5.
+                        self.assertEqual("protocol_feedback", history[-1].kind)
+                        budget = json.loads(history[-1].content)
+                        self.assertEqual("execution_budget", budget["type"])
+                        self.assertEqual(round_number, budget["round_number"])
+                        history = history[:-1]
                     self.assertEqual("verification_feedback", history[-1].kind)
                     self.assertEqual("user", history[-1].role)
                     assistant, tool_result = history[-3:-1]

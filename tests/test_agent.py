@@ -32,6 +32,26 @@ from tricoder.providers import ProviderError, ProviderProtocolError
 from tricoder.tools import ToolContext, ToolRegistry
 
 
+def without_budget_feedback(messages):
+    """Assertion-only legacy view; actual Provider/history stays intact.
+
+    Validate new host entries before excluding them from old positional assertions.
+    Full requests, schedule and usage prefixes have dedicated regression tests.
+    """
+    result = []
+    for message in messages:
+        if message.kind == "protocol_feedback" and (message.content or "").startswith('{'):
+            payload = json.loads(message.content)
+            if payload.get("type") == "execution_budget":
+                assert message.role == "user"
+                assert message.message_seq is not None and message.task_id is not None
+                assert len(message.content) <= 800
+                assert payload["remaining_after_current"] == payload["max_rounds"] - payload["round_number"]
+                continue
+        result.append(message)
+    return result
+
+
 class CloseFailingBinding:
     """让真实目录绑定完成关闭后报告 OSError。"""
 
@@ -350,7 +370,7 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(self.tools.definitions, provider.tool_batches[0])
         self.assertEqual(self.tools.definitions, provider.tool_batches[1])
-        assistant, tool = provider.histories[1][-2:]
+        assistant, tool = without_budget_feedback(provider.histories[1])[-2:]
         self.assertEqual("assistant", assistant.role)
         self.assertEqual(("call-read",), tuple(call.id for call in assistant.tool_calls))
         self.assertEqual("tool", tool.role)
@@ -647,7 +667,7 @@ class NativeToolCallingTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertFalse((self.workspace / "leak.py").exists())
-        feedback = provider.histories[1][-1]
+        feedback = without_budget_feedback(provider.histories[1])[-1]
         self.assertEqual("user", feedback.role)
         self.assertIn("工具调用", feedback.content or "")
         self.assertNotIn("leak.py", feedback.content or "")
@@ -691,7 +711,7 @@ class NativeToolCallingTests(unittest.TestCase):
             "value = 2\n",
             (self.workspace / "sample.py").read_text(encoding="utf-8"),
         )
-        first_round = provider.histories[1]
+        first_round = without_budget_feedback(provider.histories[1])
         assistant_index = next(
             index
             for index, message in enumerate(first_round)
@@ -719,7 +739,7 @@ class NativeToolCallingTests(unittest.TestCase):
         recovered = CodingAgent(recovering, self.tools, max_rounds=2, plan_enabled=False).run("修正协议")
 
         self.assertTrue(recovered.ok)
-        feedback = recovering.histories[1][-1]
+        feedback = without_budget_feedback(recovering.histories[1])[-1]
         self.assertIn("协议", feedback.content or "")
         self.assertNotIn(protocol_sentinel, feedback.content or "")
 
@@ -733,7 +753,7 @@ class NativeToolCallingTests(unittest.TestCase):
         self.assertEqual(1, len(failing.histories))
         self.assertEqual(
             ["task", "task_termination"],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
 
     def test_provider_error_private_text_stays_out_of_public_agent_outputs(
@@ -818,7 +838,7 @@ class NativeToolCallingTests(unittest.TestCase):
         result = CodingAgent(provider, self.tools, max_rounds=2, plan_enabled=False).run("处理未知工具")
 
         self.assertTrue(result.ok)
-        assistant, tool = provider.histories[1][-2:]
+        assistant, tool = without_budget_feedback(provider.histories[1])[-2:]
         self.assertEqual("call-unknown", assistant.tool_calls[0].id)
         self.assertEqual("tool", tool.role)
         self.assertEqual("call-unknown", tool.tool_call_id)
@@ -913,7 +933,7 @@ class NativeToolCallingTests(unittest.TestCase):
                 plan_enabled=False,
                 ).run_with_context("继续任务", first.context)
 
-                reused = second_provider.histories[0]
+                reused = without_budget_feedback(second_provider.histories[0])
                 self.assertTrue(
                     any(
                         message.role == "tool"
@@ -1275,7 +1295,7 @@ class AgentTests(unittest.TestCase):
                 "tool_result",
                 "task_termination",
             ],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
         resumed_provider = ScriptedProvider([action("finish", {"summary": "继续完成"})])
         resumed = LegacyCodingAgent(resumed_provider, self.tools, max_rounds=2, plan_enabled=False).run_with_context(
@@ -1283,7 +1303,7 @@ class AgentTests(unittest.TestCase):
         )
         self.assertTrue(resumed.result.ok)
         self.assertTrue(
-            any(message.kind == "tool_result" for message in resumed_provider.histories[0])
+            any(message.kind == "tool_result" for message in without_budget_feedback(resumed_provider.histories[0]))
         )
 
     def test_audit_failure_after_finish_keeps_complete_turn(self) -> None:
@@ -1301,7 +1321,7 @@ class AgentTests(unittest.TestCase):
                 "tool_result",
                 "task_termination",
             ],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
 
     def test_tiny_budget_keeps_fixed_latest_and_drops_old_complete_history(self) -> None:
@@ -1321,7 +1341,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertTrue(completed.result.ok)
         self.assertEqual(1, len(provider.histories))
-        request = provider.histories[0]
+        request = without_budget_feedback(provider.histories[0])
         contents = [message.content for message in request]
         self.assertEqual("system", request[0].role)
         self.assertIn("持久化会话摘要", request[1].content)
@@ -1365,7 +1385,7 @@ class AgentTests(unittest.TestCase):
                 "verification_feedback",
                 "task_termination",
             ],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
         self.assertEqual("待验证", failed.context.verification)
@@ -1407,7 +1427,7 @@ class AgentTests(unittest.TestCase):
                 "verification_feedback",
                 "task_termination",
             ],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
         self.assertEqual("待验证", failed.context.verification)
@@ -1511,7 +1531,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertFalse(failed.result.ok)
         self.assertEqual(2, len(provider.histories))
-        second_request = provider.histories[1]
+        second_request = without_budget_feedback(provider.histories[1])
         self.assertIn(CONTEXT_COMPACTION_NOTICE, [m.content for m in second_request])
         self.assertEqual(
             ["task", "generic", "tool_result", "verification_feedback"],
@@ -1527,7 +1547,7 @@ class AgentTests(unittest.TestCase):
                 "tool_result",
                 "task_termination",
             ],
-            [message.kind for message in failed.context.messages],
+            [message.kind for message in without_budget_feedback(failed.context.messages)],
         )
         self.assertEqual(("sample.py",), failed.context.modified_files)
         self.assertEqual("待验证", failed.context.verification)
@@ -1550,8 +1570,8 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(second.result.ok)
         self.assertIsInstance(first.context.messages, tuple)
         self.assertGreater(len(second.context.messages), len(first.context.messages))
-        self.assertIn("用户任务：检查模块", provider.histories[0][1].content)
-        self.assertIn("用户任务：继续补测试", provider.histories[-1][-1].content)
+        self.assertIn("用户任务：检查模块", without_budget_feedback(provider.histories[0])[1].content)
+        self.assertIn("用户任务：继续补测试", [m for m in provider.histories[-1] if m.kind == "task"][-1].content)
         self.assertTrue(
             any(message.kind == "tool_result" for message in provider.histories[-1])
         )
@@ -1586,7 +1606,7 @@ class AgentTests(unittest.TestCase):
 
         agent.run_with_context("当前任务", context)
 
-        request = provider.histories[0]
+        request = without_budget_feedback(provider.histories[0])
         contents = [message.content for message in request]
         self.assertNotIn(early_task, contents)
         self.assertNotIn("过早动作", contents)
@@ -1612,7 +1632,7 @@ class AgentTests(unittest.TestCase):
 
         agent.run_with_context("当前任务", context)
 
-        contents = [message.content for message in provider.histories[0]]
+        contents = [message.content for message in without_budget_feedback(provider.histories[0])]
         self.assertEqual([LEGACY_SYSTEM_PROMPT, "用户任务：当前任务"], contents)
 
     def test_complete_external_history_is_kept_when_budget_fits(self) -> None:
@@ -1629,7 +1649,7 @@ class AgentTests(unittest.TestCase):
 
         agent.run_with_context("当前任务", context)
 
-        contents = [message.content for message in provider.histories[0]]
+        contents = [message.content for message in without_budget_feedback(provider.histories[0])]
         self.assertEqual(
             [
                 LEGACY_SYSTEM_PROMPT,
