@@ -1,5 +1,94 @@
 # TriCoder Reviewer 会话交接
 
+## 2026-10-29 已授权提交、最终 CI 与 main 合入
+
+- R4/P2独立复审通过后，用户明确授权提交并推送已复审修改，在最终提交的Windows3.11 CI通过后合并main，保留全部本地证据。
+- 集成前再次核对265个Python候选文件与冻结版本一致；新聚焦54项全部通过、0skip、exit0，compileall exit0。10676份历史安全证据哈希一致，50871个历史runtime文件建立元数据保全清单。
+- 本次提交包含19个已核对的源码、测试及审查/交接文档文件；runtime原始证据不进入Git。此前审查结论和历史CI根因限制继续保留。
+- 本条记录授权与提交前状态，不预先宣称CI或合并成功。最终提交、CI、合并SHA及保全结果记录在本地独占目录runtime/mg29-r4-7e8db912/，完成后见integration-result.md与final-verification.json；不删除分支、本地目录或历史证据。
+
+
+## 2026-10-29 R4/P2 独立复审通过
+
+- 独立审查当前未提交候选，**R4/P2关闭，未发现新P1/P2阻塞项**；原R1/R2/R3具体触发条件关闭状态保持。审查范围和历史限制见新报告，不以实施方自述替代验收。
+- 新独立运行：聚焦220通过/0skip；额外3个真实原生线程探针全部通过；隔离14项=13通过+1符号链接权限skip；合计237项=236通过+1skip，0失败/错误，全部exit0；compileall exit0。重点验证owner输出槽已写但DuplicateHandle未返回的中断、done/Python线程状态不能替代原生退出、普通命令不启动任务终止期限。
+- 同轮重放原搜索>=5.2秒、冷启动/输出超限10轮、R1 query/terminate各10轮、R3四取消场景及新observer六场景；未确认资源、primary、原期限、Eval阻断和失败粘性符合要求。
+- actual before384/after386/delta8、8936历史保护文件、1651实施安全证据及seal匹配；265候选Python文件与冻结副本一致；120其他生产文件不变。reviewer起始391文件亦核对，额外覆盖5个生成egg-info文本。数据库/缓存仅保留元数据，不读内容。
+- 实施方全量2312项=2297通过+15skip、exit0已核对原始日志及冻结字节；**本轮没有独立重跑全量，也没有新候选远端CI**。本轮只修改审查文档和独占runtime证据，保留所有历史正文和失败记录。
+- 报告：docs/reviews/2026-10-29-r4-observer-lifecycle-independent-review.md；新证据：runtime/ec29-r4review-c5d819a3/。HEAD仍d6d6c4c8245bdffc19cba03c37b2bfe316f7b448，本地main仍a81ec2457ece970756b00424393e5f2df9253858，未重新确认远端main；未提交、推送、合并。
+- 后续：等待明确集成指令；授权后提交准确候选并核对该SHA的Windows3.11 CI再决定合并。历史CI40721403072两次失败的精确根因仍不能确定；本机确定性探针不能证明全部中断组合、其他平台或硬实时边界。身份缺失/启动未知可保守pending。Python3.12不恢复，Skills/Replan不自动推进。
+
+
+## 2026-10-29 R4观察线程生命周期：实现完成，待独立复审
+
+- 本轮为coding实施，状态**R4实现完成，待独立复审**。原R4导致整体验收不通过的独立结论保留；原R1/R2/R3具体触发条件关闭状态保持，不自行关闭新发现。
+- 仅修改windows_job.py和必要control.py接线：显式启动尝试、worker自身DuplicateHandle精确不可继承身份、owner持有输出槽、ready/最终done及原生退出双证明。未知启动、Wait/Post/Close失败继续持有owner；正常ready消费原命令预算，不启动任务终止期限；本/父取消不被工厂吞掉。
+- 新增13个测试方法，含真实公开调用/迟到OpenProcess/二次中断/启动确认/ready取消，以及Eval持久owner四子场景。原Thread.start整体抛错fixture改为明确构造前失败，另测已尝试启动异常仍pending；不靠mock识别判断生产行为。
+- 本轮最终结果：聚焦220通过/0skip，201.347s；全量2312项=2297通过+15平台skip，0failure/error，1296.721s；compileall exit0。原R1两组各10轮、R3四真实取消、超限10轮/冷启动/搜索>=5.2s及owner回归均重新执行。不是沿用旧SHA/旧日志。
+- 报告：docs/reviews/2026-10-29-r4-observer-lifecycle-implementation.md；独占证据：runtime/ec29-r4fix-93fd44da/（RED/GREEN、before/after/delta/hash、逐命令/逐native收据、自审、最终验证与保护索引）。before384→after386，8文件增量；8936唯一安全保护文件保持，metadata-only库/缓存未读内容。
+- 冻结候选265源码/测试树SHA256：651577fb1ae1dc5cb73fd6b501489cabd4c905e7a3c1e682de30d360e787584f。HEAD仍d6d6c4c8245bdffc19cba03c37b2bfe316f7b448；本地main仍a81ec2457ece970756b00424393e5f2df9253858。本轮不提交/推送/合并，没有最终候选新远端CI；历史CI40721403072两次失败精确原因仍未知。
+- 限制：身份缺失/启动未知无法证明时保守pending；同步native/Thread.start内部不是新增可抢占硬实时边界。本机Windows/Python3.11.6验证，其他平台/自然Ctrl+C频率/所有故障组合未验证。未读真实配置/凭据/用户库、未安装/调用模型；未改题库/评分/权限/默认预算/TaskCleanup/Agent/Session/Replan/CI3.12。
+- 下一步：交独立reviewer检查线程退出与owner证明、重放新边界并核对最终字节。通过前禁止合并，通过后仍等明确推送/合并指令。以下历史正文保留。
+
+
+## 2026-10-29 R4/P2：修复文档与coding提示词已交付
+
+- 本轮仅编写文档，未修改生产代码/项目测试，未重跑产品测试、提交、推送或合并；R4仍未关闭，原R1/R2/R3具体触发条件关闭状态保持。
+- 完整计划：docs/superpowers/plans/2026-10-29-r4-observer-lifecycle-fix.md；可复制提示词：docs/reviews/2026-10-29-r4-observer-lifecycle-coding-prompt.md。以最新独立复审及四个有效探针为输入，明确启动结果未知、join中断状态失真、迟到句柄、owner/期限、原异常和Eval执行阻断验收。
+- 推荐先验证worker自身取得精确原生线程句柄的方案；done握手不是单独的OS退出证明。计划特别要求区分旧Thread.start异常fixture中的明确未启动与启动未知，并防止新增ready取消被工厂except Exception吞成普通初始化失败。新等待不续清理预算、不启动正常任务终止期限。
+- 接手coding需重新建立actual before（HEAD不是基线）、独占证据及RED/GREEN，保持旧回归和保护索引，冻结最终字节后聚焦/全量/编译；不安装依赖/读凭据或用户库/调用真实模型，不推进Skills/Replan或恢复3.12，不提交推送合并。完成后交独立reviewer，不能自行关闭发现。
+- 规划保全与文档核对：runtime/ec29-r4-plan-8f2b6c91/。以下历史正文完整保留。
+
+
+## 2026-10-29 Windows清理三项P2独立复审：旧触发条件关闭，新增R4/P2阻塞
+
+- 单会话独立复审未通过；原R1/R2/R3具体触发条件已修复，可关闭；新增R4：观察线程启动确认或join被中断后，ident/is_alive会错误证明线程已退出，提前关闭Job/port并发布complete。公开run_bounded_process真实native探针返回主中断时无cleanup_failed/资源、scope无pending；observer随后登记1个有效精确句柄，资源retry仍未回收。位置windows_job.py:126-135（关联63-64、173-198）。
+- reviewer独立聚焦207通过/0skip/exit0；全量2299项、2284通过/15skip、0失败错误/exit0、1587.788秒；编译exit0。runtime新增4项有效契约失败（启动、模型、真实finish、公开执行路径）均exit1，未混入项目全量；首版join探针收尾错误另存，不作产品RED。全量绿色不能关闭R4。
+- R1真实query/terminate两个交错点各10轮与即时删除、R2捕获失败→空列表和Eval owner门禁、R3四组真实取消事件、旧搜索至少5.2秒恢复、冷启动/输出超限10轮均独立通过；不改变历史CI因果未知限制。
+- actual before382/after386/9增量及264冻结源码一致，5723保护文件和2720实施安全证据hash未变，五项seal匹配；124份无关现有生产源码及_score AST保持。无生产/项目测试修改、凭据/用户库读取、真实模型、依赖安装、提交推送合并，不恢复Python3.12。
+- 报告：docs/reviews/2026-10-29-windows-cleanup-p2-independent-review.md；独立证据：runtime/ec29-review-p2-7c19e4ab/。本轮候选仍是d6d6c4c上的未提交工作树，没有对应新SHA的远端CI。下一步交coding修R4并复审；通过前禁止合并，通过后仍需明确合并指令。以下历史正文完整保留。
+
+
+## 2026-10-29 Windows清理R1/R2/R3：实现完成，待独立复审
+
+- 本轮coding实现基于实际d6d6c4c脏工作树，保留全部原提交/未提交文档；不以自测关闭原独立复审3项P2。报告：`docs/reviews/2026-10-29-windows-cleanup-p2-implementation.md`；独占证据`runtime/ec29-p2fix-5e0b4ed2/`，包含actual before/after/delta/hash、全部RED/中间失败、最终候选冻结及保全记录。
+- R1从挂起root起建立Job生命周期账本；通知只发现候选，精确身份/持有句柄、逐个Wait和累计成员完整性核对分别证明归属/退出/覆盖。R2跨重试保留缺口、部分句柄和观察资源，只靠真实补齐证据解除，空列表不能洗掉失败。R3透传原令牌，在native句柄登记后、ResumeThread前复检，保留父令牌/清理/主异常语义。
+- 最终本地聚焦207通过、0skip、exit0，155.256s；完整2299项、2284通过、15平台skip、0失败/error、exit0，1004.484s；compileall exit0。新真实query/terminate交错各10轮即时Wait与兜底前删目录通过；原输出超限树10轮、冷启动、至少5.2秒搜索恢复及取消/owner负例保留。中途全量2失败为新增模块漏复制到隔离helper，补齐最小依赖闭包后重新冻结并全量；其他探针fixture错误单列，不虚称产品RED。
+- 最终源码树SHA为`50f5890b77e607d468f94c5b31cbf491b08335235e5b706987edf1f53e979a8f`（264份）；旧evals766+mg28安全2739以及旧实施/复审/规划证据共5723份按原索引保全。题库、评分、默认权限/轮数/期限、TaskCleanup/Session/Agent和原Eval owner逻辑没有修改；workspace仅增加新helper依赖复制。
+- 普通Job通知可能丢失；无法补齐精确成员证据时仍保守pending，超过4096生命周期成员/失败关联和Job外特权代理有明确限制。非本机OS及所有native错误组合未穷尽验证。历史CI40721403072两次失败精确根因仍未证实，不能追溯认定由本次修复解决。
+- 本轮未提交、推送、合并，未调用模型/安装依赖/读取真实凭据用户库，未恢复Python3.12或推进Replan。HEAD仍d6d6c4c，候选远端CI尚未执行；旧绿色CI不覆盖新工作树。下一步交独立reviewer复审，后续推送/合并须用户明确授权。以下原不通过结论及全部历史正文保留。
+
+
+## 2026-10-29 Windows清理3项P2：修复计划与coding提示词已交付
+
+- 用户要求仅整理修复文档，由coding session实施。本轮没有生产/测试代码修改，不提交、推送或合并；R1/R2/R3仍未关闭。
+- 主计划：`docs/superpowers/plans/2026-10-29-windows-cleanup-p2-fixes.md`；可复制提示词：`docs/reviews/2026-10-29-windows-cleanup-p2-coding-prompt.md`。包含基线保全、R2跨重试不确定状态、R3恢复前取消检查、R1机制原型与完整性证明、逐项RED/GREEN和真实进程验收。
+- R1优先验证从Job建立时追踪生命周期并核对完整性的路线，也允许有充分证据的成员新增阻断方案。完成端口普通通知不保证送达，不能单独证明完整性；空列表/计数归零/父退出都不能替代精确退出确认。本文未给未经验证native机制背书。
+- coding session应先建立新actual before和独占证据，再实施R2/R3及R1；新源码的干净CI需要用户另行授权推送，不能把旧CI当新结果。单会话、不读取凭据/用户库、不安装依赖/调用真实模型、不放宽权限预算评分、不恢复3.12、不推进Replan。
+- 下一步由用户交给coding session，完成后独立复审再决定合并。此次规划备份/校验在`runtime/ec29-review-plan-3b65fe67/`，以下历史正文完整保留。
+
+
+## 2026-10-29 Eval清理独立复审：不通过，新增3项P2
+
+- 源码d6d6c4c，单会话独立复审；没有生产/项目测试修改、提交、推送或合并。完整报告：`docs/reviews/2026-10-29-eval-cleanup-independent-review.md`；新证据`runtime/ec29-review-6e1b2ea2/`。
+- R1/P2：Job查询与终止间新成员未被捕获；真实5/5轮ProcessResources.finish返回True时，预持有子句柄仍WAIT_TIMEOUT=258。R2/P2：OpenProcess/Query失败及4096容量不足后，空列表重试忘记不确定性，三种模型均错误确认并关闭Job。R3/P2：Toolhelp期间取消后仍ResumeThread，真实合成脚本SetEvent证明已执行。位置分别process/control.py:438、439、525。
+- reviewer重跑187聚焦全过、0skip、exit0，compileall通过；新增native模型4方法/5失败断言/0skip、exit1；真实取消1项失败；晚到多线程成员5轮均违约。另10轮普通子进程对照未观察退出延迟但都漏捕获。自写第一版线程探针的清理断言错误保留，不作产品RED。
+- 独立从GitHub核对最终CI2279项/2275通过+4skip/编译通过；不以此关闭新增探针问题。未另跑本地全量；实施方本地全量的helper版本限制保留。旧Eval P2直接丢引用的上层缺口已修复；整体验收仍受R1/R2/R3阻塞。原搜索P2至少5.2秒延迟恢复及负例独立通过，维持关闭。
+- actual before369/after374/15增量一致；3505受保护文件及2128份实施安全证据hash一致；118份无关生产文件和_score AST保持，旧交接及原阻塞报告保留。两次历史CI精确因果仍不能证明。
+- 下一步仅交coding session修复三个边界并复审；不自动合并、不恢复3.12、不放宽权限/评分或推进Replan。本地与远端main仍a81ec24。以下实施记录和历史正文完整保留。
+
+
+## 2026-10-29 Eval清理所有权与Windows退出确认：实现完成，待独立复审
+
+- actual before为本地2807343工作树的369份安全文件，保留原提交与runtime/mg28。返回值/异常cleanup_resource现先retain、按原期限重试并交持久宿主owner；环境scope继续持有，新owner不能隐藏旧pending。失败判分不因清理成功改写，二次中断不覆盖主中断。
+- 真实回归另证实Windows Job终止请求不等于后代退出，以及冷启动在Job分配前创建后代的竞态；分别补精确句柄退出确认、挂起创建→分配→恢复。清理失败继续保留资源/阻断，不增加期限、不忽略目录清理错误。两个旧CI失败点已加无命令/输出/凭据正文的诊断；历史40721403072两次失败的精确根因仍未证实。
+- 新增19项Eval所有权/进程回归与1项TUI测试发布同步回归；后者源自新CI的确定性竞态，只改测试等待并保留断言。最终聚焦187项全部通过；本地全量2279项、2264通过+15skip、0失败/错误、exit0，1147.780s。最新冷启动辅助脚本另单测通过，生产文件与本地全量一致。
+- 最新候选d6d6c4c已推送PR #1；干净Windows3.11 CI 40810040358：2279项、2275通过+4skip、0失败/错误，577.536s，编译通过。中间失败和三次不同候选CI全部保留，不把旧CI失败改写为通过。main本地/远端仍a81ec24，未合并；不恢复3.12。
+- 报告：`docs/reviews/2026-10-29-eval-cleanup-implementation.md`；独立证据：`runtime/ec29-afafcaf4/`，含actual before/after/delta/hash、各轮RED/GREEN/完整日志、最新CI及原搜索5.2秒恢复/取消/owner回归。旧evals766+mg28安全证据2739共3505份hash全同；旧交接正文保留。
+- 无真实模型、凭据/用户库读取或本机依赖安装；CI使用原有安装步骤。无默认权限/预算/评分/题库/Agent变更，不推进Replan。平台skip、native错误组合与历史CI精确因果未穷尽验证。交接文档暂留本地；下一步只交独立reviewer复审，再决定是否合并，不自行关闭原发现。
+
+
+
 ## 2026-10-29 main集成阻塞：3.11两次CI失败及eval清理资源交接
 
 - Python3.12已按用户要求从CI移除。PR #1已推送三个提交，候选cca5535；main本地与远端仍为a81ec24，尚未合并。

@@ -138,19 +138,21 @@ def run_bounded_process(
     )
     windows_job: _WindowsJob | None = None
     resources = _ProcessResources(process, env)
+    execution_deadline = time.monotonic() + timeout
     try:
-        windows_job = _create_windows_job(process) if os.name == "nt" else None
+        windows_job = _create_windows_job(process, resources=resources,
+            deadline=execution_deadline, cancellation=cancellation) if os.name == "nt" else None
         resources.windows_job = windows_job
-        if os.name == "nt" and windows_job is None:
+        if os.name == "nt" and (windows_job is None or not getattr(windows_job, "ready", True)):
             raise OSError("无法建立 Windows 进程树约束")
         if os.name == "nt":
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            _resume_windows_process(process, resources)
+            _resume_windows_process(process, resources, cancellation=cancellation)
         return _collect_bounded_process(
             process,
             env=env,
-            timeout=timeout,
+            timeout=max(0.0, execution_deadline - time.monotonic()) if os.name == "nt" else timeout,
             max_output_bytes=max_output_bytes,
             windows_job=windows_job,
             cancellation=cancellation,
@@ -331,6 +333,8 @@ class _WindowsJob:
         self._handle = handle
         self._close_handle = close_handle
         self._terminate_and_wait = terminate_and_wait
+        self.ready = True
+        self._tracker = None
 
     def close(self, *, deadline: float | None = None) -> bool:
         if not self._handle:
@@ -349,9 +353,12 @@ class _WindowsJob:
 
 def _create_windows_job(
     process: subprocess.Popen[bytes],
+    *, resources: _ProcessResources | None = None,
+    deadline: float | None = None, cancellation: CancellationToken | None = None,
 ) -> _WindowsJob | None:
     if os.name != "nt":
         return None
+    job = None
     try:
         import ctypes
         from ctypes import wintypes
@@ -389,13 +396,6 @@ def _create_windows_job(
                 ("PeakJobMemoryUsed", ctypes.c_size_t),
             ]
 
-        class ProcessIdList(ctypes.Structure):
-            _fields_ = [
-                ("NumberOfAssignedProcesses", wintypes.DWORD),
-                ("NumberOfProcessIdsInList", wintypes.DWORD),
-                ("ProcessIdList", ctypes.c_size_t * 4096),
-            ]
-
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_job = kernel32.CreateJobObjectW
         create_job.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
@@ -427,36 +427,15 @@ def _create_windows_job(
         wait_process = kernel32.WaitForSingleObject
         wait_process.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         wait_process.restype = wintypes.DWORD
-        pending_processes = {}
-
-        def terminate_and_wait(handle, deadline):
-            # CloseHandle(KILL_ON_JOB_CLOSE) requests asynchronous termination;
-            # parent.wait() cannot prove detached descendants have exited.
-            # Keep exact process handles too: an empty Job accounting list can
-            # precede signaled process handles and cwd/handle release on Windows.
-            ids = ProcessIdList()
-            listed = query_job(handle, 3, ctypes.byref(ids), ctypes.sizeof(ids), None)
-            captured = bool(listed)
-            if listed:
-                for pid in ids.ProcessIdList[:ids.NumberOfProcessIdsInList]:
-                    if pid in pending_processes:
-                        continue
-                    process_handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE
-                    if process_handle:
-                        pending_processes[pid] = process_handle
-                    elif ctypes.get_last_error() != 87:  # exited PID is already gone
-                        captured = False
-            if not terminate_job(handle, 1):
-                return False
-            for pid, process_handle in tuple(pending_processes.items()):
-                milliseconds = max(0, int((deadline - time.monotonic()) * 1000))
-                if wait_process(process_handle, milliseconds) == 0 and close_handle(process_handle):
-                    del pending_processes[pid]
-            return captured and not pending_processes
-
         handle = create_job(None, None)
         if not handle:
             return None
+        job = _WindowsJob(int(handle), close_handle)
+        job.ready = False
+        if resources is not None:
+            # Own the Job before native setup or starting its observer can be
+            # interrupted. The caller's primary-exception cleanup uses this slot.
+            resources.windows_job = job
         information = ExtendedLimitInformation()
         information.BasicLimitInformation.LimitFlags = 0x00002000
         if not set_information(
@@ -465,18 +444,31 @@ def _create_windows_job(
             ctypes.byref(information),
             ctypes.sizeof(information),
         ):
-            close_handle(handle)
-            return None
+            return job
         process_handle = wintypes.HANDLE(int(process._handle))  # type: ignore[attr-defined]
         if not assign_process(handle, process_handle):
-            close_handle(handle)
-            return None
-        return _WindowsJob(int(handle), close_handle, terminate_and_wait)
+            return job
+        from tricoder.process.windows_job import WindowsJobTracker
+        tracker = WindowsJobTracker(job, process, kernel32)
+        job._tracker = tracker
+        job._terminate_and_wait = tracker.cleanup
+        try:
+            tracker.start(deadline=deadline, cancellation=cancellation)
+        except CancellationError:
+            raise
+        except Exception:
+            # Return the exact owner even on partially acquired observer state.
+            # Caller attaches it before rejecting startup and cleaning the root.
+            return job
+        job.ready = True
+        return job
     except (AttributeError, OSError, ValueError):
-        return None
+        return job
 
 
-def _resume_windows_process(process, resources: _ProcessResources) -> None:
+def _resume_windows_process(
+    process, resources: _ProcessResources, *, cancellation: CancellationToken | None = None,
+) -> None:
     """Resume only after Job assignment; user code cannot spawn unowned children.
 
     Popen closes CreateProcess's thread handle, so locate the initial suspended
@@ -485,6 +477,9 @@ def _resume_windows_process(process, resources: _ProcessResources) -> None:
     """
     import ctypes
     from ctypes import wintypes
+
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
 
     class ThreadEntry(ctypes.Structure):
         _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
@@ -513,15 +508,21 @@ def _resume_windows_process(process, resources: _ProcessResources) -> None:
     if not handle or handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     resources.native_handles.append((handle, close))
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     entry = ThreadEntry()
     entry.dwSize = ctypes.sizeof(entry)
     found = first(handle, ctypes.byref(entry))
     while found:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if entry.th32OwnerProcessID == process.pid:
             thread = open_thread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
             if not thread:
                 raise ctypes.WinError(ctypes.get_last_error())
             resources.native_handles.append((thread, close))
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             previous_count = resume(thread)
             if previous_count == 0xFFFFFFFF:
                 raise ctypes.WinError(ctypes.get_last_error())

@@ -242,6 +242,114 @@ class EvalCleanupOwnershipTests(unittest.TestCase):
                 resource.closed = True
                 self.assertTrue(retry_verification_cleanup(owner))
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows native boundary')
+    def test_native_capture_gap_stays_owned_through_eval_retry_and_blocks_executor(self):
+        import ctypes
+        from types import SimpleNamespace
+        from test_windows_cleanup_boundaries import Kernel
+        from tricoder.process import control
+        from tricoder.evals.loader import load_suite
+        case=load_suite(Path(__file__).resolve().parents[1]/'evals/quality-v3').cases[0]
+        for failure in ('open_error','query_error','overflow'):
+            for path in ('result','exception'):
+                with self.subTest(failure=failure,path=path):
+                    kernel=Kernel(failure)
+                    self.addCleanup(kernel.dispose)
+                    process=SimpleNamespace(pid=10,_handle=1010,stdin=None,stdout=None,stderr=None,
+                        poll=lambda:0,wait=lambda **kw:0)
+                    with patch.object(ctypes,'WinDLL',return_value=kernel):
+                        job=control._create_windows_job(process)
+                    resource=control._ProcessResources(process,{},job)
+                    deadline=time.monotonic()+1;resource.deadline=deadline
+                    calls=[];cleanup=resource.cleanup
+                    def observe(budget):calls.append(budget);return cleanup(budget)
+                    resource.cleanup=observe
+                    owner=TaskCleanup()
+                    def execute(*args,**kwargs):
+                        self.assertFalse(resource.finish(None))
+                        if path=='exception':
+                            raise ProcessExecutionUncertain(cleanup_failed=True,cleanup_resource=resource)
+                        return BoundedProcessResult(None,'','',cleanup_failed=True,cleanup_resource=resource)
+                    with verification_owner_scope(owner):
+                        with patch.object(runner,'run_bounded_process',side_effect=execute):
+                            result=runner._run_verification(self.spec,self.root)
+                        self.assertFalse(retry_verification_cleanup(owner));self.assertTrue(owner.has_pending)
+                        with patch.object(runner,'run_bounded_process') as next_command:
+                            blocked=runner._run_verification(self.spec,self.root)
+                            next_command.assert_not_called()
+                    trial=self.root/(failure+'-'+path);trial.mkdir()
+                    with patch('tricoder.evals.runner.prepare_workspace') as prepare:
+                        with verification_owner_scope(owner):
+                            executor=unittest.mock.Mock()
+                            next_case=runner.run_isolated_case(case,trial,executor,cleanup_owner=owner)
+                        executor.assert_not_called();prepare.assert_not_called()
+                    self.assertEqual(next_case.status,'error');self.assertEqual(blocked.error_code,'verification_error')
+                    self.assertFalse(result.passed);self.assertTrue(owner.failed);self.assertTrue(job._handle)
+                    self.assertEqual(resource.deadline,deadline);self.assertTrue(all(x<=deadline for x in calls))
+                    self.assertNotIn('cleanup_resource',json.dumps(asdict(result)))
+                    self.assertFalse(job._tracker.worker.is_alive())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows native boundary')
+    def test_pending_observer_blocks_next_verifier_and_case_after_result_is_dropped(self):
+        import ctypes,threading
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from test_windows_cleanup_boundaries import Kernel,interrupt_python_join
+        from tricoder.process import control
+        from tricoder.evals.loader import load_suite
+        case=load_suite(Path(__file__).resolve().parents[1]/'evals/quality-v3').cases[0]
+        for ambient in (False,True):
+            for mode in ('result','exception'):
+                with self.subTest(ambient=ambient,mode=mode):
+                    kernel=Kernel('missing');kernel.total=1;self.addCleanup(kernel.dispose)
+                    entered=threading.Event();release=threading.Event();real_thread=threading.Thread
+                    class Tail(real_thread):
+                        def run(self):
+                            super().run();entered.set()
+                            if not release.wait(4):raise AssertionError('test observer tail expired')
+                    process=SimpleNamespace(pid=10,_handle=1010,stdin=None,stdout=None,stderr=None,poll=lambda:0,wait=lambda **kw:0)
+                    resource=control._ProcessResources(process,{})
+                    with patch.object(ctypes,'WinDLL',return_value=kernel),patch.object(threading,'Thread',Tail):
+                        job=control._create_windows_job(process,resources=resource)
+                    tracker=job._tracker;kernel.messages.put((0,2,None));self.assertTrue(entered.wait(1))
+                    python_alive=interrupt_python_join(tracker.worker)
+                    deadline=time.monotonic()-0.01;resource.deadline=deadline
+                    reference=weakref.ref(resource);holder=[resource];calls=[]
+                    original_cleanup=control._ProcessResources.cleanup
+                    def cleanup(budget):calls.append(budget);return original_cleanup(reference(),budget)
+                    resource.cleanup=cleanup;del resource
+                    parent=TaskCleanup() if ambient else None;owner=TaskCleanup();host=parent or owner
+                    def execute(*args,**kwargs):
+                        current=holder.pop();okay=current.finish(None)
+                        if mode=='exception':raise ProcessExecutionUncertain(cleanup_failed=not okay,cleanup_resource=None if okay else current)
+                        return BoundedProcessResult(0,'','',cleanup_failed=not okay,cleanup_resource=None if okay else current)
+                    try:
+                        with verification_owner_scope(owner),cleanup_scope(parent) if parent else nullcontext():
+                            with patch.object(runner,'run_bounded_process',side_effect=execute):
+                                result=runner._run_verification(self.spec,self.root)
+                            self.assertFalse(result.passed);self.assertNotIn('cleanup_resource',json.dumps(asdict(result)))
+                            del result;gc.collect()
+                            self.assertIsNotNone(reference());self.assertTrue(host.has_pending);self.assertTrue(host.failed)
+                            self.assertFalse(retry_verification_cleanup(host));self.assertFalse(tracker.complete)
+                            with patch.object(runner,'run_bounded_process') as next_command:
+                                blocked=runner._run_verification(self.spec,self.root);next_command.assert_not_called()
+                            trial=self.root/(str(ambient)+'-'+mode);trial.mkdir()
+                            with patch.object(runner,'prepare_workspace') as prepare:
+                                executor=unittest.mock.Mock()
+                                next_case=runner.run_isolated_case(case,trial,executor,cleanup_owner=TaskCleanup() if parent else owner)
+                                prepare.assert_not_called();executor.assert_not_called()
+                            self.assertEqual(next_case.status,'error');self.assertIsNotNone(next_case.timings)
+                            self.assertFalse(blocked.passed)
+                    finally:
+                        release.set()
+                        if hasattr(tracker,'observer_handle') and tracker.observer_handle.value:
+                            self.assertEqual(kernel.wait(tracker.observer_handle.value,2000),0)
+                        else:tracker.worker.join(1)
+                        if reference() is not None:self.assertTrue(host.retry(deadline))
+                    self.assertTrue(host.failed);self.assertFalse(host.has_pending)
+                    self.assertTrue(calls);self.assertTrue(all(value<=deadline for value in calls))
+                    self.assertFalse(job._handle)
+
     def test_job_unconfirmed_exit_keeps_handle_and_exact_retry_deadline(self):
         from tricoder.process.control import _WindowsJob
         closed, waited = [], []
@@ -327,9 +435,9 @@ class EvalCleanupOwnershipTests(unittest.TestCase):
         (self.root/'check.py').write_text("from pathlib import Path\nPath('started').touch()\n", encoding='utf8')
         create = control._create_windows_job
         processes = []
-        def assign(process):
+        def assign(process, **kwargs):
             processes.append(process)
-            job = create(process)
+            job = create(process, **kwargs)
             token.cancel()
             return job
         scope = TaskCleanup()

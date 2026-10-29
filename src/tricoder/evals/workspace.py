@@ -12,6 +12,7 @@ from typing import Mapping
 
 from tricoder.core import cancellation as cancellation_module
 from tricoder.process import control as process_control
+from tricoder.process import windows_job as windows_job_module
 import tricoder.task_cleanup as task_cleanup_module
 from tricoder.workspace.lock import CONTROL_DIRECTORY
 
@@ -110,11 +111,13 @@ def _install_bounded_process_runtime(verifier: Path, root: Path) -> None:
 
     runtime_package = _within_root(verifier / _HIDDEN_RUNTIME_PACKAGE, root)
     runtime_core = _within_root(runtime_package / "core", root)
+    runtime_process = _within_root(runtime_package / "process", root)
     runtime_package.mkdir()
     runtime_core.mkdir()
+    runtime_process.mkdir()
 
     # 空包标记避免工作区中同名恶意包或机器上已安装版本抢先参与导入。
-    for marker in (runtime_package / "__init__.py", runtime_core / "__init__.py"):
+    for marker in (runtime_package / "__init__.py", runtime_core / "__init__.py", runtime_process / "__init__.py"):
         destination = _within_root(marker, root)
         destination.write_text("", encoding="utf-8")
 
@@ -122,6 +125,7 @@ def _install_bounded_process_runtime(verifier: Path, root: Path) -> None:
         (Path(process_control.__file__), verifier / _HIDDEN_PROCESS_HELPER),
         (Path(task_cleanup_module.__file__), runtime_package / "task_cleanup.py"),
         (Path(cancellation_module.__file__), runtime_core / "cancellation.py"),
+        (Path(windows_job_module.__file__), runtime_process / "windows_job.py"),
     )
     for source, destination in sources:
         _copy_framework_file(source, destination, root)
