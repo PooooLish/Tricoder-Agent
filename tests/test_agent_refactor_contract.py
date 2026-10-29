@@ -98,7 +98,7 @@ class AgentRefactorContractTests(unittest.TestCase):
         self.assertFalse(turn.result.ok)
         self.assertEqual("模型请求失败，运行已安全停止", turn.result.summary)
         self.assertEqual(
-            ["task", "task_termination"],
+            ["task", "protocol_feedback", "task_termination"],
             [message.kind for message in turn.context.messages],
         )
         self.assertGreater(turn.context.latest_completed_task_seq, 0)

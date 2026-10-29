@@ -1,0 +1,24 @@
+path_match_mode = "workspace_root"
+expose_edit_scope = true
+id = "cf-parameter-validation"
+title = "cf-parameter-validation"
+task = "validator.valid_quantity：输入为整数且不含bool；仅1—100有效。service.accept同步返回ok或invalid，不要求字符串转换。"
+allowed_changes = ["validator.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "cross_file"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed"]
+
+[[steps]]
+kind = "user_turn"
+content = "validator.valid_quantity：输入为整数且不含bool；仅1—100有效。service.accept同步返回ok或invalid，不要求字符串转换。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20

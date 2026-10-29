@@ -33,6 +33,7 @@ from tricoder.context.memory import (
 from tricoder.core.clarification import ClarificationStatus
 from tricoder.context.summarizer import MemorySummaryError
 from tricoder.core.cancellation import CancellationError, CancellationToken
+from tricoder.engine.budget_feedback import build_round_budget_feedback
 from tricoder.core.events import (
     ContextCompacted,
     EventSink,
@@ -228,6 +229,11 @@ class AgentRunner:
             self.observer.on_round_start(round_number, self.max_rounds)
             emit(event_sink, RoundStarted(round_number, self.max_rounds))
             started = time.perf_counter()
+            budget_feedback = build_round_budget_feedback(
+                round_number=round_number, max_rounds=self.max_rounds,
+            )
+            if budget_feedback is not None:
+                state.messages.append(self._feedback_message(budget_feedback, "protocol_feedback"))
             state.normalize_history()
             preparation = await self._prepare_memory(
                 coordinator,

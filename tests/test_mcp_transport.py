@@ -245,6 +245,7 @@ class VerifiedStdioTransportTests(unittest.IsolatedAsyncioTestCase):
                         primary = ValueError("synthetic primary")
                         with patch.object(control.subprocess, "Popen", return_value=process), \
                              patch.object(control, "_create_windows_job", return_value=mock.Mock()), \
+                             patch.object(control, "_resume_windows_process"), \
                              patch.object(control, "_collect_bounded_process", side_effect=primary):
                             with self.assertRaises(ValueError) as caught:
                                 control.run_bounded_process(["synthetic"], cwd=Path("."), env={},

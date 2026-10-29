@@ -16,10 +16,12 @@ from tricoder.evals.output import EvalOutputError
 from tricoder.evals.runner import run_suite
 from tricoder.evals.workspace import RESERVED_VERIFIER_DIR
 from tricoder.models import RunResult, TokenUsage
+from eval_process_diagnostics import ProcessDiagnostics
 
 
 class EvalRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.process_diagnostics = self.enterContext(ProcessDiagnostics())
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.original_cwd = Path.cwd()
@@ -36,7 +38,11 @@ class EvalRunnerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         os.chdir(self.original_cwd)
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        except OSError as error:
+            self.process_diagnostics.emit('temporary_directory_cleanup', error)
+            raise
 
     def _make_case(
         self,
@@ -387,6 +393,10 @@ class EvalRunnerTests(unittest.TestCase):
         marker = self.run_dir / "workspaces" / case.id / "verifier-after-flood.txt"
         self.assertEqual("verification_error", result.verifications[0].error_code)
         self.assertFalse(marker.exists())
+        self.assertTrue(result.verifications[0].diagnostics['output_exceeded'],
+                        result.verifications[0].diagnostics)
+        self.assertFalse(result.verifications[0].diagnostics['cleanup_failed'],
+                         result.verifications[0].diagnostics)
 
     def test_verification_policy_rejection_has_fixed_error_mapping(self) -> None:
         case = replace(

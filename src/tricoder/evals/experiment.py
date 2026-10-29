@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -21,12 +22,14 @@ from .models import (
     TrialDimensions,
     TrialKey,
     TrialRecord,
+    TrialPlanEntry,
 )
 from .assertions import REGISTERED_ASSERTIONS
 from .output import _is_link_or_reparse_point, validate_run_directory
 from .report import (
     trial_record_as_dict,
     trial_record_from_dict,
+    trial_plan_as_dict,
     write_experiment_reports,
 )
 
@@ -91,6 +94,8 @@ def run_experiment(
     trials_dir = directory / "trials"
     results_dir.mkdir()
     trials_dir.mkdir()
+    frozen_plan = tuple(TrialPlanEntry(item.key, item.condition.execution_kind,
+                                      item.case.category, item.case.split) for item in planned)
     _atomic_json(
         directory / "plan.json",
         {
@@ -101,11 +106,9 @@ def run_experiment(
             "planned_trials": [
                 {
                     "ordinal": item.ordinal,
-                    "condition_id": item.key.condition_id,
-                    "case_id": item.key.case_id,
-                    "repetition": item.key.repetition,
+                    **trial_plan_as_dict(entry),
                 }
-                for item in planned
+                for item, entry in zip(planned, frozen_plan)
             ],
         },
     )
@@ -135,8 +138,11 @@ def run_experiment(
                     dimensions=TrialDimensions(),
                     failure_stage="tool",
                     failure_codes=("executor_error",),
+                    category=item.case.category,
+                    split=item.case.split,
                 )
             _validate_executor_record(item, record)
+            record = replace(record, category=item.case.category, split=item.case.split)
         records.append(record)
         _atomic_json(results_dir / f"{item.ordinal:04d}.json", trial_record_as_dict(record))
 
@@ -156,6 +162,7 @@ def run_experiment(
         benchmark_version=definition.suite.benchmark_version,
         conditions=definition.conditions,
         fingerprints=_experiment_fingerprints(definition),
+        trial_plan=frozen_plan,
     )
     write_experiment_reports(report, directory)
     return report
@@ -188,6 +195,7 @@ def _not_run_record(item: PlannedTrial, status: str) -> TrialRecord:
         dimensions=TrialDimensions(),
         failure_stage="agent_budget" if status == "not_run_budget" else None,
         category=item.case.category,
+        split=item.case.split,
     )
 
 
@@ -196,6 +204,8 @@ def _validate_executor_record(item: PlannedTrial, record: TrialRecord) -> None:
         raise ValueError("executor returned a mismatched trial key")
     if record.execution_kind != item.condition.execution_kind:
         raise ValueError("executor returned a mismatched execution kind")
+    if record.category not in ("unknown", item.case.category) or record.split not in ("unknown", item.case.split):
+        raise ValueError("executor returned mismatched grouping metadata")
 
 
 def _atomic_json(path: Path, payload: object) -> None:

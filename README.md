@@ -710,6 +710,14 @@ SQLite 数据库位于系统状态目录，不会写入目标工作区：
 
 ## Eval
 
+Eval 新增按 condition/case/repetition 统计的产物/完整交付 pass@k、完整交付 pass^k、
+token 分布与失败摊销、Eval 阶段耗时。`eval-analyze --result <result.json> [--plan <plan.json>]`
+可离线重算旧结果，不加载配置或调用模型；默认 k=1/2/3，缺计划、缺测或样本不足会明确
+显示不可用。口径、兼容与使用方法见 [量化指标说明](docs/eval-quantitative-metrics.md)。
+旧指标及评分不变，token 不等同费用，新阶段时间不从历史 duration 推断。
+
+新增 [`evals/quality-v3.1/`](evals/quality-v3.1/README.md) 作为公开验证指引版本：30题首选根目录 `python -m unittest discover -v`，再按宿主 pending/blocking 反馈补检查并显式 finish。业务定义、公私测试、16/16000、split 与四维AND不变；旧V3及历史成绩保留。2026-10-28真实30题×3次复测：产物88/90、完整交付86/90，仍有两次范围违规及两次Provider请求中断；详见[复测报告](docs/reviews/2026-10-28-quality-v31-repeat3-real-rerun.md)。跨版本结果不能直接归因为Agent改进。
+
 新 [`evals/quality-v3/`](evals/quality-v3/README.md) 提供 **30 道 quality、0 道 contract**
 （原19题优化+新增11题），22 dev / 8 holdout。每 user_turn 16轮、16000上下文字符；
 四份实验清单 planned_trials 为30/90/22/8。旧19题全部归dev，已用于诊断的旧holdout
@@ -811,7 +819,7 @@ Agent 效果已提升。真实运行会使用本机配置并可能产生费用�
 
 ### 无密钥自动化测试
 
-GitHub Actions 当前在 Windows 的 Python 3.11/3.12 上运行，暂不运行 Linux 环境检查；这不代表已经保证其他平台兼容。CI 会先安装项目和测试依赖。需要在新环境中运行测试时，先执行（安装步骤需要网络）：
+GitHub Actions 当前仅在 Windows 的 Python 3.11 上运行；Python 3.12及其他平台不在当前CI验证范围内。CI 会先安装项目和测试依赖，并创建被Git忽略的测试运行目录。题库由`.gitattributes`保持检出字节，避免自动换行破坏来源哈希。需要在新环境中运行测试时，先执行（安装步骤需要网络）：
 
 ```powershell
 python -m pip install -e ".[test]"
@@ -820,6 +828,7 @@ python -m pip install -e ".[test]"
 `test` 可选依赖包含包发现测试使用的 setuptools；构建隔离环境中的 setuptools 不代表测试解释器也已安装它。依赖就绪后，以下检查不联网，也不需要真实 API Key：
 
 ```powershell
+python -c "from pathlib import Path; Path('runtime').mkdir(exist_ok=True)"
 python -m unittest discover -s tests -v
 python -m compileall -q src tests
 ```

@@ -480,6 +480,7 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
                      patch("tricoder.task_cleanup.time", SimpleNamespace(monotonic=clock.monotonic)), \
                      patch.object(control.subprocess, "Popen", side_effect=(first, second)), \
                      patch.object(control, "_create_windows_job", return_value=Mock()), \
+                     patch.object(control, "_resume_windows_process"), \
                      patch.object(control, "_terminate_process_tree", side_effect=terminate):
                     self.assertIsNone(current_cleanup())
                     result = await execute(1)

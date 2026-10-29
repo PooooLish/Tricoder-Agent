@@ -894,6 +894,7 @@ def _trial_from_case_result(
         failure_stage=failure_stage,
         failure_codes=result.failure_codes,
         duration_ms=result.duration_ms,
+        timings=result.timings,
         rounds=result.rounds,
         tool_calls=result.tool_calls,
         usage=result.usage,
@@ -928,6 +929,7 @@ def _trial_from_case_result(
             faults.legitimate_actions_allowed if faults is not None else None
         ),
         category=plan.case.category,
+        split=plan.case.split,
         expectation_met=expectation_met,
         assertion_results=assertion_results,
         subcase_results=(

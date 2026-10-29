@@ -224,9 +224,10 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertEqual(memory, turn.context.conversation_memory)
         self.assertEqual(1, turn.context.persisted_memory_revision)
         self.assertTrue(turn.context.memory_pending_clear)
-        self.assertEqual((8, 9, 10), tuple(message.message_seq for message in turn.context.messages))
-        self.assertEqual(("task-8",) * 3, tuple(message.task_id for message in turn.context.messages))
-        self.assertEqual(11, turn.context.next_message_seq)
+        self.assertEqual((8, 9, 10, 11), tuple(message.message_seq for message in turn.context.messages))
+        self.assertEqual(("task-8",) * 4, tuple(message.task_id for message in turn.context.messages))
+        self.assertEqual("protocol_feedback", turn.context.messages[1].kind)
+        self.assertEqual(12, turn.context.next_message_seq)
 
 
 if __name__ == "__main__":

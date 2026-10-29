@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
@@ -13,9 +14,12 @@ from typing import Literal, TypeAlias
 from tricoder.models import RunResult, TokenUsage
 from tricoder.policy import CommandPolicy, PolicyError
 from tricoder.process.control import run_bounded_process
+from tricoder.task_cleanup import current_cleanup, TaskCleanup
 
+from .cleanup import (retain_failure, verifier_scope, verification_cleanup_owner,
+                      verification_owner_scope)
 from .loader import is_reserved_eval_path, is_workspace_relative_path
-from .models import EvalCase, EvalSuite, PathMatchMode, VerificationSpec
+from .models import EvalCase, EvalSuite, PathMatchMode, VerificationSpec, TrialTimings
 from .output import validate_run_directory
 from .workspace import (
     FileFingerprint,
@@ -43,6 +47,7 @@ class VerificationResult:
     exit_code: int | None
     passed: bool
     error_code: str | None
+    diagnostics: dict[str, object] | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +62,7 @@ class EvalCaseResult:
     verifications: tuple[VerificationResult, ...]
     agent_verification: str
     usage: TokenUsage | None
+    timings: TrialTimings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +83,8 @@ def run_suite(
     provider: str,
     model: str,
     agent_executor: AgentExecutor,
+    *,
+    cleanup_owner: TaskCleanup | None = None,
 ) -> EvalRunReport:
     """Run every case independently and return a safe structured report."""
 
@@ -92,10 +100,11 @@ def run_suite(
     workspaces_root.mkdir()
     audit_root.mkdir()
 
-    cases = tuple(
-        _run_case(case, workspaces_root, audit_root, agent_executor)
-        for case in suite.cases
-    )
+    with verification_owner_scope(cleanup_owner):
+        cases = tuple(
+            _run_case(case, workspaces_root, audit_root, agent_executor)
+            for case in suite.cases
+        )
     return EvalRunReport(
         run_id=run_dir.name,
         suite_id=suite.id,
@@ -112,6 +121,8 @@ def run_isolated_case(
     case: EvalCase,
     trial_dir: Path,
     agent_executor: AgentExecutor,
+    *,
+    cleanup_owner: TaskCleanup | None = None,
 ) -> EvalCaseResult:
     """Run one case inside a scheduler-owned, initially empty trial directory."""
 
@@ -121,7 +132,8 @@ def run_isolated_case(
     audit_root = trial_dir / "audit"
     workspaces_root.mkdir()
     audit_root.mkdir()
-    return _run_case(case, workspaces_root, audit_root, agent_executor)
+    with verification_owner_scope(cleanup_owner):
+        return _run_case(case, workspaces_root, audit_root, agent_executor)
 
 
 def _run_case(
@@ -129,6 +141,45 @@ def _run_case(
     workspaces_root: Path,
     audit_root: Path,
     agent_executor: AgentExecutor,
+) -> EvalCaseResult:
+    observation = _TimingObservation()
+    if _verification_cleanup_pending():
+        result = _case_result(case, time.perf_counter(), ("verification_error",),
+                              modified_files=(), verifications=(), run_result=None)
+        return replace(result, timings=observation.finish())
+    result = _run_case_observed(case, workspaces_root, audit_root, agent_executor, observation)
+    return replace(result, timings=observation.finish())
+
+
+class _TimingObservation:
+    """Monotonic observations only; never a resource owner or deadline."""
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter_ns()
+        self.agent_ns = 0
+        self.verifier_ns = 0
+
+    @contextmanager
+    def phase(self, field: str):
+        started = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            setattr(self, field, getattr(self, field) + time.perf_counter_ns() - started)
+
+    def finish(self) -> TrialTimings:
+        total = (time.perf_counter_ns() - self.started) // 1_000_000
+        agent = self.agent_ns // 1_000_000
+        verifier = self.verifier_ns // 1_000_000
+        return TrialTimings(total, agent, verifier, total-agent-verifier)
+
+
+def _run_case_observed(
+    case: EvalCase,
+    workspaces_root: Path,
+    audit_root: Path,
+    agent_executor: AgentExecutor,
+    observation: _TimingObservation,
 ) -> EvalCaseResult:
     started = time.perf_counter()
     workspace: Path | None = None
@@ -158,6 +209,7 @@ def _run_case(
             before=before,
             audit_root=audit_root,
             agent_executor=agent_executor,
+            observation=observation,
         )
     finally:
         try:
@@ -184,17 +236,19 @@ def _run_prepared_case(
     before: dict[str, FileFingerprint],
     audit_root: Path,
     agent_executor: AgentExecutor,
+    observation: _TimingObservation,
 ) -> EvalCaseResult:
     run_result: RunResult | None = None
     modified_files: tuple[str, ...] = ()
     verifications: tuple[VerificationResult, ...] = ()
 
     try:
-        run_result = agent_executor(
-            case,
-            workspace,
-            audit_root / f"{case.id}.jsonl",
-        )
+        with observation.phase("agent_ns"):
+            run_result = agent_executor(
+                case,
+                workspace,
+                audit_root / f"{case.id}.jsonl",
+            )
     except Exception:
         return _case_result(
             case,
@@ -229,10 +283,11 @@ def _run_prepared_case(
         )
 
     try:
-        install_verifier(case, workspace)
-        verifications = tuple(
-            _run_verification(spec, workspace) for spec in case.verifications
-        )
+        with observation.phase("verifier_ns"):
+            install_verifier(case, workspace)
+            verifications = tuple(
+                _run_verification(spec, workspace) for spec in case.verifications
+            )
     except (OSError, WorkspaceSafetyError):
         return _case_result(
             case,
@@ -254,25 +309,40 @@ def _run_prepared_case(
     )
 
 
-def _run_verification(
-    spec: VerificationSpec, workspace: Path
+def _verification_cleanup_pending() -> bool:
+    parent = current_cleanup()
+    return verification_cleanup_owner().has_pending or bool(parent is not None and parent.has_pending)
+
+
+def _run_verification(spec: VerificationSpec, workspace: Path) -> VerificationResult:
+    if _verification_cleanup_pending():
+        return VerificationResult(spec.name, None, False, "verification_error",
+                                  {"stage": "pending_cleanup", "resource_pending": True})
+    with verifier_scope() as scope:
+        return _run_owned_verification(spec, workspace, scope)
+
+
+def _run_owned_verification(
+    spec: VerificationSpec, workspace: Path, scope: TaskCleanup
 ) -> VerificationResult:
     policy = CommandPolicy(workspace)
     try:
         args = policy.validate(spec.command)
-    except PolicyError:
+    except PolicyError as exc:
         return VerificationResult(
             spec.name,
             exit_code=None,
             passed=False,
             error_code="verification_policy_rejected",
+            diagnostics=_verification_diagnostics("policy", scope, error=exc),
         )
-    except Exception:
+    except Exception as exc:
         return VerificationResult(
             spec.name,
             exit_code=None,
             passed=False,
             error_code="verification_error",
+            diagnostics=_verification_diagnostics("policy", scope, error=exc),
         )
 
     try:
@@ -283,20 +353,32 @@ def _run_verification(
             timeout=spec.timeout,
             max_output_bytes=_VERIFICATION_MAX_OUTPUT_BYTES,
         )
-    except Exception:
+    except BaseException as exc:
+        try:
+            retain_failure(scope, exc)
+        except BaseException:
+            # The exact resource was retained before retry. A second cleanup
+            # interruption must not replace the primary exception/cancellation.
+            scope.mark_failed()
+        if not isinstance(exc, Exception):
+            raise
         return VerificationResult(
             spec.name,
             exit_code=None,
             passed=False,
             error_code="verification_error",
+            diagnostics=_verification_diagnostics("process_exception", scope, error=exc),
         )
 
+    retain_failure(scope, completed)
+    diagnostics = _verification_diagnostics("process_result", scope, result=completed)
     if completed.cleanup_failed or completed.output_exceeded:
         return VerificationResult(
             spec.name,
             exit_code=None,
             passed=False,
             error_code="verification_error",
+            diagnostics=diagnostics,
         )
     if completed.timed_out:
         return VerificationResult(
@@ -304,6 +386,7 @@ def _run_verification(
             exit_code=None,
             passed=False,
             error_code="verification_timeout",
+            diagnostics=diagnostics,
         )
 
     passed = completed.returncode == 0
@@ -312,7 +395,34 @@ def _run_verification(
         exit_code=completed.returncode,
         passed=passed,
         error_code=None,
+        diagnostics=diagnostics,
     )
+
+
+def _verification_diagnostics(stage, scope, *, error=None, result=None):
+    """Only controlled categories/booleans/numbers, never argv/env/output/paths."""
+    from tricoder.process.control import ProcessExecutionUncertain
+    from tricoder.core.cancellation import CancellationError
+    kinds = (ProcessExecutionUncertain, CancellationError, PolicyError,
+             PermissionError, FileNotFoundError, OSError, ValueError, RuntimeError)
+    cause = error.__cause__ if error is not None else None
+    os_error = cause if isinstance(cause, OSError) else error
+    def number(name):
+        value = getattr(os_error, name, None)
+        return value if type(value) is int else None
+    source = error if error is not None else result
+    return {
+        "stage": stage,
+        "exception_type": next((kind.__name__ for kind in kinds if isinstance(error, kind)),
+                               "other" if error is not None else None),
+        "errno": number("errno"), "winerror": number("winerror"),
+        "timed_out": bool(result.timed_out) if result is not None else None,
+        "output_exceeded": bool(result.output_exceeded) if result is not None else None,
+        "cleanup_failed": bool(getattr(source, "cleanup_failed", False)),
+        "resource_returned": getattr(source, "cleanup_resource", None) is not None,
+        "resource_pending": scope.has_pending,
+        "termination_started": scope.started_deadline is not None,
+    }
 
 
 def _score(

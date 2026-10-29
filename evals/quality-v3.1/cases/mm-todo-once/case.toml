@@ -1,0 +1,28 @@
+path_match_mode = "workspace_root"
+expose_edit_scope = true
+id = "mm-todo-once"
+title = "mm-todo-once"
+task = "tasks.pending_once(items,completed)：字符串列表排除completed并稳定去重；空集、全完成、非相邻重复；不修改输入列表和completed集合。"
+allowed_changes = ["tasks.py", "tests/*.py"]
+required_changes = ["*.py"]
+max_rounds = 16
+max_context_chars = 16000
+category = "memory"
+split = "dev"
+execution_kind = "quality"
+scorers = ["hidden_verifier"]
+faults = ["none"]
+dimensions = ["artifact_correct", "agent_completed", "scope_compliant", "cleanup_confirmed", "memory_stale_state_avoided"]
+
+[[steps]]
+kind = "user_turn"
+content = "记住已完成事项 a；后续任务不要将已完成事项当作待办。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n本轮只确认并记住这条约束/决定，不修改文件、不运行测试；调用finish结束本轮，等待下一条任务。"
+
+[[steps]]
+kind = "user_turn"
+content = "tasks.pending_once(items,completed)：字符串列表排除completed并稳定去重；空集、全完成、非相邻重复；不修改输入列表和completed集合。\n当前为非交互执行；已有信息足够时自主完成，必要信息确实缺失时明确报告，不能编造；ask_user无法即时获得回答。\n可在允许范围自行补测试。运行公开测试及当前验证要求后，明确调用finish交付；不要只提供建议。"
+
+[[verification]]
+name = "hidden"
+command = "python -m unittest discover -s .tricoder_eval_verifier -q"
+timeout = 20
