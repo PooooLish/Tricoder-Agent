@@ -30,6 +30,7 @@ from tricoder.evals.loader import load_suite
 from tricoder.evals.runner import run_isolated_case
 from tricoder.models import RunResult
 import tricoder.evals.runner as runner
+from eval_process_diagnostics import ProcessDiagnostics
 
 
 def cases(suite=SUITE):
@@ -78,8 +79,10 @@ def isolated(case, label, files, *, ok=True, executor=None, public=False, worksp
             prefix=workspace_prefix if workspace_prefix is not None else case.id+"-"+label+"-", dir=root)
     else:
         temporary=tempfile.TemporaryDirectory(prefix="tricoder-v3-",dir=ROOT/"runtime")
-    with temporary as directory, patch.object(runner,"run_bounded_process",side_effect=record):
+    with ProcessDiagnostics() as diagnostics, temporary as directory, patch.object(runner,"run_bounded_process",side_effect=record):
         result=run_isolated_case(case,Path(directory).resolve(),execute)
+        if any(not row['passed'] for row in public_receipts):
+            diagnostics.emit('public_verification_failed')
     evidence=dict(case=case.id,variant=label,result=asdict(result),processes=receipts,public=public_receipts)
     if target:
         path=Path(target)/(case.id+"-"+label+".json")

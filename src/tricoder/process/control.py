@@ -293,7 +293,7 @@ def _terminate_process_tree(
     cleanup_ok = True
     if os.name == "nt":
         if windows_job is not None:
-            cleanup_ok = windows_job.close()
+            cleanup_ok = windows_job.close(deadline=deadline)
         else:
             cleanup_ok = _terminate_windows_tree(process, env, deadline=deadline)
     else:
@@ -316,14 +316,19 @@ def _terminate_process_tree(
 
 
 class _WindowsJob:
-    def __init__(self, handle: int, close_handle: Any) -> None:
+    def __init__(self, handle: int, close_handle: Any, terminate_and_wait: Any = None) -> None:
         self._handle = handle
         self._close_handle = close_handle
+        self._terminate_and_wait = terminate_and_wait
 
-    def close(self) -> bool:
+    def close(self, *, deadline: float | None = None) -> bool:
         if not self._handle:
             return True
         handle = self._handle
+        if self._terminate_and_wait is not None:
+            deadline = deadline if deadline is not None else time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+            if not self._terminate_and_wait(handle, deadline):
+                return False
         if not self._close_handle(handle):
             return False
         # 只有确认 CloseHandle 成功才放弃句柄所有权；失败可由原资源持有者重试。
@@ -373,6 +378,13 @@ def _create_windows_job(
                 ("PeakJobMemoryUsed", ctypes.c_size_t),
             ]
 
+        class ProcessIdList(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfAssignedProcesses", wintypes.DWORD),
+                ("NumberOfProcessIdsInList", wintypes.DWORD),
+                ("ProcessIdList", ctypes.c_size_t * 4096),
+            ]
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_job = kernel32.CreateJobObjectW
         create_job.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
@@ -391,6 +403,45 @@ def _create_windows_job(
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
+        terminate_job = kernel32.TerminateJobObject
+        terminate_job.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        terminate_job.restype = wintypes.BOOL
+        query_job = kernel32.QueryInformationJobObject
+        query_job.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                              wintypes.DWORD, ctypes.c_void_p]
+        query_job.restype = wintypes.BOOL
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait_process = kernel32.WaitForSingleObject
+        wait_process.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_process.restype = wintypes.DWORD
+        pending_processes = {}
+
+        def terminate_and_wait(handle, deadline):
+            # CloseHandle(KILL_ON_JOB_CLOSE) requests asynchronous termination;
+            # parent.wait() cannot prove detached descendants have exited.
+            # Keep exact process handles too: an empty Job accounting list can
+            # precede signaled process handles and cwd/handle release on Windows.
+            ids = ProcessIdList()
+            listed = query_job(handle, 3, ctypes.byref(ids), ctypes.sizeof(ids), None)
+            captured = bool(listed)
+            if listed:
+                for pid in ids.ProcessIdList[:ids.NumberOfProcessIdsInList]:
+                    if pid in pending_processes:
+                        continue
+                    process_handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE
+                    if process_handle:
+                        pending_processes[pid] = process_handle
+                    elif ctypes.get_last_error() != 87:  # exited PID is already gone
+                        captured = False
+            if not terminate_job(handle, 1):
+                return False
+            for pid, process_handle in tuple(pending_processes.items()):
+                milliseconds = max(0, int((deadline - time.monotonic()) * 1000))
+                if wait_process(process_handle, milliseconds) == 0 and close_handle(process_handle):
+                    del pending_processes[pid]
+            return captured and not pending_processes
 
         handle = create_job(None, None)
         if not handle:
@@ -409,7 +460,7 @@ def _create_windows_job(
         if not assign_process(handle, process_handle):
             close_handle(handle)
             return None
-        return _WindowsJob(int(handle), close_handle)
+        return _WindowsJob(int(handle), close_handle, terminate_and_wait)
     except (AttributeError, OSError, ValueError):
         return None
 
