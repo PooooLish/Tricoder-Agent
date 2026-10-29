@@ -44,6 +44,7 @@ class BoundedProcessTests(unittest.TestCase):
         process = mock.Mock(returncode=None)
         with mock.patch.object(control.subprocess, "Popen", return_value=process), \
              mock.patch.object(control, "_create_windows_job", return_value=mock.Mock()), \
+             mock.patch.object(control, "_resume_windows_process"), \
              mock.patch.object(control, "_collect_bounded_process", side_effect=primary), \
              mock.patch.object(control, "_terminate_process_tree", side_effect=RuntimeError("cleanup synthetic")):
             with self.assertRaises(ValueError) as caught:

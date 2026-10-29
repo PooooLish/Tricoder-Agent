@@ -53,12 +53,19 @@ class _ProcessResources:
         self.windows_job = windows_job
         self.readers: tuple[threading.Thread, ...] = ()
         self.deadline: float | None = None
+        self.native_handles: list[tuple[Any, Any]] = []
 
     def cleanup(self, deadline: float) -> bool:
         try:
             okay = _terminate_process_tree(self.process, self.env, self.windows_job, deadline=deadline)
         except Exception:
             okay = False
+        for entry in tuple(self.native_handles):
+            handle, close_handle = entry
+            if close_handle(handle):
+                self.native_handles.remove(entry)
+            else:
+                okay = False
         for reader in self.readers:
             if reader.is_alive():
                 reader.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -112,7 +119,7 @@ def run_bounded_process(
         cancellation.raise_if_cancelled()
     popen_options: dict[str, object] = {}
     if os.name == "nt":
-        popen_options["creationflags"] = getattr(
+        popen_options["creationflags"] = 0x00000004 | getattr(  # CREATE_SUSPENDED
             subprocess,
             "CREATE_NEW_PROCESS_GROUP",
             0,
@@ -136,6 +143,10 @@ def run_bounded_process(
         resources.windows_job = windows_job
         if os.name == "nt" and windows_job is None:
             raise OSError("无法建立 Windows 进程树约束")
+        if os.name == "nt":
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            _resume_windows_process(process, resources)
         return _collect_bounded_process(
             process,
             env=env,
@@ -463,6 +474,63 @@ def _create_windows_job(
         return _WindowsJob(int(handle), close_handle, terminate_and_wait)
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def _resume_windows_process(process, resources: _ProcessResources) -> None:
+    """Resume only after Job assignment; user code cannot spawn unowned children.
+
+    Popen closes CreateProcess's thread handle, so locate the initial suspended
+    thread using Toolhelp. Keep every acquired handle in the exact process
+    resource until confirmed closed, including all error/cancellation paths.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ThreadID", wintypes.DWORD), ("th32OwnerProcessID", wintypes.DWORD),
+                    ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = kernel.CreateToolhelp32Snapshot
+    snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    snapshot.restype = wintypes.HANDLE
+    first, next_thread = kernel.Thread32First, kernel.Thread32Next
+    for function in (first, next_thread):
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+        function.restype = wintypes.BOOL
+    open_thread = kernel.OpenThread
+    open_thread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_thread.restype = wintypes.HANDLE
+    resume = kernel.ResumeThread
+    resume.argtypes = [wintypes.HANDLE]
+    resume.restype = wintypes.DWORD
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    handle = snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    resources.native_handles.append((handle, close))
+    entry = ThreadEntry()
+    entry.dwSize = ctypes.sizeof(entry)
+    found = first(handle, ctypes.byref(entry))
+    while found:
+        if entry.th32OwnerProcessID == process.pid:
+            thread = open_thread(0x0002, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
+            if not thread:
+                raise ctypes.WinError(ctypes.get_last_error())
+            resources.native_handles.append((thread, close))
+            previous_count = resume(thread)
+            if previous_count == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if previous_count != 1:
+                raise OSError("受管进程线程挂起状态异常")
+            return
+        entry.dwSize = ctypes.sizeof(entry)
+        found = next_thread(handle, ctypes.byref(entry))
+    raise OSError("无法恢复受管进程线程")
 
 
 def _terminate_windows_tree(

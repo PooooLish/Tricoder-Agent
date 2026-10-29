@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -258,6 +259,24 @@ class EvalCleanupOwnershipTests(unittest.TestCase):
         self.assertTrue(job.close(deadline=17))
         self.assertEqual([123], closed)
 
+    def test_failed_native_handle_close_remains_owned_for_retry(self):
+        from tricoder.process import control
+        from unittest.mock import Mock
+        process = Mock(stdout=None, stderr=None, stdin=None)
+        resource = control._ProcessResources(process, {})
+        outcomes = iter((False, True))
+        calls = []
+        def close(handle):
+            calls.append(handle)
+            return next(outcomes)
+        resource.native_handles.append((123, close))
+        with patch.object(control, '_terminate_process_tree', return_value=True):
+            self.assertFalse(resource.cleanup(7))
+            self.assertEqual([(123, close)], resource.native_handles)
+            self.assertTrue(resource.cleanup(7))
+            self.assertEqual([], resource.native_handles)
+        self.assertEqual([123,123], calls)
+
     def test_inherited_pending_scope_blocks_executor_even_with_new_host_owner(self):
         from tricoder.evals.loader import load_suite
         from tricoder.models import RunResult
@@ -275,6 +294,73 @@ class EvalCleanupOwnershipTests(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertEqual('error', result.status)
         self.assertTrue(parent.has_pending)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process handle and directory evidence')
+    def test_resume_failure_reaps_suspended_process_without_running_script(self):
+        from tricoder.process import control
+        from tricoder.policy import CommandPolicy
+        (self.root/'check.py').write_text("from pathlib import Path\nPath('started').touch()\n", encoding='utf8')
+        processes = []
+        popen = control.subprocess.Popen
+        def capture(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            return process
+        policy = CommandPolicy(self.root)
+        with patch.object(control.subprocess, 'Popen', side_effect=capture), \
+             patch.object(control, '_resume_windows_process', side_effect=OSError('synthetic resume failure')):
+            with self.assertRaises(ProcessExecutionUncertain) as caught:
+                control.run_bounded_process(policy.validate('python check.py'), cwd=self.root,
+                    env=policy.subprocess_environment(), timeout=5, max_output_bytes=4096)
+        self.assertFalse(caught.exception.cleanup_failed)
+        self.assertIsNone(caught.exception.cleanup_resource)
+        self.assertTrue(processes)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertFalse((self.root/'started').exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows suspended startup cancellation')
+    def test_cancellation_after_job_assignment_never_resumes_user_code(self):
+        from tricoder.process import control
+        from tricoder.policy import CommandPolicy
+        from tricoder.core.cancellation import CancellationToken
+        token = CancellationToken()
+        (self.root/'check.py').write_text("from pathlib import Path\nPath('started').touch()\n", encoding='utf8')
+        create = control._create_windows_job
+        processes = []
+        def assign(process):
+            processes.append(process)
+            job = create(process)
+            token.cancel()
+            return job
+        scope = TaskCleanup()
+        policy = CommandPolicy(self.root)
+        with cleanup_scope(scope), patch.object(control, '_create_windows_job', side_effect=assign):
+            with self.assertRaises(CancellationError) as caught:
+                control.run_bounded_process(policy.validate('python check.py'), cwd=self.root,
+                    env=policy.subprocess_environment(), timeout=5, max_output_bytes=4096, cancellation=token)
+        self.assertFalse(caught.exception.cleanup_failed)
+        self.assertIsNotNone(scope.started_deadline)
+        self.assertFalse(scope.has_pending)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertFalse((self.root/'started').exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows process handle and directory evidence')
+    def test_cold_start_adopts_children_before_any_user_code_runs(self):
+        from tricoder.policy import CommandPolicy
+        env = CommandPolicy(self.root).subprocess_environment()
+        env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]/'src')
+        completed = subprocess.run(
+            [sys.executable, '-B', str(Path(__file__).with_name('eval_cold_process_probe.py')),
+             str(self.root/'cold')], env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        receipt = json.loads(completed.stdout)
+        self.assertFalse(receipt['ctypes_loaded_before_process'])
+        self.assertFalse(receipt['cleanup_failed'], receipt)
+        self.assertTrue(receipt['membership'], receipt)
+        self.assertTrue(all(row['query_ok'] and row['in_exact_job'] for row in receipt['membership']), receipt)
+        self.assertTrue(all(not row['opened'] or row['wait_before_cleanup'] == 0
+                            for row in receipt['children']), receipt)
+        self.assertTrue(receipt['directory_removed'])
 
     @unittest.skipUnless(os.name == 'nt', 'Windows process handle and directory evidence')
     def test_real_overflow_reaps_parent_and_detached_child_before_directory_removal(self):

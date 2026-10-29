@@ -409,6 +409,9 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(300):
             await pilot.pause()
             if app.last_result is not None:
+                # Result assignment precedes the worker's final sidebar update.
+                # Wait for publication, not a guessed amount of rendering time.
+                await asyncio.wait_for(app.workers.wait_for_complete(), 5)
                 return app.last_result  # type: ignore[return-value]
         self.fail("任务未在超时内完成")
 
@@ -587,6 +590,41 @@ class TricoderTuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ok done", result.summary)
         self.assertIn(record.name, plain)
         self.assertIn(record.id[:8], plain)
+
+    async def test_result_wait_includes_worker_sidebar_publication(self) -> None:
+        """last_result is assigned before the worker publishes its sidebar."""
+        response = ProviderResponse(tool_calls=(ToolCall('c1', 'finish', {'summary': 'done'}),))
+        app = self._make_app([response])
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        refresh = app.refresh_sidebar
+
+        def gated_refresh():
+            if app.last_result is not None:
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise RuntimeError('test publication gate timed out')
+            refresh()
+
+        with mock.patch.object(app, 'refresh_sidebar', side_effect=gated_refresh):
+            async with app.run_test() as pilot:
+                waiter = None
+                try:
+                    await self._submit(pilot, 'synthetic finish')
+                    await asyncio.wait_for(entered.wait(), 5)
+                    waiter = asyncio.create_task(self._wait_result(pilot))
+                    # Drain actual UI messages, without a guessed wall-clock sleep.
+                    await pilot.pause()
+                    await pilot.pause()
+                    self.assertFalse(waiter.done(), 'returned before sidebar publication')
+                finally:
+                    release.set()
+                    if waiter is not None:
+                        await asyncio.wait_for(waiter, 5)
+                content = app.query_one('#sidebar-content', Static).content
+                plain = content.plain if hasattr(content, 'plain') else str(content)
+                self.assertIn(app.runtime.current.record.name, plain)
 
     async def test_failed_first_task_still_displays_committed_session(self) -> None:
         """Provider 失败发生在创建提交后时，TUI 必须保留并展示真实 Session。"""
